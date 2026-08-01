@@ -26,33 +26,16 @@ export default function Chat() {
                                 return <div key={i}>{part.text}</div>;
                             }
 
-                            // Source citation parts — accept either possible v7 type name,
-                            // and read the URL/title from a flat or nested shape.
-                            if (part.type === "source-url" || part.type === "source") {
-                                const p = part as any;
-                                const url = p.url ?? p.value?.url;
-                                const title = p.title ?? p.value?.title ?? url;
-                                if (!url) return null;
-                                return (
-                                    <a key={i} href={url} target="_blank" rel="noopener noreferrer" className="inline-block mr-2 mt-2 px-3 py-1 text-xs rounded-full border border-gray-300 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-400 transition">
-                                        📄 {title}
-                                    </a>
-                                );
-                            }
-
-                            // Structural markers we intentionally don't render
-                            if (part.type === "step-start" || part.type === "step-end") {
+                            // Structural marker we intentionally don't render
+                            if (part.type === "step-start") {
                                 return null;
                             }
 
                             // Custom sources data part (an array of sources)
                             if (part.type === "data-sources") {
-                                const sources = (part as any).data as {
-                                    id: number;
-                                    title: string;
-                                    url: string;
-                                    score: number;
-                                }[];
+                                // No cast: ChatMessage carries ChatDataParts, so narrowing
+                                // to "data-sources" already gives part.data its real type.
+                                const sources = part.data;
                                 return (
                                     <div key={i} className="flex flex-wrap gap-2 mt-2">
                                         {sources.map((s) => (
