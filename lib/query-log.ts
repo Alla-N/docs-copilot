@@ -12,7 +12,8 @@
  */
 import { createClient } from "@supabase/supabase-js";
 
-import { isRefusal, type RetrievalMode, type RetrievedChunk } from "./retrieve";
+import { isRefusal } from "./refusal";
+import { type RetrievalMode, type RetrievedChunk } from "./retrieve";
 
 const supabase = createClient(
     process.env.SUPABASE_URL!,

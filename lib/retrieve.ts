@@ -9,6 +9,19 @@ import { openai } from "@ai-sdk/openai";
 import { cohere } from "@ai-sdk/cohere";
 import { createClient } from "@supabase/supabase-js";
 
+// Defined in a dependency-free module so the client bundle can import it too;
+// re-exported here so existing importers keep working.
+import { REFUSAL_MESSAGE } from "./refusal";
+export { REFUSAL_MESSAGE, isRefusal } from "./refusal";
+
+/**
+ * Fallback threshold, used when reranking is unavailable. This is the value calibrated
+ * on Day 6 against raw cosine similarity — answerable queries clustered 0.58–0.63, the
+ * worst near-miss scored 0.349. Rerank scores are distributed differently, which is why
+ * the primary threshold is 0.30 and this one is not.
+ */
+export const COSINE_THRESHOLD = 0.45;
+
 /** Calibrated on rerank scores, not cosine — the two are distributed differently. */
 export const RERANK_THRESHOLD = 0.3;
 
@@ -24,32 +37,6 @@ export const RERANK_THRESHOLD = 0.3;
 // Cost: Cohere reranks 2x the documents on every production query. Measured, not free.
 export const VECTOR_CANDIDATES = Number(process.env.VECTOR_CANDIDATES ?? 40);
 export const RERANK_TOP_N = Number(process.env.RERANK_TOP_N ?? 5);
-
-/**
- * The exact refusal sentence. Exported so the eval harness classifies answers by
- * comparing against the same constant the prompt instructs — if this string ever
- * changes, the harness follows it instead of silently scoring every refusal as
- * an answer.
- */
-export const REFUSAL_MESSAGE = "I don't have information about that in the documentation.";
-
-/**
- * One definition of "this was a refusal", shared by the eval harness and the production
- * query log. If it lived in two places they could drift, and the two would disagree about
- * the same answer — which is exactly the kind of bug that makes a metric quietly wrong.
- */
-export function isRefusal(answer: string): boolean {
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-    return norm(answer).includes(norm(REFUSAL_MESSAGE));
-}
-
-/**
- * Fallback threshold, used when reranking is unavailable. This is the value calibrated
- * on Day 6 against raw cosine similarity — answerable queries clustered 0.58–0.63, the
- * worst near-miss scored 0.349. Rerank scores are distributed differently, which is why
- * the primary threshold is 0.30 and this one is not.
- */
-export const COSINE_THRESHOLD = 0.45;
 
 export type RetrievedChunk = {
     content: string;
