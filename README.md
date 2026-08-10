@@ -19,6 +19,7 @@ made by measuring the alternative.
 | Cohere reranking | — | **2 of 6** | Queries where vector search ranked the right chunk below a worse one, fixed by the cross-encoder |
 | Answerable vs unanswerable score gap | ~1.7× | **~8×** | Widening this gap is what makes a threshold able to separate the two |
 | Idempotent ingestion | 853 embeds | **154** | Re-ingest after real upstream doc drift — 82% fewer embedding calls |
+| Answer coverage (eval harness) | 4/5 | **5/5** | 9 labelled cases × 3 runs; guardrails held 4/4 throughout |
 
 **Retrieval threshold was calibrated, not guessed.** Cosine similarity needed 0.45 to
 separate answerable from unanswerable queries; after reranking the useful cut moved to
@@ -132,6 +133,24 @@ npm run dev
 ```
 
 `npm run exp:chunking` re-runs the chunking experiment behind the 0.546 → 0.643 number.
+
+## Evals
+
+```bash
+npm run eval                 # 9 labelled cases × 3 generations
+EVAL_RUNS=0 npm run eval     # retrieval-only diagnostic — free, no generation calls
+```
+
+Reports retrieval recall, answer coverage, guardrails held, and median retrieval latency —
+and, per guardrail, **which layer refused it**. That last one matters: two of the four
+guardrails retrieve nothing past the threshold, so the model never sees them and they stay
+green no matter what the prompt says. A test that can't fail in the direction you're
+changing is decoration, and the harness says so out loud rather than quietly counting it
+as a pass.
+
+Retrieval runs once per case (deterministic); generation runs N times, because temperature 0
+lowers variance without eliminating it. A case passing 2 of 3 is reported `FLAKY`, not
+rounded up.
 
 ---
 

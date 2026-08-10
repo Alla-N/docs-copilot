@@ -39,8 +39,9 @@ export default function Chat() {
                                 return (
                                     <div key={i} className="flex flex-wrap gap-2 mt-2">
                                         {sources.map((s) => (
-                                            <a key={s.id} href={s.url} target="_blank" rel="noopener noreferrer" className="inline-block px-3 py-1 text-xs rounded-full border border-gray-300 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-400 transition">
-                                                📄 {s.title} ({s.score.toFixed(2)})
+                                            <a key={s.id} href={s.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1.5 px-3 py-1 text-xs rounded-full border transition-colors border-gray-300 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-400 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-200 dark:hover:bg-gray-700/70 dark:hover:border-gray-500">
+                                                📄 {s.title}
+                                                <span className="text-gray-500 dark:text-gray-400 tabular-nums">{s.score.toFixed(2)}</span>
                                             </a>
                                         ))}
                                     </div>
@@ -54,20 +55,20 @@ export default function Chat() {
 
                 {/* Loader — shown during the silent pre-stream gap (embed + rerank round-trip) */}
                 {status === "submitted" && (
-                    <div className="flex items-center gap-2 text-gray-500">
-                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-pulse" />
-                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-pulse [animation-delay:150ms]" />
-                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 animate-pulse [animation-delay:300ms]" />
+                    <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
+                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-500 animate-pulse" />
+                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-500 animate-pulse [animation-delay:150ms]" />
+                        <span className="inline-block w-2 h-2 rounded-full bg-gray-400 dark:bg-gray-500 animate-pulse [animation-delay:300ms]" />
                         <span className="ml-1 text-sm">Searching the docs…</span>
                     </div>
                 )}
 
                 {/* Error banner with retry */}
                 {error && (
-                    <div className="rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800">
+                    <div className="rounded border p-3 text-sm border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/50 dark:text-red-200">
                         <div className="font-medium">Something went wrong.</div>
-                        <div className="text-red-600">The request failed. Please try again.</div>
-                        <button onClick={() => regenerate()} className="mt-2 rounded bg-red-600 px-3 py-1 text-white hover:bg-red-700">
+                        <div className="text-red-600 dark:text-red-300">The request failed. Please try again.</div>
+                        <button onClick={() => regenerate()} className="mt-2 rounded px-3 py-1 text-white bg-red-600 hover:bg-red-700 dark:bg-red-700 dark:hover:bg-red-600">
                             Retry
                         </button>
                     </div>
@@ -81,10 +82,10 @@ export default function Chat() {
                     sendMessage({ text: input });
                     setInput("");
                 }}
-                className="fixed bottom-0 w-full max-w-2xl mb-8"
+                className="fixed bottom-0 w-full max-w-2xl mb-8 bg-[var(--background)] pt-2"
             >
                 <input
-                    className="w-full p-3 border border-gray-300 rounded shadow disabled:opacity-50"
+                    className="w-full p-3 rounded border shadow outline-none transition-colors disabled:opacity-50 border-gray-300 bg-white text-gray-900 placeholder-gray-400 focus:border-gray-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-gray-500"
                     value={input}
                     placeholder={isBusy ? "Waiting for response…" : "Ask about the AI SDK…"}
                     onChange={(e) => setInput(e.target.value)}

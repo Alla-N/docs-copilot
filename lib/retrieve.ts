@@ -1,0 +1,161 @@
+/**
+ * The retrieval pipeline, extracted from the chat route so the eval harness
+ * exercises the SAME code path production does. A harness that re-implements
+ * retrieval tests a copy, and a copy drifts — silently, and in the direction
+ * that makes the tests pass.
+ */
+import { embed, rerank } from "ai";
+import { openai } from "@ai-sdk/openai";
+import { cohere } from "@ai-sdk/cohere";
+import { createClient } from "@supabase/supabase-js";
+
+/** Calibrated on rerank scores, not cosine — the two are distributed differently. */
+export const RERANK_THRESHOLD = 0.3;
+
+/**
+ * Retrieve wide, then let the cross-encoder narrow.
+ * Overridable via env so the eval harness can sweep them without editing code —
+ * and so a sweep is reproducible from the command that produced it.
+ */
+// 40, not 20. At 20, "what is new in AI SDK 7" pulled only 3 Migration chunks (top
+// 0.768) and the model refused 3/3; at 40 it pulls 5 (top 0.852) and answers 3/3.
+// The reranker can only re-order what vector search hands it — recall is upstream of
+// precision, and no amount of reranking recovers a chunk that never made the cut.
+// Cost: Cohere reranks 2x the documents on every production query. Measured, not free.
+export const VECTOR_CANDIDATES = Number(process.env.VECTOR_CANDIDATES ?? 40);
+export const RERANK_TOP_N = Number(process.env.RERANK_TOP_N ?? 5);
+
+/**
+ * The exact refusal sentence. Exported so the eval harness classifies answers by
+ * comparing against the same constant the prompt instructs — if this string ever
+ * changes, the harness follows it instead of silently scoring every refusal as
+ * an answer.
+ */
+export const REFUSAL_MESSAGE = "I don't have information about that in the documentation.";
+
+/**
+ * One definition of "this was a refusal", shared by the eval harness and the production
+ * query log. If it lived in two places they could drift, and the two would disagree about
+ * the same answer — which is exactly the kind of bug that makes a metric quietly wrong.
+ */
+export function isRefusal(answer: string): boolean {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+    return norm(answer).includes(norm(REFUSAL_MESSAGE));
+}
+
+/**
+ * Fallback threshold, used when reranking is unavailable. This is the value calibrated
+ * on Day 6 against raw cosine similarity — answerable queries clustered 0.58–0.63, the
+ * worst near-miss scored 0.349. Rerank scores are distributed differently, which is why
+ * the primary threshold is 0.30 and this one is not.
+ */
+export const COSINE_THRESHOLD = 0.45;
+
+export type RetrievedChunk = {
+    content: string;
+    title: string;
+    source_url: string;
+    score: number;
+};
+
+/** "reranked" = full pipeline. "cosine-fallback" = reranker was unavailable. */
+export type RetrievalMode = "reranked" | "cosine-fallback";
+
+const supabase = createClient(
+    process.env.SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_KEY!
+);
+
+export async function retrieve(question: string): Promise<{
+    /** Everything vector search returned, in cosine order — used to measure what reranking changed. */
+    candidates: { content: string; title: string; source_url: string; similarity: number }[];
+    /** What survived reranking AND the threshold. This is what the model sees. */
+    relevant: RetrievedChunk[];
+    /** Degraded when the reranker failed — surfaced so the harness can measure it. */
+    mode: RetrievalMode;
+}> {
+    // Same embedding model as ingestion — non-negotiable. Different models produce
+    // vectors of the same dimension that mean nothing to each other.
+    const { embedding } = await embed({
+        model: openai.embedding("text-embedding-3-small"),
+        value: question,
+    });
+
+    const { data, error } = await supabase.rpc("match_documents", {
+        query_embedding: embedding,
+        match_count: VECTOR_CANDIDATES,
+    });
+    if (error) throw new Error(`Retrieval failed: ${error.message}`);
+
+    const candidates = (data ?? []) as {
+        content: string;
+        title: string;
+        source_url: string;
+        similarity: number;
+    }[];
+
+    if (candidates.length === 0) return { candidates, relevant: [], mode: "reranked" };
+
+    try {
+        const { ranking } = await rerank({
+            model: cohere.reranking("rerank-v3.5"),
+            query: question,
+            documents: candidates.map((d) => d.content),
+            topN: RERANK_TOP_N,
+        });
+
+        const relevant = ranking
+            .filter((r) => r.score >= RERANK_THRESHOLD)
+            .map((r) => ({
+                content: candidates[r.originalIndex].content,
+                title: candidates[r.originalIndex].title,
+                source_url: candidates[r.originalIndex].source_url,
+                score: r.score,
+            }));
+
+        return { candidates, relevant, mode: "reranked" };
+    } catch (err) {
+        // Reranking is an enhancement, not a dependency. A Cohere outage or rate limit
+        // (the trial key allows 10 calls/minute) must degrade the answer, not break it.
+        // Fall back to cosine order with the STRICTER Day-6 threshold: without the
+        // cross-encoder the scores are noisier, so the guardrail has to compensate.
+        console.error("RERANK FAILED — falling back to cosine ordering:", err);
+
+        const relevant = candidates
+            .filter((d) => d.similarity >= COSINE_THRESHOLD)
+            .slice(0, RERANK_TOP_N)
+            .map((d) => ({
+                content: d.content,
+                title: d.title,
+                source_url: d.source_url,
+                score: d.similarity,
+            }));
+
+        return { candidates, relevant, mode: "cosine-fallback" };
+    }
+}
+
+/**
+ * Two-layer refusal: the numeric threshold above drops weak chunks before the model
+ * sees them, and this prompt instructs refusal when nothing survived. Either layer
+ * alone leaks — the gate can't judge semantics, and the prompt alone will happily
+ * answer from the model's own knowledge.
+ */
+export function buildSystemPrompt(relevant: RetrievedChunk[]): string {
+    const context =
+        relevant.length > 0
+            ? relevant
+                .map((c, i) => `[Source ${i + 1}] (relevance: ${c.score.toFixed(2)})\n${c.content}`)
+                .join("\n\n---\n\n")
+            : "NO RELEVANT DOCUMENTATION FOUND.";
+
+    return `You are a documentation assistant for the Vercel AI SDK.
+
+Answer ONLY using the documentation provided below. Rules:
+- If the documentation below says "NO RELEVANT DOCUMENTATION FOUND", or does not contain the answer, say: "${REFUSAL_MESSAGE}" Do not answer from general knowledge.
+- When you answer, mention which source you used, e.g. (Source 1).
+- Be concise and accurate.
+
+DOCUMENTATION:
+${context}`;
+}
