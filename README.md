@@ -100,8 +100,12 @@ it.
   right chunks either way, the strict prompt over-refuses on phrasing. Deliberately not
   patched: a narrow prompt tweak is whack-a-mole, and the general fix can't be verified
   without an eval set. Parked as a regression case.
-- **No rate limiting on `/api/chat`.** A public endpoint in front of paid API keys.
-  Acceptable for a low-traffic demo, not for anything real.
+- **Conversation history is client-supplied.** Request validation strips forged *structure*
+  — extra roles, oversized payloads, unexpected parts — but not forged *text*. A client can
+  still send a fabricated assistant turn. The real fix is server-side sessions.
+- **The rate limiter fails open.** If Redis is unreachable, requests are allowed and the
+  failure is logged. A demo staying up matters more than a few unmetered minutes; anywhere
+  real money is at stake, fail closed and alert.
 - **No ANN index on the embedding column** — deliberate. At 853 rows an exact scan has
   perfect recall and is fast; hnsw/ivfflat trades recall for speed and only pays off at
   a far larger corpus.
@@ -133,6 +137,41 @@ npm run dev
 ```
 
 `npm run exp:chunking` re-runs the chunking experiment behind the 0.546 → 0.643 number.
+
+## Security
+
+Public endpoint, personal API keys — so the threat model is cost first, then grounding.
+
+**Cost.** Three sliding windows in Redis (Upstash): burst 10/min, per-visitor 50/day, and a
+**global 800/day ceiling ≈ €0.50**, derived from measured per-request cost rather than picked.
+The global one is the point: a per-user limit bounds abuse, but a public link means hundreds
+of distinct IPs each with their own allowance, so only a global counter bounds spend. Redis
+rather than Postgres because a limiter must be atomic — count-then-insert races exactly when
+you're being hit hardest. In-memory is worse: serverless instances don't share memory, so the
+effective ceiling rises with the load it exists to stop.
+
+Callers are identified by a salted hash of their IP, never the raw address.
+
+**Input.** The request body is parsed and rebuilt rather than trusted — only `role` and text
+parts are read, capped at 20 messages / 4,000 chars each / 24,000 total, and `system` is not
+an accepted role.
+
+**Injection.** Eight adversarial cases run in the regression suite, 8 attempts each, two of
+them multi-turn:
+
+```
+injection resisted 8/8   (2 multi-turn, 6 single-turn, 8 attempts each)
+```
+
+That number means *those eight attacks don't work* — not that the app is safe. It exists
+because a manual attempt extracted the entire system prompt while the suite reported the same
+case as passing: every eval case was single-turn, and the attack only reproduced inside a
+conversation. Adding history to the dataset reproduced it immediately, and the fix then had a
+failing test to prove itself against.
+
+Worth stating plainly: the exposure here is low because the model **has no tools** and the
+corpus is public. Posture comes from what capability you expose, not from how the prompt is
+worded.
 
 ## Evals
 
