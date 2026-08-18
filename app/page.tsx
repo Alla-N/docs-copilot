@@ -5,6 +5,7 @@ import { useState } from "react";
 
 import { ChatMessage } from "@/lib/chat-types";
 import { isRefusal } from "@/lib/refusal";
+import { parseRateLimit, REPO_URL } from "@/lib/rate-limit-message";
 
 /**
  * Minimal inline markdown: `code` and **bold**. The model emits both and rendering
@@ -37,6 +38,7 @@ export default function Chat() {
     const { messages, sendMessage, status, error, regenerate } = useChat<ChatMessage>();
 
     const isBusy = status === "submitted" || status === "streaming";
+    const rateLimit = parseRateLimit(error);
 
     return (
         <div className="flex flex-col w-full max-w-3xl mx-auto px-4 pt-10 pb-44">
@@ -137,7 +139,24 @@ export default function Chat() {
                     </div>
                 )}
 
-                {error && (
+                {error && rateLimit && (
+                    // A rate limit is not an error the visitor caused — it's a budget
+                    // decision. Amber and explanatory, not red and apologetic.
+                    <div className="rounded-xl border p-4 text-sm border-amber-200 bg-amber-50 text-amber-900 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-100">
+                        <div className="font-medium">{rateLimit.title}</div>
+                        <p className="mt-1 leading-relaxed text-amber-800 dark:text-amber-200/90">{rateLimit.body}</p>
+                        <a
+                            href={REPO_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="mt-3 inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors border-amber-300 hover:bg-amber-100 dark:border-amber-800 dark:hover:bg-amber-900/40"
+                        >
+                            View the project on GitHub →
+                        </a>
+                    </div>
+                )}
+
+                {error && !rateLimit && (
                     <div className="rounded-xl border p-4 text-sm border-red-200 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200">
                         <div className="font-medium">Something went wrong.</div>
                         <div className="mt-0.5 text-red-600 dark:text-red-300">The request failed. Please try again.</div>

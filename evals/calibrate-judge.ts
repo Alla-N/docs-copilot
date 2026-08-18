@@ -46,7 +46,7 @@ type Sample = {
 };
 
 async function main() {
-    const answerable = CASES.filter((c) => c.shouldAnswer);
+    const answerable = CASES.filter((c) => c.shouldAnswer === true && !c.injection);
 
     // ── 1. Produce one real answer per answerable case ───────────
     const base: { id: string; question: string; source?: string; chunks: RetrievedChunk[]; answer: string }[] = [];
