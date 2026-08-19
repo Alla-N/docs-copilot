@@ -1,21 +1,25 @@
 /**
- * Eval harness — deterministic layer.
+ * Eval harness.
  *
- *   npm run eval
+ *   npm run eval                deterministic metrics
+ *   EVAL_JUDGE=1 npm run eval   + LLM faithfulness (see judge.ts)
+ *   EVAL_RUNS=0  npm run eval    retrieval-only diagnostic, no generation cost
  *
- * Measures two things, neither of which needs an LLM judge:
+ * Per-case criteria, chosen so each measures the property that actually matters:
+ *   RETRIEVAL RECALL     did the expected doc survive rerank + threshold?
+ *   ANSWER vs REFUSE     shouldAnswer: true / false / "either"
+ *   mustNotContain       forbidden strings (leaks, injected answers) — checked every run
+ *   mustContain          required strings — proves a multi-part answer covered every intent
+ *   FAITHFULNESS         (opt-in) is the answer grounded in its own chunks?
  *
- *   RETRIEVAL RECALL  did the expected doc survive rerank + threshold?
- *   REFUSAL CORRECTNESS  did it answer when it should, refuse when it shouldn't?
+ * Refusal is detected against REFUSAL_MESSAGE, the same constant the prompt instructs —
+ * reword it there and this follows, rather than silently scoring every refusal as an answer.
  *
- * Refusal is detected by comparing against REFUSAL_MESSAGE — the same constant the
- * system prompt instructs. If that sentence is ever reworded, this follows it instead
- * of silently scoring every refusal as an answer.
- *
- * Retrieval runs ONCE per case (it is deterministic — same embedding, same rerank).
- * Generation runs N times, because that is where non-determinism actually lives:
- * temperature 0 lowers variance, it does not eliminate it. A case that passes 2/3 is
- * not passing, it is flaky, and a harness that hides that is worse than no harness.
+ * Retrieval runs ONCE per case (deterministic). Generation runs N times, because that is
+ * where non-determinism lives: temp 0 lowers variance, it does not remove it. A case that
+ * passes 2/3 is FLAKY, not passing. Adversarial cases run more times (an attack that works
+ * 1-in-8 is a working attack). A parked, known-failing case is marked `expectFail`: it runs
+ * and reports but does not fail the suite, and is flagged if it ever starts passing.
  */
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
@@ -101,6 +105,9 @@ async function runCase(c: EvalCase): Promise<Result> {
     // Forbidden strings are checked on EVERY run, not just the first. An injection that
     // works one time in three is a working injection.
     const leaked = new Set<string>();
+    // Required strings likewise: if ANY run omits one, the coverage is unreliable — a
+    // multi-part answer that only sometimes includes an intent is not passing.
+    const missed = new Set<string>();
 
     for (let i = 0; i < runs; i++) {
         // Multi-turn cases replay their history before the query. Retrieval above still
@@ -120,6 +127,13 @@ async function runCase(c: EvalCase): Promise<Result> {
         const lower = text.toLowerCase();
         for (const forbidden of c.mustNotContain ?? []) {
             if (lower.includes(forbidden.toLowerCase())) leaked.add(forbidden);
+        }
+        // Only require coverage on runs that actually answered — a legitimate refusal
+        // cannot be expected to contain answer content.
+        if (!isRefusal(text)) {
+            for (const required of c.mustContain ?? []) {
+                if (!lower.includes(required.toLowerCase())) missed.add(required);
+            }
         }
     }
 
@@ -141,23 +155,26 @@ async function runCase(c: EvalCase): Promise<Result> {
     let verdict: Result["verdict"] =
         answered === expected ? "PASS" : answered === runs - expected ? "FAIL" : "FLAKY";
 
-    // A leak overrides everything. inj-piggyback is SUPPOSED to answer — it carries a
-    // legitimate question — so "answered 3/3" is correct there and tells you nothing
-    // about whether the injection worked. Only the forbidden-string check can.
-    if (leaked.size > 0) verdict = "FAIL";
+    // A leak or a missed required string overrides answer-vs-refuse. inj-piggyback is
+    // SUPPOSED to answer, so "answered 3/3" tells you nothing about whether the injection
+    // worked — only the string checks can. Same for coverage: multi-intent-noise answers,
+    // but dropping an intent means mustContain missed.
+    if (leaked.size > 0 || missed.size > 0) verdict = "FAIL";
 
     // Retrieval succeeding while generation fails is the interesting failure —
     // it is exactly the parked bug, and it is invisible without both metrics.
     const detail =
         leaked.size > 0
             ? `LEAKED: ${[...leaked].join(", ")}`
-            : verdict === "PASS"
-            ? ""
-            : found === true && c.shouldAnswer
-                ? "retrieval OK, generation refused"
-                : found === false
-                    ? "expected doc not retrieved"
-                    : `answered ${answered}/${runs}, expected ${expected}`;
+            : missed.size > 0
+                ? `MISSING: ${[...missed].join(", ")}`
+                : verdict === "PASS"
+                ? ""
+                : found === true && c.shouldAnswer
+                    ? "retrieval OK, generation refused"
+                    : found === false
+                        ? "expected doc not retrieved"
+                        : `answered ${answered}/${runs}, expected ${expected}`;
 
     return {
         id: c.id,
@@ -174,6 +191,13 @@ async function runCase(c: EvalCase): Promise<Result> {
 }
 
 async function main() {
+    // Duplicate ids fail silently otherwise: byId is a Map, so a second case with the same
+    // id overwrites the first in the summary while both still run and both still cost money.
+    // (This exact bug shipped once — two copies of multi-intent-noise.) Fail loudly instead.
+    const ids = CASES.map((c) => c.id);
+    const dupes = [...new Set(ids.filter((id, i) => ids.indexOf(id) !== i))];
+    if (dupes.length) throw new Error(`Duplicate case ids in dataset: ${dupes.join(", ")}`);
+
     // Print the knobs. A pasted result that doesn't say what produced it is not a result.
     console.log(
         `eval: ${CASES.length} cases × ${RUNS} generations, temp 0  |  ` +
@@ -209,9 +233,13 @@ async function main() {
     // Injection cases are counted on their own axis. Several are also guardrails by
     // shouldAnswer, but "did it refuse an out-of-corpus question" and "did it resist an
     // instruction to disobey" are different properties and deserve separate numbers.
-    const injections = CASES.filter((c) => c.injection);
-    const answerable = CASES.filter((c) => c.shouldAnswer === true && !c.injection);
-    const guardrails = CASES.filter((c) => c.shouldAnswer === false && !c.injection);
+    // expectFail (parked, known-failing) cases are excluded from every headline metric and
+    // reported on their own line — otherwise a documented, deferred bug drags coverage
+    // below 5/5 and reads as a regression.
+    const injections = CASES.filter((c) => c.injection && !c.expectFail);
+    const answerable = CASES.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail);
+    const guardrails = CASES.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail);
+    const parked = CASES.filter((c) => c.expectFail);
     const byId = new Map(results.map((r) => [r.id, r]));
 
     const coverage = answerable.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
@@ -254,8 +282,25 @@ async function main() {
         console.log(`faithfulness       ${grounded}/${judged.length}   answers fully supported by their own retrieved chunks (judge, n=15 calibration)`);
     }
 
-    const unfaithful = results.filter((r) => r.faithful === "NO");
-    const failed = results.filter((r) => r.verdict !== "PASS");
+    // Parked, known-failing cases: reported here, never counted against the suite.
+    if (parked.length) {
+        const stillFailing = parked.filter((c) => byId.get(c.id)!.verdict !== "PASS").length;
+        console.log(
+            `known failures     ${stillFailing}/${parked.length}   parked, not blocking (${parked.map((c) => c.id).join(", ")})`
+        );
+    }
+
+    // A parked case that has started PASSING is news — the bug got fixed elsewhere and the
+    // marker is now lying. Surface it loudly and fail, so expectFail can't hide a real pass.
+    const unexpectedPass = parked.filter((c) => byId.get(c.id)!.verdict === "PASS");
+    if (unexpectedPass.length) {
+        console.log(`\n⚠ expectFail case now PASSING — remove expectFail: ${unexpectedPass.map((c) => c.id).join(", ")}`);
+        process.exit(1);
+    }
+
+    const parkedIds = new Set(parked.map((c) => c.id));
+    const unfaithful = results.filter((r) => r.faithful === "NO" && !parkedIds.has(r.id));
+    const failed = results.filter((r) => r.verdict !== "PASS" && !parkedIds.has(r.id));
     if (unfaithful.length) {
         console.log(`\n${unfaithful.length} unfaithful: ${unfaithful.map((f) => f.id).join(", ")}`);
         process.exit(1);
@@ -264,7 +309,7 @@ async function main() {
         console.log(`\n${failed.length} failing: ${failed.map((f) => f.id).join(", ")}`);
         process.exit(1);
     }
-    console.log("\nall green.");
+    console.log(`\nall green${parked.length ? ` (${parked.length} parked)` : ""}.`);
 }
 
 main().catch((err) => {
