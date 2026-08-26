@@ -2,6 +2,7 @@
   "name": "docs-copilot",
   "version": "0.1.0",
   "private": true,
+  "homepage": "https://docs-copilot-w89t.vercel.app",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
