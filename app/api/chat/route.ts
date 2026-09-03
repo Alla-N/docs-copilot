@@ -7,7 +7,8 @@ import {
 import { openai } from "@ai-sdk/openai";
 
 import { ChatMessage } from "@/lib/chat-types";
-import { retrieve, buildSystemPrompt } from "@/lib/retrieve";
+import { buildSystemPrompt } from "@/lib/retrieve";
+import { plannedRetrieve, GREETING_MESSAGE } from "@/lib/plan";
 import { logQuery } from "@/lib/query-log";
 import { parseChatRequest, BadRequestError } from "@/lib/chat-request";
 import { checkRateLimit, clientKey } from "@/lib/rate-limit";
@@ -15,13 +16,8 @@ import { checkRateLimit, clientKey } from "@/lib/rate-limit";
 export async function POST(req: Request) {
     try {
         // ── 1. Rate limit BEFORE any paid work ───────────────────────
-        // Ordering matters: embedding, reranking and generation all cost money, so the
-        // limiter runs before the request is even parsed.
         const limit = await checkRateLimit(clientKey(req));
         if (!limit.allowed) {
-            // Structured body: the client transport surfaces the response text as
-            // error.message, so shipping JSON lets the UI explain WHICH limit was hit
-            // instead of showing one generic failure.
             return Response.json(
                 { code: "rate_limited", scope: limit.scope, retryAfter: limit.retryAfter },
                 { status: 429, headers: { "Retry-After": String(limit.retryAfter) } }
@@ -29,29 +25,56 @@ export async function POST(req: Request) {
         }
 
         // ── 2. Parse and normalise — never trust the client's shape ──
-        // Returns a message array we BUILT, not one we inspected: role + text only,
-        // capped, assistant-authored parts stripped.
         const { question, messages } = parseChatRequest(await req.json());
 
-        // ── 3. Retrieve — embed, vector search, rerank, threshold ────
-        // Lives in lib/retrieve.ts so the eval harness runs this exact code.
+        // Prior turns (everything before the current question) feed the planner so it can
+        // resolve "it"/"that" in a follow-up. Text only, user/assistant only.
+        const history = messages
+            .slice(0, -1)
+            .filter(
+                (m): m is { role: "user" | "assistant"; content: string } =>
+                    (m.role === "user" || m.role === "assistant") && typeof m.content === "string"
+            )
+            .map((m) => ({ role: m.role, text: m.content }));
+
+        // ── 3. Plan + retrieve — expand/split/resolve, then search each sub-query ──
+        // plannedRetrieve orchestrates retrieve(); the eval harness calls the SAME function.
         const startedAt = Date.now();
-        const { relevant, mode } = await retrieve(question);
+        const { greeting, relevant, mode, subQueries } = await plannedRetrieve(question, history);
         const retrievalMs = Date.now() - startedAt;
 
-        // ── 4. Generate, grounded ────────────────────────────────────
-        const result = streamText({
-            model: openai("gpt-4o-mini"),
-            temperature: 0,
-            system: buildSystemPrompt(relevant),
-            messages,
-            // Fires after the stream completes, so logging never delays a token.
-            // Deliberately not awaited and it cannot throw — telemetry must not
-            // be able to break the request it is observing.
-            onFinish: ({ text }) => {
-                void logQuery({ question, answer: text, relevant, mode, latencyMs: retrievalMs });
-            },
-        });
+        // Plan-and-execute: generation ANSWERS the planner's resolved sub-queries, not the
+        // raw message. The answerer anchors on the literal last turn, so a terse "What is
+        // SDK?" gets refused against context its explicit twin answers from, and adversarial
+        // noise primes it to drop legit intents. Swapping the final user turn for the resolved
+        // queries fixes both: shorthand is already expanded and the noise never reaches
+        // generation. Safe — off-topic/injection yield no usable sub-queries, so the planner
+        // falls back to the raw question and rewrites nothing into an answerable one. Same
+        // swap the eval performs, so eval and prod stay identical.
+        const genMessages =
+            !greeting && subQueries.length
+                ? [...messages.slice(0, -1), { role: "user" as const, content: subQueries.join("\n") }]
+                : messages;
+
+        // ── 4. Generate ──────────────────────────────────────────────
+        // A greeting short-circuits grounding: reply with the fixed scope message instead of
+        // cold-refusing "hi". Everything else is grounded in the unioned retrieved chunks.
+        const result = greeting
+            ? streamText({
+                model: openai("gpt-4o-mini"),
+                temperature: 0,
+                system: `Reply with EXACTLY the following text, verbatim, and nothing else:\n\n${GREETING_MESSAGE}`,
+                messages,
+            })
+            : streamText({
+                model: openai("gpt-4o-mini"),
+                temperature: 0,
+                system: buildSystemPrompt(relevant),
+                messages: genMessages,
+                onFinish: ({ text }) => {
+                    void logQuery({ question, answer: text, relevant, mode, latencyMs: retrievalMs });
+                },
+            });
 
         const stream = createUIMessageStream<ChatMessage>({
             onError: (err) => {
@@ -59,7 +82,7 @@ export async function POST(req: Request) {
                 return "Stream failed";
             },
             execute: async ({ writer }) => {
-                if (relevant.length > 0) {
+                if (!greeting && relevant.length > 0) {
                     writer.write({
                         type: "data-sources",
                         data: relevant.map((c, i) => ({
@@ -76,9 +99,6 @@ export async function POST(req: Request) {
 
         return createUIMessageStreamResponse({ stream });
     } catch (err) {
-        // A malformed request is the caller's fault and gets a 400 with a usable message.
-        // Everything else is ours and stays opaque — internal errors must not leak
-        // schema names, table names or stack traces to a public endpoint.
         if (err instanceof BadRequestError) {
             return Response.json({ error: err.message }, { status: 400 });
         }

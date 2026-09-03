@@ -24,7 +24,8 @@
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
 
-import { retrieve, buildSystemPrompt, isRefusal, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { buildSystemPrompt, isRefusal, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { plannedRetrieve, GREETING_MESSAGE } from "../lib/plan";
 import { CASES, type EvalCase } from "./dataset";
 import { judgeFaithfulness } from "./judge";
 
@@ -41,6 +42,10 @@ const RUNS = Number(process.env.EVAL_RUNS ?? 3);
  * system prompt when tried by hand.
  */
 const ADVERSARIAL_RUNS = Number(process.env.EVAL_ADVERSARIAL_RUNS ?? 8);
+
+/** EVAL_ONLY=id1,id2 runs just those cases — for investigating a failure without paying
+ *  for the whole suite. Metrics then report over the subset, which is fine for debugging. */
+const ONLY = (process.env.EVAL_ONLY ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
 /**
  * Faithfulness is opt-in: EVAL_JUDGE=1 npm run eval
@@ -77,8 +82,19 @@ type Result = {
 
 async function runCase(c: EvalCase): Promise<Result> {
     const t0 = performance.now();
-    const { relevant, mode } = await retrieve(c.query);
+    const { relevant, mode, greeting, subQueries } = await plannedRetrieve(c.query, c.history ?? []);
     retrievalMs.push(performance.now() - t0);
+
+    // Plan-and-execute: generation ANSWERS the planner's resolved sub-queries, not the raw
+    // message. This is the "execute/synthesize" step actually using the plan. It matters
+    // because the answerer anchors on the literal user turn: a terse "What is SDK?" gets
+    // refused against context its explicit twin "What is the AI SDK?" answers from, and the
+    // adversarial noise in multi-intent primes the model to dump legit intents. Feeding the
+    // resolved queries removes both — the noise never reaches generation, and shorthand is
+    // already expanded. Safe: off-topic/injection produce no usable sub-queries, so the
+    // planner falls back to the raw question and nothing is rewritten into an answerable one.
+    // Same computation the production route uses, so the eval measures the real pipeline.
+    const resolvedQuestion = !greeting && subQueries.length ? subQueries.join("\n") : c.query;
     if (mode === "cosine-fallback") console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
 
     const found = c.expectedSource
@@ -93,6 +109,9 @@ async function runCase(c: EvalCase): Promise<Result> {
         // Inspect the data, don't trust the count: a guardrail is only useful if the
         // chunks reaching the model look plausible enough to tempt it.
         console.log(`  ${c.id}`);
+        if (greeting) console.log("      planner → [greeting]");
+        else if (subQueries.length > 1 || (subQueries[0] && subQueries[0] !== c.query))
+            console.log(`      planner → ${JSON.stringify(subQueries)}`);
         for (const r of relevant) console.log(`      ${r.score.toFixed(3)}  ${r.title}`);
         if (!relevant.length) console.log("      (nothing cleared the threshold)");
         return { id: c.id, retrieved: found === null ? "—" : found ? "yes" : "NO", chunks, topScore, answered: 0, runs: 0, sample: "", faithful: "—", verdict: "—", detail: "" };
@@ -112,15 +131,20 @@ async function runCase(c: EvalCase): Promise<Result> {
     for (let i = 0; i < runs; i++) {
         // Multi-turn cases replay their history before the query. Retrieval above still
         // used c.query alone, matching production, which embeds only the latest message.
-        const { text } = await generateText({
-            model: openai("gpt-4o-mini"),
-            temperature: 0,
-            system: buildSystemPrompt(relevant),
-            messages: [
-                ...(c.history ?? []).map((h) => ({ role: h.role, content: h.text })),
-                { role: "user" as const, content: c.query },
-            ],
-        });
+        // The final user turn is the planner's RESOLVED question, not the raw message.
+        const text = greeting
+            ? GREETING_MESSAGE
+            : (
+                await generateText({
+                    model: openai("gpt-4o-mini"),
+                    temperature: 0,
+                    system: buildSystemPrompt(relevant),
+                    messages: [
+                        ...(c.history ?? []).map((h) => ({ role: h.role, content: h.text })),
+                        { role: "user" as const, content: resolvedQuestion },
+                    ],
+                })
+            ).text;
         if (!isRefusal(text)) answered++;
         if (i === 0) firstAnswer = text;
 
@@ -176,6 +200,12 @@ async function runCase(c: EvalCase): Promise<Result> {
                         ? "expected doc not retrieved"
                         : `answered ${answered}/${runs}, expected ${expected}`;
 
+    if (verdict !== "PASS" && !greeting && relevant.length) {
+        console.log(`      [context] ${relevant.length} chunks:`);
+        for (const r of relevant)
+            console.log(`        ${r.score.toFixed(3)} ${r.title}: ${r.content.replace(/\s+/g, " ").slice(0, 130)}`);
+    }
+
     return {
         id: c.id,
         retrieved: found === null ? "—" : found ? "yes" : "NO",
@@ -204,16 +234,20 @@ async function main() {
         `candidates ${VECTOR_CANDIDATES} → rerank top ${RERANK_TOP_N} → threshold ${RERANK_THRESHOLD}\n`
     );
 
+    const active = ONLY.length ? CASES.filter((c) => ONLY.includes(c.id)) : CASES;
+    if (ONLY.length) console.log(`(EVAL_ONLY: ${active.map((c) => c.id).join(", ")})\n`);
+
     const results: Result[] = [];
-    for (const [i, c] of CASES.entries()) {
+    for (const [i, c] of active.entries()) {
         if (i > 0) await sleep(RERANK_INTERVAL_MS);
         const r = await runCase(c);
         results.push(r);
         if (RUNS > 0) {
             console.log(`  ${r.verdict.padEnd(5)} ${r.id.padEnd(22)} ${r.detail}`);
-            // Always show what an adversarial case actually produced. Inferring behaviour
-            // from a verdict is how three wrong criteria survived this long.
-            if (c.injection) console.log(`         → ${r.sample.replace(/\s+/g, " ").slice(0, 160)}`);
+            // Show what the model actually produced for adversarial cases AND any failure —
+            // inferring behaviour from a verdict is how wrong criteria survive. Look, don't guess.
+            if (c.injection || r.verdict !== "PASS")
+                console.log(`         → ${r.sample.replace(/\s+/g, " ").slice(0, 1200)}`);
         }
     }
 
@@ -236,10 +270,10 @@ async function main() {
     // expectFail (parked, known-failing) cases are excluded from every headline metric and
     // reported on their own line — otherwise a documented, deferred bug drags coverage
     // below 5/5 and reads as a regression.
-    const injections = CASES.filter((c) => c.injection && !c.expectFail);
-    const answerable = CASES.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail);
-    const guardrails = CASES.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail);
-    const parked = CASES.filter((c) => c.expectFail);
+    const injections = active.filter((c) => c.injection && !c.expectFail);
+    const answerable = active.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail);
+    const guardrails = active.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail);
+    const parked = active.filter((c) => c.expectFail);
     const byId = new Map(results.map((r) => [r.id, r]));
 
     const coverage = answerable.filter((c) => byId.get(c.id)!.verdict === "PASS").length;

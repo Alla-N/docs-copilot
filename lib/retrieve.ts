@@ -53,7 +53,16 @@ const supabase = createClient(
     process.env.SUPABASE_SERVICE_KEY!
 );
 
-export async function retrieve(question: string): Promise<{
+/**
+ * @param query     the real question — used for RERANKING (a cross-encoder judges
+ *                  question↔passage relevance well, so the true question belongs here).
+ * @param embedText what to EMBED for vector search. Defaults to `query`. HyDE passes a
+ *                  hypothetical *answer* here: a question embeds far from an answer written
+ *                  as a feature list ("AI SDK Core has functions for…"), so embedding a
+ *                  hypothetical answer instead surfaces the definitional chunk. Measured:
+ *                  no question phrasing retrieved Core: Overview; an answer-shaped one hit 0.953.
+ */
+export async function retrieve(query: string, embedText: string = query): Promise<{
     /** Everything vector search returned, in cosine order — used to measure what reranking changed. */
     candidates: { content: string; title: string; source_url: string; similarity: number }[];
     /** What survived reranking AND the threshold. This is what the model sees. */
@@ -63,9 +72,10 @@ export async function retrieve(question: string): Promise<{
 }> {
     // Same embedding model as ingestion — non-negotiable. Different models produce
     // vectors of the same dimension that mean nothing to each other.
+    // embedText is the HyDE hypothetical answer when provided, else the query itself.
     const { embedding } = await embed({
         model: openai.embedding("text-embedding-3-small"),
-        value: question,
+        value: embedText,
     });
 
     const { data, error } = await supabase.rpc("match_documents", {
@@ -86,7 +96,7 @@ export async function retrieve(question: string): Promise<{
     try {
         const { ranking } = await rerank({
             model: cohere.reranking("rerank-v3.5"),
-            query: question,
+            query,
             documents: candidates.map((d) => d.content),
             topN: RERANK_TOP_N,
         });
