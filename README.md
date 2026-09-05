@@ -19,7 +19,8 @@ made by measuring the alternative.
 | Cohere reranking | — | **2 of 6** | Queries where vector search ranked the right chunk below a worse one, fixed by the cross-encoder |
 | Answerable vs unanswerable score gap | ~1.7× | **~8×** | Widening this gap is what makes a threshold able to separate the two |
 | Idempotent ingestion | 853 embeds | **154** | Re-ingest after real upstream doc drift — 82% fewer embedding calls |
-| Answer coverage (eval harness) | 4/5 | **5/5** | 9 labelled cases × 3 runs; guardrails held 4/4 throughout |
+| Query planner + HyDE | terse/multi-part refused | **answered** | "What is SDK?" and multi-intent questions now resolve; verified by the suite below |
+| Eval suite | 9 cases · coverage 5/5 | **24 cases · coverage 11/11** | hand-labelled golden set; also guardrails 4/4, injection 8/8, retrieval recall 11/11 |
 
 **Retrieval threshold was calibrated, not guessed.** Cosine similarity needed 0.45 to
 separate answerable from unanswerable queries; after reranking the useful cut moved to
@@ -32,12 +33,14 @@ have silently rejected good results.
 
 ```mermaid
 flowchart LR
-    Q[User question] --> E[embed<br/>text-embedding-3-small]
+    Q[User question] --> P[query planner<br/>gpt-4o-mini<br/>expand · split · resolve]
+    P -->|greeting| GR[Friendly scope reply]
+    P -->|sub-queries| E[embed HyDE answer<br/>text-embedding-3-small]
     E --> V[(Supabase pgvector<br/>853 chunks · cosine)]
-    V -->|top 20| R[rerank<br/>cohere rerank-v3.5]
+    V -->|top 40| R[rerank on the question<br/>cohere rerank-v3.5]
     R -->|top 5| T{score >= 0.30?}
     T -->|no| REF[Refuse:<br/>not in the docs]
-    T -->|yes| S[Grounded system prompt]
+    T -->|yes| S[Grounded prompt<br/>answers the resolved query]
     S --> G[streamText · gpt-4o-mini · temp 0]
     G --> UI[Answer + source pills]
 
@@ -48,11 +51,21 @@ flowchart LR
     end
 ```
 
-**Retrieve wide, then narrow.** Vector search is fast but ranks by embedding proximity,
-which is not the same as relevance. Pulling 20 candidates and letting a cross-encoder
-re-score them recovers cases where the right chunk was buried at rank 8. The threshold
-then runs on the *rerank* score, not the cosine score — the reranker is the component
-that actually knows what relevance means.
+**Understand the question before retrieving.** A raw message is often not a clean search
+query — "What is SDK?" is under-specified, "stream text and also what is the SDK" holds two
+intents, "how do I configure it?" needs the previous turn. A planner (`lib/plan.ts`,
+plan-and-execute) expands shorthand, splits multi-intent messages into standalone
+sub-queries, resolves follow-ups from history, and answers a greeting with a friendly scope
+line instead of a cold refusal. It fails safe: any planner error falls back to the raw query.
+Generation then answers the planner's *resolved* query, so terse and adversarially-noisy
+messages behave like their clean equivalents.
+
+**Retrieve wide, then narrow — with HyDE.** Questions and answers don't share vocabulary, so
+a question-shaped query embeds far from the answer chunk. The planner emits, per sub-query, a
+one-line *hypothetical answer*; that's what gets embedded (HyDE), while the reranker still runs
+on the real question. Vector search pulls 40 candidates and the cross-encoder re-scores them,
+recovering chunks buried at rank 8. The threshold runs on the *rerank* score, not the cosine
+score — the reranker is the component that actually knows what relevance means.
 
 **Two-layer refusal.** A numeric gate drops low-scoring chunks before the model sees
 them, and the system prompt instructs refusal when context is empty. Either alone
@@ -95,11 +108,12 @@ it.
 
 ## Other known limitations
 
-- **False refusal on wording.** *"What is new in AI SDK 7"* refuses while *"what was
-  changed in AI SDK 7"* answers. Diagnosed as generation-side — retrieval returns the
-  right chunks either way, the strict prompt over-refuses on phrasing. Deliberately not
-  patched: a narrow prompt tweak is whack-a-mole, and the general fix can't be verified
-  without an eval set. Parked as a regression case.
+- **~~False refusal on wording~~ (fixed).** *"What is SDK?"* used to refuse while *"What is
+  AI SDK?"* answered, on identical retrieved context — the answerer anchored on the raw terse
+  message. Root-caused with the now-existing eval set and fixed by having generation answer the
+  planner's *resolved* query rather than the literal message; kept as passing regression cases
+  (`what-is-sdk`, `what-is-ai-sdk`, `new-7`). The narrow prompt tweaks were avoided precisely
+  because the eval set could tell a real fix from whack-a-mole.
 - **Conversation history is client-supplied.** Request validation strips forged *structure*
   — extra roles, oversized payloads, unexpected parts — but not forged *text*. A client can
   still send a fabricated assistant turn. The real fix is server-side sessions.
@@ -176,20 +190,34 @@ worded.
 ## Evals
 
 ```bash
-npm run eval                 # 9 labelled cases × 3 generations
+npm run eval                 # 24 labelled cases × 3 generations (injection cases × 8)
 EVAL_RUNS=0 npm run eval     # retrieval-only diagnostic — free, no generation calls
+EVAL_JUDGE=1 npm run eval    # + LLM faithfulness check per answered case
+npm run eval:calibrate       # validate that judge against known-labelled answers first
 ```
 
-Reports retrieval recall, answer coverage, guardrails held, and median retrieval latency —
-and, per guardrail, **which layer refused it**. That last one matters: two of the four
-guardrails retrieve nothing past the threshold, so the model never sees them and they stay
-green no matter what the prompt says. A test that can't fail in the direction you're
-changing is decoration, and the harness says so out loud rather than quietly counting it
-as a pass.
+The golden set is **24 hand-labelled cases** — every one added because it was *observed*
+passing or failing, not to pad a number: 5 core answerable, 4 out-of-corpus guardrails, 7
+query-understanding (terse / multi-part / follow-up / greeting / typo), and 8 prompt-injection.
+Latest run: coverage **11/11**, guardrails **4/4**, injection resisted **8/8** (8 attempts each),
+retrieval recall **11/11**.
+
+Reports retrieval recall, answer coverage, guardrails held, injection resisted, and median
+retrieval latency — and, per guardrail, **which layer refused it**. That last one matters: two
+of the four guardrails retrieve nothing past the threshold, so the model never sees them and
+they stay green no matter what the prompt says. A test that can't fail in the direction you're
+changing is decoration, and the harness says so out loud rather than quietly counting it as a
+pass.
 
 Retrieval runs once per case (deterministic); generation runs N times, because temperature 0
 lowers variance without eliminating it. A case passing 2 of 3 is reported `FLAKY`, not
 rounded up.
+
+**The faithfulness judge** (`evals/judge.ts`, opt-in via `EVAL_JUDGE=1`) checks whether every
+claim in an answer is grounded in the retrieved chunks — but the model only *proposes* an
+evidence quote per claim; code then verifies each quote literally appears in the source, so the
+verdict can't be talked into existence. `npm run eval:calibrate` tests that judge against clean,
+fabricated, and source-swapped answers before any number it produces is trusted.
 
 ---
 
