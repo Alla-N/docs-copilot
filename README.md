@@ -22,7 +22,7 @@ made by measuring the alternative.
 | Answerable vs unanswerable score gap | ~1.7× | **~8×** | Widening this gap is what makes a threshold able to separate the two |
 | Idempotent ingestion | 853 embeds | **154** | Re-ingest after real upstream doc drift — 82% fewer embedding calls |
 | Query planner + HyDE | terse/multi-part refused | **answered** | "What is SDK?" and multi-intent questions now resolve; verified by the suite below |
-| Eval suite | 9 cases · coverage 5/5 | **24 cases · coverage 11/11** | hand-labelled golden set; also guardrails 4/4, injection 8/8, retrieval recall 11/11 |
+| Eval suite | 9 cases · coverage 5/5 | **25 cases · coverage 12/12** | hand-labelled golden set; also guardrails 4/4, injection 8/8, retrieval recall 12/12 |
 
 **Retrieval threshold was calibrated, not guessed.** Cosine similarity needed 0.45 to
 separate answerable from unanswerable queries; after reranking the useful cut moved to
@@ -201,17 +201,17 @@ worded.
 ## Evals
 
 ```bash
-npm run eval                 # 24 labelled cases × 3 generations (injection cases × 8)
+npm run eval                 # 25 labelled cases × 3 generations (injection cases × 8)
 EVAL_RUNS=0 npm run eval     # retrieval-only diagnostic — free, no generation calls
 EVAL_JUDGE=1 npm run eval    # + LLM faithfulness check per answered case
 npm run eval:calibrate       # validate that judge against known-labelled answers first
 ```
 
-The golden set is **24 hand-labelled cases** — every one added because it was *observed*
-passing or failing, not to pad a number: 5 core answerable, 4 out-of-corpus guardrails, 7
-query-understanding (terse / multi-part / follow-up / greeting / typo), and 8 prompt-injection.
-Latest run: coverage **11/11**, guardrails **4/4**, injection resisted **8/8** (8 attempts each),
-retrieval recall **11/11**.
+The golden set is **25 hand-labelled cases** — every one added because it was *observed*
+passing or failing, not to pad a number: 5 core answerable, 4 out-of-corpus guardrails, 8
+query-understanding (terse / multi-part / follow-up / greeting / greeting+question / typo), and 8 prompt-injection.
+Latest run: coverage **12/12**, guardrails **4/4**, injection resisted **8/8** (8 attempts each),
+retrieval recall **12/12**.
 
 Reports retrieval recall, answer coverage, guardrails held, injection resisted, and median
 retrieval latency — and, per guardrail, **which layer refused it**. That last one matters: two
