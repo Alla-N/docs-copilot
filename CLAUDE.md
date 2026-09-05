@@ -1,1 +1,114 @@
 @AGENTS.md
+
+# docs-copilot — project instructions for coding agents
+
+A RAG assistant over the Vercel AI SDK docs (Next.js 16, AI SDK 7, OpenAI `gpt-4o-mini`,
+`text-embedding-3-small`, Cohere `rerank-v3.5`, Supabase pgvector, Upstash). Live at
+https://docs-copilot-w89t.vercel.app — one Vercel project, do not create a second.
+
+The project's thesis is **every design decision is measured**. An agent working here is
+expected to hold to that, not just to keep the tests green.
+
+## Map
+
+| Path | Owns |
+|---|---|
+| `app/api/chat/route.ts` | The **only** route: rate-limit → parse → plan → retrieve → generate |
+| `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; `DEBUG_PLAN=1` |
+| `lib/retrieve.ts` | embed → pgvector (top 40) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
+| `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
+| `lib/chat-request.ts` | zod parse-then-construct of the request body |
+| `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
+| `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
+| `evals/dataset.ts` · `run.ts` | 25 hand-labelled cases; the harness that gates CI |
+| `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
+| `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
+
+## Invariants — do not break these
+
+1. **The content hash is byte-identical in TypeScript and SQL.** `scripts/ingest.ts`
+   computes `sha256(source_url + "\n" + content)` exactly as `db/001_content_hash.sql`
+   does. Change one and idempotent ingestion silently re-embeds the whole corpus.
+2. **`app/api/` holds exactly one route.** Ingestion is a terminal script. Never add a
+   mutating public endpoint — the old `GET /api/ingest` was an unauthenticated way to
+   spend the owner's API credits.
+3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
+   from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
+   retrieval inside `evals/` — a copy drifts, and drifts toward passing.
+4. **Generation answers the planner's *resolved* query, not the raw message** — in the
+   route AND the harness. Change one, change the other. This is what makes "What is SDK?"
+   behave like "What is the AI SDK?".
+5. **Refusal detection is positional.** `isRefusal` matches the refusal's core sentence at
+   the *start* (or after a "The documentation doesn't cover…" prefix). Do not loosen it to
+   `includes()` — that scored partial answers as refusals and poisoned the production
+   query log (Day 12). Do not tighten it to the full message — the model drops the polite
+   tail and a must-refuse case went flaky (Day 13).
+6. **Thresholds are calibrated, not guessed.** Rerank 0.30, cosine-fallback 0.45, 40
+   candidates, top 5. Move one only with an eval run showing coverage *and* guardrails.
+7. **Planner rewrites nothing malicious into something retrievable.** Off-topic and
+   "ignore the docs" parts are *dropped*, never expanded into an AI-SDK-shaped query.
+   That is a security property. Greeting intent applies only when the whole message is a
+   greeting — a greeting attached to a question is a search.
+8. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
+   is never an accepted role; caps 20 msgs / 4k chars / 24k total. Never `String(err)`
+   to the client. Rate limit runs before any paid work.
+
+## How to change things here
+
+- **Baseline first, one variable at a time, full suite after.** `npm run eval` — the
+  *whole* thing, not `EVAL_ONLY`. Three fixes in this project passed the case under
+  scrutiny and broke others; each was caught only by re-running everything. A change
+  that turns two cases green and three red is a regression.
+- **Prompt-level fixes have lost to structural fixes four times** (false refusal, judge,
+  injection clauses, terse-query refusal). Reach for structure: a stage, a criterion, a
+  detector — not a sentence in the prompt. Tightening refusal wording tips borderline
+  cases to refuse; loosening it weakens guardrails. They are one dial.
+- **Criteria are as likely to be the bug as the system.** Before adding `mustContain`,
+  grep the corpus for the phrase — `"set of tools"` was a model paraphrase that never
+  existed in the docs. Use `shouldAnswer: "either"` + `mustNotContain` when
+  answer-vs-refuse is the wrong axis. The canned greeting is *not* a refusal, so
+  `shouldAnswer: true` alone passes a short-circuit.
+- **Every eval case is added because it was observed**, with a note saying how.
+  `evals/manual-qa.md` is where the hand tests live; a bug found there becomes a case.
+- **Look, don't guess.** `EVAL_RUNS=0` for retrieval-only; `DEBUG_PLAN=1` prints each
+  sub-query's hypothetical and pre-rerank candidates; a non-PASS prints the run that broke
+  expectation. Use them before theorising about retrieval.
+- **Spec first for anything non-trivial**: write `specs/<thing>.md` with the eval contract
+  (which cases flip, which must not move), then build to it.
+- Retrieval is nondeterministic even at temp 0 (the HyDE hypothetical is an LLM output).
+  A case near a threshold moves ±0.05 between runs; `FLAKY` is a real verdict, not a
+  rounding error. Don't declare a case stable from one run.
+
+## Commands
+
+```
+npm run dev                          # local app; limiter fails open without Upstash keys
+npm run eval                         # full suite: 25 cases × 3 gens (8 for injection); exits non-zero on fail
+EVAL_RUNS=0 npm run eval             # retrieval-only, no generation cost; fails on a recall miss
+EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
+DEBUG_PLAN=1 EVAL_RUNS=0 npm run eval # hypotheticals + vector candidates per sub-query
+EVAL_JUDGE=1 npm run eval            # + faithfulness judge per answered case
+npm run eval:calibrate               # validate the judge against known-labelled answers first
+npm run ingest / -- --write          # dry run prints the diff; --write applies it
+npx tsc --noEmit                     # typecheck (CI runs this before eval)
+```
+
+## Environment gotchas
+
+- Node **24** (`.nvmrc`). `npm i <one package>` can move others; re-check `tsc` after.
+- Secrets live in `.env.local` (never committed). `.env.example` *is* tracked — keep it
+  in sync when a new env var is read anywhere (`grep -r "process.env"`).
+- The Cohere trial key allows 10 rerank calls/min. The harness sleeps 6.5 s per case
+  (`RERANK_INTERVAL_MS`) and `retrieve()` degrades to cosine ordering on failure. Don't
+  remove either.
+- CI (`.github/workflows/eval.yml`): retrieval-only on every push, full suite on PRs to
+  `main`. Needs 4 repo secrets. Workflow files can't be written through the remote bridge.
+- Evals must run on the Mac, not in the Cowork bridge VM (`@esbuild/darwin-x64` is what's
+  installed). `tsc` works anywhere.
+
+## Out of scope — decided, not forgotten
+
+ReAct / tool-calling loops belong to Artifact 2, not here. Server-side sessions (forged
+assistant *text* is still client-supplied) is the real fix for history, deferred.
+Content-defined chunk boundaries would remove the ~14× re-ingest write amplification;
+deferred until an eval proves retrieval survives it.
