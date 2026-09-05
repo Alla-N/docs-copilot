@@ -133,16 +133,25 @@ it.
 ```bash
 git clone https://github.com/Alla-N/docs-copilot && cd docs-copilot
 npm install
-cp .env.example .env.local     # fill in the four keys
+cp .env.example .env.local     # fill in the keys below
 ```
 
 ```
+# required to run
 SUPABASE_URL=          SUPABASE_SERVICE_KEY=
 OPENAI_API_KEY=        COHERE_API_KEY=
+
+# required for a public deployment — the rate limiter
+UPSTASH_REDIS_REST_URL=   UPSTASH_REDIS_REST_TOKEN=   IP_HASH_SALT=
 ```
 
-Then, in the Supabase SQL editor, run `db/000_schema.sql` followed by
-`db/001_content_hash.sql`. Populate the corpus and start:
+Leave the Upstash keys unset for local development: the limiter detects it's unconfigured and
+**fails open**, so `npm run dev` works unmetered. Optional tuning knobs (candidate count,
+rerank depth, rate ceilings, planner/judge model) are listed with their defaults in
+`.env.example`.
+
+Then, in the Supabase SQL editor, run `db/000_schema.sql`, `db/001_content_hash.sql`, and
+`db/002_query_log.sql` in order. Populate the corpus and start:
 
 ```bash
 npm run ingest              # dry run — prints the diff, writes nothing
@@ -218,6 +227,10 @@ claim in an answer is grounded in the retrieved chunks — but the model only *p
 evidence quote per claim; code then verifies each quote literally appears in the source, so the
 verdict can't be talked into existence. `npm run eval:calibrate` tests that judge against clean,
 fabricated, and source-swapped answers before any number it produces is trusted.
+
+For hands-on checks beyond the automated set, `evals/manual-qa.md` is a 50-question bank
+(terse, multi-part, follow-up, out-of-scope, injection) with a note on what a good reply looks
+like for each group.
 
 ---
 
