@@ -1,5 +1,7 @@
 # docs-copilot
 
+[![eval](https://github.com/Alla-N/docs-copilot/actions/workflows/eval.yml/badge.svg)](https://github.com/Alla-N/docs-copilot/actions/workflows/eval.yml)
+
 A RAG assistant over the Vercel AI SDK documentation. Ask it a question about the SDK
 and it answers from 853 indexed chunks of the real docs, with clickable source pills —
 or refuses, when the docs don't cover it.
@@ -231,6 +233,16 @@ fabricated, and source-swapped answers before any number it produces is trusted.
 For hands-on checks beyond the automated set, `evals/manual-qa.md` is a 50-question bank
 (terse, multi-part, follow-up, out-of-scope, injection) with a note on what a good reply looks
 like for each group.
+
+**It runs in CI** (`.github/workflows/eval.yml`), priced in two tiers. Every push runs the
+retrieval-only mode — no generation calls — and **fails if an answerable case's expected doc no
+longer survives rerank + threshold**, so a retrieval regression can't land quietly. Pull
+requests to `main` (and manual runs) execute the full suite: 3 generations per case, 8 per
+injection case, verdicts, guardrails, injection. The harness exits non-zero on any failing
+verdict, on a recall miss, and on a parked case that has started passing — that's what makes it
+a gate rather than a log. Needs four repository secrets: `OPENAI_API_KEY`, `COHERE_API_KEY`,
+`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`. Wall clock is ~3–5 minutes, bounded by the 6.5 s/case
+throttle that keeps the Cohere trial key under its 10 calls/min ceiling.
 
 ---
 

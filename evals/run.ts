@@ -308,7 +308,18 @@ async function main() {
         );
     }
 
-    if (RUNS === 0) return;
+    if (RUNS === 0) {
+        // Retrieval-only mode is the cheap CI gate (no generation calls). It used to always
+        // exit 0, which made "runs on every push" a smoke test rather than a gate. A missing
+        // expected doc is a retrieval regression whether or not we generated an answer, so
+        // fail on recall here. Parked (expectFail) cases are already excluded from `answerable`.
+        if (recall < answerable.length) {
+            const missed = answerable.filter((c) => byId.get(c.id)!.retrieved !== "yes").map((c) => c.id);
+            console.log(`\nretrieval regression — expected doc not retrieved: ${missed.join(", ")}`);
+            process.exit(1);
+        }
+        return;
+    }
 
     if (JUDGE) {
         const judged = results.filter((r) => r.faithful !== "—");

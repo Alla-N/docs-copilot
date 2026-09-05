@@ -1,0 +1,62 @@
+# Eval as a CI gate.
+#
+# Two tiers, priced on purpose:
+#   push            → EVAL_RUNS=0  retrieval-only. No generation calls. Fails on a retrieval
+#                     regression (an answerable case whose expected doc no longer survives
+#                     rerank + threshold). Cheap enough to run on every push.
+#   pull_request    → full suite: 3 generations per case, 8 per injection case, verdicts,
+#     / manual        guardrails, injection. Costs real (small) money, so PRs to main only.
+#
+# Constraints the design respects:
+#   - The Cohere trial key allows 10 rerank calls/min. The harness already sleeps 6.5 s
+#     between cases (RERANK_INTERVAL_MS), so a 24-case run is ~3–5 min wall clock.
+#   - `npm run eval` reads .env.local, which does not exist in CI. `eval:ci` is the same
+#     harness without --env-file, so secrets flow in as ordinary environment variables.
+#   - The harness exits non-zero on any failing verdict, on an expectFail case that has
+#     started passing, and (retrieval-only mode) on a recall miss — that is what makes
+#     this a gate rather than a log.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   OPENAI_API_KEY  COHERE_API_KEY  SUPABASE_URL  SUPABASE_SERVICE_KEY
+# Upstash is not needed: the rate limiter is on the chat route, not in the eval path.
+
+name: eval
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes an in-flight run — no point spending
+# rerank/generation budget on a commit that has already been replaced.
+concurrency:
+  group: eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+      # push → retrieval-only gate; PR / manual → full suite.
+      EVAL_RUNS: ${{ github.event_name == 'push' && '0' || '3' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Eval (${{ github.event_name == 'push' && 'retrieval-only gate' || 'full suite' }})
+        run: npm run eval:ci

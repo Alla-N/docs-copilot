@@ -11,6 +11,7 @@
     "ingest": "tsx --env-file=.env.local scripts/ingest.ts",
     "exp:chunking": "tsx --env-file=.env.local scripts/experiments/chunking-comparison.ts",
     "eval": "tsx --env-file=.env.local evals/run.ts",
+    "eval:ci": "tsx evals/run.ts",
     "exp:refusal": "tsx --env-file=.env.local scripts/experiments/refusal-ab.ts",
     "eval:calibrate": "tsx --env-file=.env.local evals/calibrate-judge.ts",
     "exp:phrasing": "tsx --env-file=.env.local scripts/experiments/query-phrasing.ts"
