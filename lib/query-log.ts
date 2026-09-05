@@ -14,6 +14,7 @@ import { createClient } from "@supabase/supabase-js";
 
 import { isRefusal } from "./refusal";
 import { type RetrievalMode, type RetrievedChunk } from "./retrieve";
+import { type Visitor } from "./visitor";
 
 const supabase = createClient(
     process.env.SUPABASE_URL!,
@@ -26,6 +27,8 @@ export async function logQuery(entry: {
     relevant: RetrievedChunk[];
     mode: RetrievalMode;
     latencyMs: number;
+    /** Attribution (db/003). Optional so the harness and older callers need not supply it. */
+    visitor?: Visitor;
 }): Promise<void> {
     try {
         const { error } = await supabase.from("query_log").insert({
@@ -35,6 +38,12 @@ export async function logQuery(entry: {
             top_score: entry.relevant[0]?.score ?? null,
             retrieval_mode: entry.mode,
             latency_ms: Math.round(entry.latencyMs),
+            // Visitor attribution — already sanitised in lib/visitor.ts; all nullable.
+            visitor_hash: entry.visitor?.visitorHash ?? null,
+            landing_referrer: entry.visitor?.landingReferrer ?? null,
+            utm_source: entry.visitor?.utmSource ?? null,
+            country: entry.visitor?.country ?? null,
+            device: entry.visitor?.device ?? null,
         } as never);
         if (error) console.error("QUERY LOG FAILED:", error.message);
     } catch (err) {

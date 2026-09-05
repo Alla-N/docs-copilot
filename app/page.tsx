@@ -1,9 +1,11 @@
 "use client";
 
 import { useChat } from "@ai-sdk/react";
-import { useState } from "react";
+import { DefaultChatTransport } from "ai";
+import { useEffect, useMemo, useState } from "react";
 
 import { ChatMessage } from "@/lib/chat-types";
+import { captureLanding, landingHeaders } from "@/lib/landing";
 import { isRefusal } from "@/lib/refusal";
 import { parseRateLimit, REPO_URL } from "@/lib/rate-limit-message";
 
@@ -35,7 +37,17 @@ function renderInline(text: string) {
 
 export default function Chat() {
     const [input, setInput] = useState("");
-    const { messages, sendMessage, status, error, regenerate } = useChat<ChatMessage>();
+
+    // Where did this visitor come from? Captured once per session on mount, then sent as
+    // headers with every chat request so the query log can attribute questions to a channel.
+    // `headers` is resolved per request, so sessionStorage is read at send time — never on
+    // the server render. See specs/visitor-analytics.md.
+    useEffect(() => captureLanding(), []);
+    const transport = useMemo(
+        () => new DefaultChatTransport<ChatMessage>({ api: "/api/chat", headers: landingHeaders }),
+        []
+    );
+    const { messages, sendMessage, status, error, regenerate } = useChat<ChatMessage>({ transport });
 
     const isBusy = status === "submitted" || status === "streaming";
     const rateLimit = parseRateLimit(error);

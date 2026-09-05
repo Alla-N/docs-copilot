@@ -6,7 +6,7 @@ A RAG assistant over the Vercel AI SDK documentation. Ask it a question about th
 and it answers from 853 indexed chunks of the real docs, with clickable source pills —
 or refuses, when the docs don't cover it.
 
-**Live:** https://docs-copilot-w89t.vercel.app/
+**Live:** https://docs-copilot-w89t.vercel.app/?utm_source=github
 
 The interesting part isn't that it works. It's that every design decision below was
 made by measuring the alternative.
@@ -176,6 +176,17 @@ you're being hit hardest. In-memory is worse: serverless instances don't share m
 effective ceiling rises with the load it exists to stop.
 
 Callers are identified by a salted hash of their IP, never the raw address.
+
+**What's logged.** Every question goes to `query_log` (the text, whether it was refused, top
+rerank score, latency) so production traffic can be mined for eval cases. Since the app is
+linked from LinkedIn and a CV, each row also carries *attribution*: the same salted visitor
+hash, the linking site's hostname (captured once on landing — the API call's own referrer is
+always this origin), `utm_source`, country (ISO-2 from Vercel's edge), and device class.
+No raw IP, no full referrer URL, no city, no user-agent string; all client-supplied values
+are re-validated server-side (`lib/visitor.ts`). Page views come from Vercel Web Analytics,
+which is cookieless and beacons to Vercel rather than to this app — so it adds no public
+write surface of our own. Retention is 90 days. `visits_by_source` and `recent_visitors`
+(`db/003`) answer "which channel sent people, and what did they ask?".
 
 **Input.** The request body is parsed and rebuilt rather than trusted — only `role` and text
 parts are read, capped at 20 messages / 4,000 chars each / 24,000 total, and `system` is not

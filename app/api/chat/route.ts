@@ -12,6 +12,7 @@ import { plannedRetrieve, GREETING_MESSAGE } from "@/lib/plan";
 import { logQuery } from "@/lib/query-log";
 import { parseChatRequest, BadRequestError } from "@/lib/chat-request";
 import { checkRateLimit, clientKey } from "@/lib/rate-limit";
+import { visitorFrom } from "@/lib/visitor";
 
 export async function POST(req: Request) {
     try {
@@ -72,7 +73,12 @@ export async function POST(req: Request) {
                 system: buildSystemPrompt(relevant),
                 messages: genMessages,
                 onFinish: ({ text }) => {
-                    void logQuery({ question, answer: text, relevant, mode, latencyMs: retrievalMs });
+                    // Attribution headers are read here, after the answer streamed, and are
+                    // sanitised in lib/visitor.ts. They never touch retrieval or the prompt.
+                    void logQuery({
+                        question, answer: text, relevant, mode, latencyMs: retrievalMs,
+                        visitor: visitorFrom(req),
+                    });
                 },
             });
 

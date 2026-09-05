@@ -19,10 +19,12 @@ expected to hold to that, not just to keep the tests green.
 | `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
 | `lib/chat-request.ts` | zod parse-then-construct of the request body |
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
+| `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
 | `evals/dataset.ts` · `run.ts` | 25 hand-labelled cases; the harness that gates CI |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
+| `db/000..003_*.sql` | schema · content hash · query log · visitor attribution + views |
 
 ## Invariants — do not break these
 
@@ -32,6 +34,8 @@ expected to hold to that, not just to keep the tests green.
 2. **`app/api/` holds exactly one route.** Ingestion is a terminal script. Never add a
    mutating public endpoint — the old `GET /api/ingest` was an unauthenticated way to
    spend the owner's API credits.
+   Analytics follows the same rule: page views beacon to Vercel, and question attribution
+   rides on the existing rate-limited chat write — there is no `/api/track`.
 3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
    retrieval inside `evals/` — a copy drifts, and drifts toward passing.
