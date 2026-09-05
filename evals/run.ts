@@ -75,6 +75,8 @@ type Result = {
     answered: number;    // how many runs produced an answer rather than a refusal
     runs: number;
     sample: string;      // first response, for eyeballing adversarial cases
+    /** The run that broke expectation (answered when it should refuse, or vice versa), if any. */
+    odd?: { i: number; text: string };
     faithful: string;    // judge verdict on the first answer, when EVAL_JUDGE=1
     verdict: "PASS" | "FAIL" | "FLAKY" | "—";
     detail: string;
@@ -127,6 +129,11 @@ async function runCase(c: EvalCase): Promise<Result> {
     // Required strings likewise: if ANY run omits one, the coverage is unreliable — a
     // multi-part answer that only sometimes includes an intent is not passing.
     const missed = new Set<string>();
+    // The run that broke expectation, when one did. `firstAnswer` is run 0, which is often
+    // a perfectly good refusal while run 2 is the one that got counted as "answered" — and
+    // printing only run 0 made a FLAKY verdict impossible to diagnose without guessing.
+    // Capture the first run whose refusal status disagrees with what the case expects.
+    let oddRun: { i: number; text: string } | null = null;
 
     for (let i = 0; i < runs; i++) {
         // Multi-turn cases replay their history before the query. Retrieval above still
@@ -145,8 +152,12 @@ async function runCase(c: EvalCase): Promise<Result> {
                     ],
                 })
             ).text;
-        if (!isRefusal(text)) answered++;
+        const refused = isRefusal(text);
+        if (!refused) answered++;
         if (i === 0) firstAnswer = text;
+        // shouldAnswer false + answered, or shouldAnswer true + refused, is the odd one out.
+        // "either" has no expectation about refusal, so it never produces an odd run.
+        if (!oddRun && c.shouldAnswer !== "either" && refused === c.shouldAnswer) oddRun = { i, text };
 
         const lower = text.toLowerCase();
         for (const forbidden of c.mustNotContain ?? []) {
@@ -214,6 +225,7 @@ async function runCase(c: EvalCase): Promise<Result> {
         answered,
         runs,
         sample: firstAnswer,
+        ...(oddRun ? { odd: oddRun } : {}),
         faithful,
         verdict,
         detail: detail || firstAnswer.slice(0, 0),
@@ -248,6 +260,11 @@ async function main() {
             // inferring behaviour from a verdict is how wrong criteria survive. Look, don't guess.
             if (c.injection || r.verdict !== "PASS")
                 console.log(`         → ${r.sample.replace(/\s+/g, " ").slice(0, 1200)}`);
+            // On a non-PASS, also show the run that actually broke expectation when it isn't
+            // run 0 — otherwise a FLAKY 1/3 prints a perfectly good refusal and hides the
+            // one reply that was scored the other way.
+            if (r.verdict !== "PASS" && r.odd && r.odd.i !== 0)
+                console.log(`         ↳ run ${r.odd.i + 1} (the odd one): ${r.odd.text.replace(/\s+/g, " ").slice(0, 1200)}`);
         }
     }
 

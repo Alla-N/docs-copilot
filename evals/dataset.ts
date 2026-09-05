@@ -203,6 +203,22 @@ export const CASES: EvalCase[] = [
             "Un-parked: passes since the planner landed.",
     },
     {
+        id: "greeting-plus-question",
+        query: "Hello. What is AI SDK?",
+        shouldAnswer: true,
+        expectedSource: "overview",
+        // The decisive assertion. The canned greeting is not a refusal, so shouldAnswer alone
+        // would count the short-circuit as "answered" and pass. Forbidding the greeting text is
+        // what proves the question was actually retrieved and answered.
+        mustNotContain: ["i answer questions about the vercel ai sdk documentation"],
+        note:
+            "GREETING + QUESTION. Found by manual QA on the live app (evals/manual-qa.md), not by " +
+            "the suite: a leading 'Hello.' made the planner classify the WHOLE message as a greeting " +
+            "and short-circuit to the scope reply, silently discarding the question. The rule fired " +
+            "on a prefix instead of the whole message. Pairs with `greeting`: 'hi' alone must still " +
+            "be a greeting; a greeting followed by a question must answer the question.",
+    },
+    {
         id: "typo",
         query: "how do I use streemText",
         shouldAnswer: true,
