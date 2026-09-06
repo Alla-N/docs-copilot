@@ -59,7 +59,10 @@ async function main() {
             system: buildSystemPrompt(relevant),
             prompt: c.query,
         });
-        base.push({ id: c.id, question: c.query, source: c.expectedSource, chunks: relevant, answer: text });
+        // `source` only picks a topically DISTANT partner below. For an any-of case the first
+        // slug is the primary page, which is all the distance check needs.
+        const source = Array.isArray(c.expectedSource) ? c.expectedSource[0] : c.expectedSource;
+        base.push({ id: c.id, question: c.query, source, chunks: relevant, answer: text });
         console.log(`  generated ${c.id}`);
     }
 

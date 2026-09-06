@@ -15,7 +15,10 @@
  * Refusal is detected against REFUSAL_MESSAGE, the same constant the prompt instructs —
  * reword it there and this follows, rather than silently scoring every refusal as an answer.
  *
- * Retrieval runs ONCE per case (deterministic). Generation runs N times, because that is
+ * Retrieval runs ONCE per case. It is *nearly* deterministic: embedding, vector search and
+ * rerank are, but the planner's HyDE hypothetical is model output, and a different
+ * hypothetical can reorder near-tied pages (the push gate retries a recall miss once, and
+ * says so — see the RUNS === 0 block). Generation runs N times, because that is
  * where non-determinism lives: temp 0 lowers variance, it does not remove it. A case that
  * passes 2/3 is FLAKY, not passing. Adversarial cases run more times (an attack that works
  * 1-in-8 is a working attack). A parked, known-failing case is marked `expectFail`: it runs
@@ -67,6 +70,17 @@ const retrievalMs: number[] = [];
 const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 6500);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Did the expected page survive rerank + threshold? `null` when the case has no expectation.
+ * `expectedSource` may be one slug or several — any match satisfies the case (see dataset.ts
+ * for why). One helper, used by the main pass and the push-gate retry, so both judge alike.
+ */
+function expectedFound(c: EvalCase, relevant: { source_url: string }[]): boolean | null {
+    if (!c.expectedSource) return null;
+    const wanted = Array.isArray(c.expectedSource) ? c.expectedSource : [c.expectedSource];
+    return relevant.some((r) => wanted.some((slug) => r.source_url.includes(slug)));
+}
+
 type Result = {
     id: string;
     retrieved: string;   // expected doc present in the retrieved set?
@@ -99,9 +113,7 @@ async function runCase(c: EvalCase): Promise<Result> {
     const resolvedQuestion = !greeting && subQueries.length ? subQueries.join("\n") : c.query;
     if (mode === "cosine-fallback") console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
 
-    const found = c.expectedSource
-        ? relevant.some((r) => r.source_url.includes(c.expectedSource!))
-        : null;
+    const found = expectedFound(c, relevant);
 
     const chunks = relevant.length;
     const topScore = chunks ? relevant[0].score.toFixed(3) : "—";
@@ -330,9 +342,33 @@ async function main() {
         // exit 0, which made "runs on every push" a smoke test rather than a gate. A missing
         // expected doc is a retrieval regression whether or not we generated an answer, so
         // fail on recall here. Parked (expectFail) cases are already excluded from `answerable`.
-        if (recall < answerable.length) {
-            const missed = answerable.filter((c) => byId.get(c.id)!.retrieved !== "yes").map((c) => c.id);
-            console.log(`\nretrieval regression — expected doc not retrieved: ${missed.join(", ")}`);
+        //
+        // A miss gets ONE retry before it fails the gate. Retrieval is not fully deterministic:
+        // the planner's HyDE hypothetical is model output (not seedable on the Responses API —
+        // see lib/plan.ts), and two near-tied pages can swap places between runs. A retry separates "the expected
+        // page is gone" (a real regression — fails both times) from "it lost a coin flip" (passes
+        // on retry). The retry is REPORTED, never silent: a case that keeps needing it is a case
+        // whose criterion or retrieval needs attention, and hiding that would turn the gate back
+        // into a smoke test. Snapshotting planner output would have been the deterministic
+        // alternative, but it would test a fixture instead of the pipeline.
+        const missed = answerable.filter((c) => byId.get(c.id)!.retrieved !== "yes");
+        const stillMissing: string[] = [];
+        const recovered: string[] = [];
+        for (const c of missed) {
+            await sleep(RERANK_INTERVAL_MS);
+            const { relevant } = await plannedRetrieve(c.query, c.history ?? []);
+            if (expectedFound(c, relevant)) {
+                recovered.push(c.id);
+                console.log(`  ↻ ${c.id}: expected doc NOT retrieved on first try, recovered on retry`);
+                for (const r of relevant) console.log(`      ${r.score.toFixed(3)}  ${r.title}`);
+            } else {
+                stillMissing.push(c.id);
+            }
+        }
+        if (recovered.length)
+            console.log(`\nrecovered on retry ${recovered.length}   ${recovered.join(", ")} — flaky retrieval, not a regression; if it repeats, widen expectedSource or look at DEBUG_PLAN=1`);
+        if (stillMissing.length) {
+            console.log(`\nretrieval regression — expected doc not retrieved twice: ${stillMissing.join(", ")}`);
             process.exit(1);
         }
         return;

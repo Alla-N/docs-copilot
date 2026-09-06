@@ -231,9 +231,14 @@ they stay green no matter what the prompt says. A test that can't fail in the di
 changing is decoration, and the harness says so out loud rather than quietly counting it as a
 pass.
 
-Retrieval runs once per case (deterministic); generation runs N times, because temperature 0
-lowers variance without eliminating it. A case passing 2 of 3 is reported `FLAKY`, not
-rounded up.
+Retrieval runs once per case; generation runs N times, because temperature 0 lowers variance
+without eliminating it. A case passing 2 of 3 is reported `FLAKY`, not rounded up. Retrieval
+is only *nearly* deterministic — the planner's HyDE hypothetical is model output, and a
+different hypothetical can swap two near-tied pages. (A fixed `seed` was tried and reverted:
+the Responses API ignores it, and switching APIs to make it count changed the planner's
+behaviour and regressed two cases — see `lib/plan.ts`.) So a
+case may name several correct pages (`expectedSource` accepts any-of), and the CI gate retries a
+recall miss once and prints `recovered on retry` when that happened, rather than hiding it.
 
 **The faithfulness judge** (`evals/judge.ts`, opt-in via `EVAL_JUDGE=1`) checks whether every
 claim in an answer is grounded in the retrieved chunks — but the model only *proposes* an
@@ -247,7 +252,8 @@ like for each group.
 
 **It runs in CI** (`.github/workflows/eval.yml`), priced in two tiers. Every push runs the
 retrieval-only mode — no generation calls — and **fails if an answerable case's expected doc no
-longer survives rerank + threshold**, so a retrieval regression can't land quietly. Pull
+longer survives rerank + threshold** on two consecutive tries, so a retrieval regression can't
+land quietly and a single HyDE coin-flip can't turn the badge red. Pull
 requests to `main` (and manual runs) execute the full suite: 3 generations per case, 8 per
 injection case, verdicts, guardrails, injection. The harness exits non-zero on any failing
 verdict, on a recall miss, and on a parked case that has started passing — that's what makes it

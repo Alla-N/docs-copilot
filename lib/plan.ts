@@ -34,6 +34,18 @@ export const GREETING_MESSAGE =
 const UNION_CAP = 8;
 /** A planner call should be cheap and fast; the small model is right here. */
 const PLANNER_MODEL = process.env.PLANNER_MODEL ?? "gpt-4o-mini";
+/*
+ * NOT seeded — tried and reverted (Day 14). The HyDE hypothetical is model output, and a
+ * different hypothetical can reorder near-tied pages, which is how one CI run failed on a case
+ * that passes locally. A fixed `seed` looked like the fix, but: (1) the default `openai(...)`
+ * model is the Responses API, which silently drops `seed` (an "unsupported setting" warning
+ * nothing surfaces); (2) switching to `openai.chat(...)` to make the seed reach OpenAI changed
+ * the planner's OUTPUTS for the same prompt — inj-forged-history started rewriting "What is
+ * the capital of France?" into "What is streamText" from history, and followup's plan varied
+ * anyway (seeds are best-effort at OpenAI). Two regressions for a determinism we didn't get.
+ * The variance is handled where it is measured instead: any-of `expectedSource` in the
+ * dataset, and a reported retry-once in the eval's push gate.
+ */
 
 /**
  * Each sub-query carries TWO strings, because embedding and reranking want different text:

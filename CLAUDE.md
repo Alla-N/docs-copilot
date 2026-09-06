@@ -80,8 +80,14 @@ expected to hold to that, not just to keep the tests green.
 - **Spec first for anything non-trivial**: write `specs/<thing>.md` with the eval contract
   (which cases flip, which must not move), then build to it.
 - Retrieval is nondeterministic even at temp 0 (the HyDE hypothetical is an LLM output).
-  A case near a threshold moves ±0.05 between runs; `FLAKY` is a real verdict, not a
-  rounding error. Don't declare a case stable from one run.
+  Don't reach for `seed`: the default Responses API silently ignores it, and switching the
+  planner to `openai.chat` to make it count changed its outputs and regressed two cases
+  (Day 14, reverted). A case near a threshold moves ±0.05 between runs; `FLAKY`
+  is a real verdict, not a rounding error. Don't declare a case stable from one run. When a
+  question has several genuinely correct pages, list them all in `expectedSource` (any-of);
+  never pad it with neighbours to make recall pass.
+- Refusal detection is compositional (lib/refusal.ts): negative opener about the docs +
+  only canonical refusal sentences after it. Don't add one-off regexes per new shape.
 
 ## Commands
 

@@ -35,26 +35,54 @@ export const REFUSAL_MESSAGE = "I don't have information about that in the docum
  * first and declines a clause at the end still does not count — the Day-12 includes() bug
  * cannot come back through here.
  *
- * For a specific out-of-scope topic the model names what it can't cover, in one of two shapes,
- * both complete refusals with nothing substantive said:
- *   a) "The documentation doesn't cover fine-tuning. <core refusal>[tail]" — prefix, then the
- *      core sentence; caught by requiring the core to be present after the prefix.
- *   b) "The documentation doesn't cover fine-tuning a model with the Vercel AI SDK." — the
- *      naming clause ALONE. Caught only when the WHOLE reply is that single sentence, matched on
- *      RAW text so the anchor holds: an injection leak ("…doesn't cover X, but here's how: …")
- *      puts content after the first period and fails it.
- * Neither shape can pass a real answer.
+ * For a specific out-of-scope topic the model names what it can't cover. Observed shapes:
+ *   a) "The documentation doesn't cover fine-tuning. <core refusal>[tail]"
+ *   b) "The documentation doesn't cover fine-tuning a model with the Vercel AI SDK."
+ *   c) "The documentation doesn't cover fine-tuning …. I can help with AI SDK docs. Ask me
+ *      about those and I'll help."  — prefix + polite tail, NO core sentence.
+ * The first detector listed (a) and (b) one by one, and then (c) showed up (1 run in 3 on
+ * guard-finetune) and slipped through. Enumerating shapes is a losing game, so the rule is now
+ * COMPOSITIONAL: a reply is a refusal when its first sentence is a negative statement about the
+ * docs ("The documentation doesn't cover/mention/… X") and EVERY sentence after it is one of the
+ * canonical refusal sentences from REFUSAL_MESSAGE — or there are none. That covers (a), (b),
+ * (c) and any recombination of them, and nothing else: a leak ("…doesn't cover X. The capital
+ * of France is Paris.") has a non-canonical sentence and fails; the topic clause may not carry
+ * clause punctuation (",;:") so "…doesn't cover X, but here's how: …" cannot hide inside it.
  */
 
 /** The load-bearing first sentence of REFUSAL_MESSAGE. Derived, so the two can't drift. */
 const REFUSAL_CORE = REFUSAL_MESSAGE.split(". ")[0];
 
+const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
+
+/** Sentence boundary: terminal punctuation followed by whitespace. norm() strips the punctuation. */
+const SENTENCE_BOUNDARY = /[.!?]\s+/;
+
+/** Every sentence of REFUSAL_MESSAGE, normalised. Derived — reword the message and this follows. */
+const CANONICAL_SENTENCES = new Set(REFUSAL_MESSAGE.split(SENTENCE_BOUNDARY).map(norm).filter(Boolean));
+
+/**
+ * "The documentation doesn't cover <topic>." as an opening sentence. The verb list is closed on
+ * purpose — "does not require…" or "does not throw…" can open a real answer; these verbs cannot.
+ * The topic may not contain ",;:" (see above). The final period is optional only at the very
+ * end of the reply, so "…doesn't cover X" alone still counts.
+ */
+const NEGATIVE_OPENER =
+    /^the documentation (?:does(?:n't|n’t| not) (?:cover|mention|include|discuss|describe|contain|provide|address|explain)|has no (?:information|details?|guidance))\b[^.,;:]*(?:[.!]\s*|$)/i;
+
 export function isRefusal(answer: string): boolean {
-    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9 ]/g, "").replace(/\s+/g, " ").trim();
-    const n = norm(answer);
+    const raw = answer.trim();
+    const n = norm(raw);
     const core = norm(REFUSAL_CORE);
+    // The canonical refusal, or a "The documentation…" opener followed by the core sentence
+    // anywhere. The second form is the one place includes() is safe: the opener already rules
+    // out an answer-first reply, and the core sentence contradicts any answer before it.
     if (n.startsWith(core) || (n.startsWith("the documentation") && n.includes(core))) return true;
-    // Shape (b): the reply is nothing but a single "The documentation doesn't cover <topic>."
-    // sentence. Anchored on RAW text (^…$) so any substantive continuation disqualifies it.
-    return /^the documentation does(n't| not) cover [^.]+\.?\s*$/i.test(answer.trim());
+
+    // Compositional: negative opener + nothing but canonical refusal sentences after it.
+    const opener = NEGATIVE_OPENER.exec(raw);
+    if (!opener) return false;
+    const rest = raw.slice(opener[0].length).trim();
+    if (rest === "") return true;
+    return rest.split(SENTENCE_BOUNDARY).map(norm).filter(Boolean).every((s) => CANONICAL_SENTENCES.has(s));
 }
