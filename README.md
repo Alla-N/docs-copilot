@@ -17,9 +17,10 @@ made by measuring the alternative.
 
 | Change | Before | After | How it was measured |
 |---|---|---|---|
-| Structure-aware chunking, recall@40 | 11/12 (fixed 500 chars) | **12/12** | Real 37-page corpus, the 12 answerable eval queries, pure vector search — but recall@5 is *worse* (8/12 vs 10/12); see below (`npm run exp:chunking`) |
-| Cohere reranking | 4 of 12 right pages outside the cosine top-5 | **3 rescued** into the rerank top-5 | Pre-HyDE; post-HyDE 2 were outside and both rescued (`npm run exp:sweep`) |
-| Answerable-min vs unanswerable-max, rerank score | 0.106 vs 0.722 pre-HyDE — not separable | **0.732 vs 0.586** post-HyDE, 1.25× | n = 11 answerable / 2 must-refuse that reach the threshold; the other 4 are gated by the planner (`npm run exp:sweep`) |
+| Structure-aware chunking, recall@40 | 11/12 (fixed 500 chars) | **12/12** | Real 37-page corpus, the 12 answerable eval queries, pure vector search — but recall@5 is *worse* (8/12 vs 10/12); see below. Measured when candidate depth was 40; it is 100 now and this comparison has not been re-run (`npm run exp:chunking`) |
+| Cohere reranking | 4 of 12 right pages outside the cosine top-5 | **3 rescued** into the rerank top-5 | Pre-HyDE; post-HyDE 2 are outside (new-7, changed-7) and **both** rescued. For those two the cosine top-10 contains *no* chunk of the right page — the cross-encoder does all the ranking (`npm run exp:sweep`) |
+| Answerable-min vs unanswerable-max, rerank score | 0.106 vs 0.722 pre-HyDE — not separable | **0.732 vs 0.596** post-HyDE, 1.23× | n = 12 answerable / 2 must-refuse that reach the threshold; the other 4 are gated by the planner (`npm run exp:sweep`) |
+| Candidate depth 40 → **100** | `changed-7` refused intermittently — one Migration chunk (the page intro) in the top 5 | **5/5 Migration chunks, 0.882, three consecutive runs** | Including the run where the planner rewrote "7" as "v7". Same Cohere price (below), +0.8s median retrieval; two full suites green after (`VECTOR_CANDIDATES`) |
 | Idempotent ingestion | 853 embeds | **154** | Re-ingest after real upstream doc drift — 82% fewer embedding calls |
 | Query planner + HyDE | terse/multi-part refused | **answered** | "What is SDK?" and multi-intent questions now resolve; verified by the suite below |
 
@@ -31,15 +32,36 @@ before HyDE. Re-swept on the current 18 cases with every rerank score exposed
 (`npm run exp:sweep`): pre-HyDE the two planner-target cases score 0.106 and 0.238 (that is the
 bug the planner fixed) while a must-refuse comparison question scores 0.722 — no threshold
 separates them. Post-HyDE every answerable page scores ≥ 0.732 and the two must-refuse questions
-that still reach the threshold score 0.586 and 0.566 — separable, 1.25× of room, on 11 vs 2
+that still reach the threshold score 0.596 and 0.566 — separable, 1.23× of room, on 12 vs 2
 samples. The 0.30 cut sits far below that room, so **at 0.30 the numeric gate holds 0 of the 6
 guardrails**: 4 are gated by the planner's off-topic intent before retrieval, 2 reach the model
-with five plausible chunks and are refused by the prompt. Raising the cut to ~0.60 would let the
-threshold hold those two — but on two samples, with ±0.05 run-to-run movement and 0.15 of room,
-that is a guess wearing a decimal point; the cut stays at 0.30 as a floor on context quality,
+with five plausible chunks and are refused by the prompt. The sweep says a cut at 0.60 would hold both of them with recall still 12/12 — but that
+buys two guardrails the prompt already holds, at the price of shrinking the margin under the
+worst answerable case from 0.43 to 0.13, on two must-refuse samples with ±0.05 run-to-run
+movement. That is a guess wearing a decimal point; the cut stays at 0.30 as a floor on context quality,
 and the refusal work is done by the planner and the prompt. HyDE bought recall (12/12) and cost
 the numeric gate its refusal job. The harness prints which layer held each guardrail so that
 trade can't drift unnoticed.
+
+**A false refusal the recall number couldn't see.** `changed-7` ("what was changed in AI SDK 7")
+is in the set only because it is a near-synonym of `new-7` ("what is new in AI SDK 7") — a pair
+put there to catch phrasing sensitivity. On Day 15 CI caught it doing exactly that: the suite
+reported **retrieval recall 12/12 and the model refusing anyway**. `expectedSource` names a
+*page*, so recall was satisfied by the migration page's intro chunk — "use the command below to
+add the migration skill" — while the chunks carrying the actual changes never made the top 5.
+The answer was a correct refusal of a question the corpus answers, which is the most expensive
+failure this project can have, and the headline number was blind to it because it counts pages,
+not answers. Two fixes came out of it. The harness now reports **false refusals** on their own
+line — answerable, page retrieved, answered 0/N — instead of a bare `FAIL`. And the cause turned
+out to be candidate depth: the planner's HyDE hypothetical varies run to run (it even rewrote the
+version token, "7" → "v7", which changes what the cross-encoder scores against), so at 40
+candidates the number of migration chunks reaching the reranker was a coin flip. At 100 the same
+query returns 5 of 5 from the right page, 0.882, three runs running, including the "v7" one.
+That depth is free in cash terms — Cohere bills one search unit per query of up to 100 documents,
+splitting anything over 500 tokens, and all 853 chunks here average 251 tokens with none over
+500 — and costs about 0.8s of median retrieval latency. It also says something about the
+architecture: for both of these questions the cosine top-10 holds no chunk of the correct page at
+all, so the cross-encoder is not refining the vector search, it is doing the ranking.
 
 **And the chunking number was wrong.** The old headline (0.546 → 0.643) came from a
 three-paragraph toy and a chunker that wasn't the deployed one. On the real corpus, fixed
@@ -62,7 +84,7 @@ flowchart LR
     P -->|off-topic| OT[Refuse:<br/>nothing here is about the SDK]
     P -->|sub-queries| E[embed HyDE answer<br/>text-embedding-3-small]
     E --> V[(Supabase pgvector<br/>853 chunks · cosine)]
-    V -->|top 40| R[rerank on the question<br/>cohere rerank-v3.5]
+    V -->|top 100| R[rerank on the question<br/>cohere rerank-v3.5]
     R -->|top 5| T{score >= 0.30?}
     T -->|no| REF[Refuse:<br/>not in the docs]
     T -->|yes| S[Grounded prompt<br/>answers the resolved query]
@@ -88,8 +110,9 @@ messages behave like their clean equivalents.
 **Retrieve wide, then narrow — with HyDE.** Questions and answers don't share vocabulary, so
 a question-shaped query embeds far from the answer chunk. The planner emits, per sub-query, a
 one-line *hypothetical answer*; that's what gets embedded (HyDE), while the reranker still runs
-on the real question. Vector search pulls 40 candidates and the cross-encoder re-scores them,
-recovering chunks buried at rank 8. The threshold runs on the *rerank* score, not the cosine
+on the real question. Vector search pulls 100 candidates and the cross-encoder re-scores them,
+recovering chunks buried far below the cosine top-10 — for both AI-SDK-7 questions *every* chunk
+the model ends up reading was rescued from that depth. The threshold runs on the *rerank* score, not the cosine
 score — the reranker is the component that actually knows what relevance means.
 
 **Three-layer refusal — and the harness says which layer did the work.** The planner gates
@@ -279,15 +302,18 @@ follow-up / greeting / greeting+question / typo), and 8 prompt-injection. A sepa
 **planner-only suite** (`evals/planner.ts`, 24 cases) asserts the planner's intent and
 sub-queries directly — that off-topic input yields no SDK-shaped query, that "it" resolves from
 history, that noise is dropped — because the main suite only sees the planner's consequences.
-Latest run: coverage **12/12**, guardrails **6/6**, injection resisted **8/8** (8 attempts each),
-retrieval recall **12/12**, planner **24/24** (5 runs each). Every full run writes
+Latest run (twice, on the same commit — one green run is what let `changed-7` through):
+coverage **12/12**, guardrails **6/6**, injection resisted **8/8** (8 attempts each), retrieval
+recall **12/12**, false refusals **0**, retrieval latency **3.3s median / 5.1s worst**, planner
+**24/24** (5 runs each). Every full run writes
 `evals/results/<timestamp>.json` — the commit it ran against, the knobs (runs, candidates,
 rerank depth, threshold, judge on/off), the summary and a per-case verdict — and those files
 are committed, so each number in this README can be traced to a stored run rather than to a
 terminal session nobody kept.
 
-Reports retrieval recall, answer coverage, guardrails held, injection resisted, and median
-retrieval latency — and, per guardrail, **which layer refused it**: planner (off-topic, never
+Reports retrieval recall, answer coverage, guardrails held, injection resisted, median
+retrieval latency, **false refusals** (the expected page was retrieved and the answer refused
+anyway — page-level recall cannot see those, and one hid for a day) — and, per guardrail, **which layer refused it**: planner (off-topic, never
 retrieved), threshold (retrieved, nothing scored ≥ 0.30), or prompt (plausible chunks reached the
 model and it still refused). Only the last kind can detect the prompt being loosened; the first
 kind detects the planner rewriting an unrelated question into an SDK one. A test that can't

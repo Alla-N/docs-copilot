@@ -16,7 +16,7 @@ expected to hold to that, not just to keep the tests green.
 | `app/api/chat/route.ts` | The **only** route: rate-limit → parse → plan → retrieve → generate |
 | `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; intents search / greeting / off-topic; `DEBUG_PLAN=1` |
 | `lib/corpus.ts` | The 37-page list, shared by ingestion and experiments |
-| `lib/retrieve.ts` | embed → pgvector (top 40) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
+| `lib/retrieve.ts` | embed → pgvector (top 100) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
 | `lib/generation.ts` | Generation settings + the resolved-query message swap, shared by route, harness and judge calibration |
 | `lib/env.ts` | `requireEnv` — the only way to read a required variable |
 | `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
@@ -56,8 +56,13 @@ expected to hold to that, not just to keep the tests green.
    `includes()` — that scored partial answers as refusals and poisoned the production
    query log (Day 12). Do not tighten it to the full message — the model drops the polite
    tail and a must-refuse case went flaky (Day 13).
-6. **Thresholds are calibrated, not guessed.** Rerank 0.30, cosine-fallback 0.45, 40
-   candidates, top 5. Move one only with an eval run showing coverage *and* guardrails.
+6. **Thresholds are calibrated, not guessed.** Rerank 0.30, cosine-fallback 0.45, **100**
+   candidates, top 5. Move one only with an eval run showing coverage *and* guardrails —
+   and, since Day 15, TWO full runs: `changed-7` passed one run and failed the next on the
+   same commit. Candidate depth went 20 → 40 (Day 10) → 100 (Day 15), both times because a
+   near-synonym pair (`new-7` / `changed-7`) exposed chunks the reranker never got to see.
+   Depth is free at Cohere's per-search pricing while every chunk stays under 500 tokens
+   (ours average 251); it costs ~0.8s of retrieval latency.
 7. **Planner rewrites nothing off-topic into something retrievable.** Off-topic and
    "ignore the docs" parts are *dropped*; a wholly off-topic message gets intent
    `off-topic` (retrieval skipped, canned refusal). Never expand "deploy to AWS" into
@@ -73,7 +78,11 @@ expected to hold to that, not just to keep the tests green.
 9. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
    function after the response and the insert is lost. Greetings and off-topic refusals are
    logged too (mode `skipped`).
-10. **One `start` chunk per response, written before any data part.** The client keys the
+10. **A refusal on an answerable case is a bug, even when recall says 12/12.** `expectedSource`
+    is a PAGE, so any chunk of it satisfies recall — including one carrying none of the answer.
+    The harness reports these as `false refusals`; never treat that line as noise, and never
+    "fix" it by widening `expectedSource`.
+11. **One `start` chunk per response, written before any data part.** The client keys the
     streaming assistant message by id and `start` assigns it: a data part written first
     pushes the message under a provisional id, and a later `start` (the merged generation
     stream sends one unless `sendStart: false`) renames it and pushes it a SECOND time —

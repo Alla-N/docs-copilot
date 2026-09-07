@@ -31,12 +31,29 @@ export const RERANK_THRESHOLD = 0.3;
  * Overridable via env so the eval harness can sweep them without editing code —
  * and so a sweep is reproducible from the command that produced it.
  */
-// 40, not 20. At 20, "what is new in AI SDK 7" pulled only 3 Migration chunks (top
-// 0.768) and the model refused 3/3; at 40 it pulls 5 (top 0.852) and answers 3/3.
-// The reranker can only re-order what vector search hands it — recall is upstream of
-// precision, and no amount of reranking recovers a chunk that never made the cut.
-// Cost: Cohere reranks 2x the documents on every production query. Measured, not free.
-export const VECTOR_CANDIDATES = Number(process.env.VECTOR_CANDIDATES ?? 40);
+// 100, not 40 — and 40, not 20 before that. The same pair of near-synonym queries forced
+// both moves. At 20, "what is new in AI SDK 7" pulled only 3 Migration chunks (top 0.768) and
+// the model refused 3/3; at 40 it pulled 5 (top 0.852) and answered. Its near-synonym "what
+// was CHANGED in AI SDK 7" then failed INTERMITTENTLY at 40 (Day 15, caught by CI): the
+// planner's HyDE hypothetical varies run to run, and it sometimes rewrites the version token
+// itself ("7" -> "v7"), which changes what the cross-encoder is scoring against. One run
+// surfaced a single Migration chunk — the page's intro, "use the command below to add the
+// migration skill" — and the model refused a question the corpus answers. At 100 the same
+// query returns 5/5 Migration chunks (top 0.882) on three consecutive runs INCLUDING one that
+// rewrote "v7". The reranker can only re-order what vector search hands it: recall is upstream
+// of precision, and no amount of reranking recovers a chunk that never made the cut. In this
+// corpus the cross-encoder does nearly all the ranking — for both queries the cosine top-10
+// contains ZERO chunks of the correct page.
+//
+// What the extra depth costs, measured (Day 15) — NOT money. Cohere bills one "search unit"
+// per query of up to 100 documents, and splits any document over 500 tokens into several that
+// each count toward that 100. Our 853 chunks average 251 tokens and NONE exceeds 500, so 20,
+// 40 and 100 candidates are all a single search unit: $0.002 per call either way. (That stops
+// being true if the chunker ever emits a chunk over 500 tokens — it would split, and 100
+// candidates would bill as two searches.) It costs LATENCY: roughly +2s on the rerank call
+// against 40. That is the trade this number is, and db/005's ttft_ms/latency_ms is where its
+// user-visible half now gets measured.
+export const VECTOR_CANDIDATES = Number(process.env.VECTOR_CANDIDATES ?? 100);
 export const RERANK_TOP_N = Number(process.env.RERANK_TOP_N ?? 5);
 
 export type RetrievedChunk = {

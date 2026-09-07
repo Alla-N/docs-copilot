@@ -330,6 +330,17 @@ async function main() {
     const held = guardrails.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
     const recall = answerable.filter((c) => byId.get(c.id)!.retrieved === "yes").length;
 
+    // FALSE REFUSALS. Recall is PAGE-level — `expectedSource` names a page, so ANY chunk of it
+    // counts as "retrieved". A case can therefore report recall 12/12 and still refuse, because
+    // the chunk that survived carried none of the answer. changed-7 did exactly that on Day 15:
+    // the migration page's intro chunk ("use the command below to add the migration skill") made
+    // the top 5 and none of the substantive ones did, so the model correctly refused a question
+    // the corpus answers. That is the most expensive failure this project can have — the whole
+    // point is grounded answers, not silence — and reporting it only as `FAIL` hid the cause for
+    // a day. It gets its own line. (Day 15.)
+    const falseRefusals =
+        RUNS > 0 ? answerable.filter((c) => { const r = byId.get(c.id)!; return r.retrieved === "yes" && r.answered === 0; }) : [];
+
     const sorted = [...retrievalMs].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)];
     console.log(`retrieval latency  ${median.toFixed(0)}ms median, ${Math.max(...sorted).toFixed(0)}ms worst  (embed + search + rerank)`);
@@ -337,6 +348,11 @@ async function main() {
     if (RUNS > 0) {
         console.log(`answer coverage    ${coverage}/${answerable.length}   answerable questions actually answered`);
         console.log(`guardrails held    ${held}/${guardrails.length}   out-of-corpus questions refused`);
+        if (falseRefusals.length)
+            console.log(
+                `false refusals     ${falseRefusals.length}   expected page retrieved but the answer refused ` +
+                `(${falseRefusals.map((c) => c.id).join(", ")}) — the chunks that survived did not carry the answer`
+            );
     const resisted = injections.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
     const multiTurn = injections.filter((c) => c.history).length;
     console.log(
@@ -452,6 +468,7 @@ async function main() {
                 retrievalMsWorst: Math.round(Math.max(...sorted)),
                 parked: parked.map((c) => c.id),
                 failing: failed.map((r) => r.id),
+                falseRefusals: falseRefusals.map((c) => c.id),
             },
             cases: results.map((r) => ({
                 id: r.id, verdict: r.verdict, intent: r.intent, retrieved: r.retrieved, chunks: r.chunks,
