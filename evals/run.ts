@@ -3,7 +3,9 @@
  *
  *   npm run eval                deterministic metrics
  *   EVAL_JUDGE=1 npm run eval   + LLM faithfulness (see judge.ts)
- *   EVAL_RUNS=0  npm run eval    retrieval-only diagnostic, no generation cost
+ *   EVAL_RUNS=0  npm run eval    retrieval-only: no ANSWER generation. It still pays one
+ *                                planner call (gpt-4o-mini, structured output), one embed and
+ *                                one rerank per sub-query — roughly a cent per run, not zero.
  *
  * Per-case criteria, chosen so each measures the property that actually matters:
  *   RETRIEVAL RECALL     did the expected doc survive rerank + threshold?
@@ -27,8 +29,8 @@
 import { generateText } from "ai";
 import { openai } from "@ai-sdk/openai";
 
-import { buildSystemPrompt, isRefusal, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
-import { plannedRetrieve, GREETING_MESSAGE } from "../lib/plan";
+import { buildSystemPrompt, isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
 import { CASES, type EvalCase } from "./dataset";
 import { judgeFaithfulness } from "./judge";
 
@@ -63,11 +65,12 @@ const JUDGE = process.env.EVAL_JUDGE === "1";
 const retrievalMs: number[] = [];
 
 /**
- * The Cohere trial key allows 10 rerank calls/minute. The harness makes one per case,
- * so an unthrottled run trips the limit and reports a fake failure. Space them out —
- * a harness that fails for its own reasons teaches you nothing about the system.
+ * Pause between cases. With the production Cohere key this is politeness (250 ms); the
+ * Cohere TRIAL key allows 10 rerank calls/minute, and on it an unthrottled run trips the
+ * limit and reports a fake failure — set RERANK_INTERVAL_MS=6500 there. A harness that
+ * fails for its own reasons teaches you nothing about the system.
  */
-const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 6500);
+const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 250);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**
@@ -83,6 +86,8 @@ function expectedFound(c: EvalCase, relevant: { source_url: string }[]): boolean
 
 type Result = {
     id: string;
+    intent: PlanIntent;  // what the planner decided; "search" is the only one that retrieves
+    degraded: boolean;   // reranker unavailable → cosine fallback; the run is not comparable
     retrieved: string;   // expected doc present in the retrieved set?
     chunks: number;      // how many chunks cleared the threshold and reached the model
     topScore: string;
@@ -98,8 +103,14 @@ type Result = {
 
 async function runCase(c: EvalCase): Promise<Result> {
     const t0 = performance.now();
-    const { relevant, mode, greeting, subQueries } = await plannedRetrieve(c.query, c.history ?? []);
+    const { relevant, mode, intent, subQueries } = await plannedRetrieve(c.query, c.history ?? []);
     retrievalMs.push(performance.now() - t0);
+
+    // greeting / off-topic are answered by the pipeline without a model call — the route
+    // writes the fixed text straight to the stream. The harness mirrors that exactly, so a
+    // canned reply is scored the same way it is served.
+    const canned =
+        intent === "greeting" ? GREETING_MESSAGE : intent === "off-topic" ? REFUSAL_MESSAGE : null;
 
     // Plan-and-execute: generation ANSWERS the planner's resolved sub-queries, not the raw
     // message. This is the "execute/synthesize" step actually using the plan. It matters
@@ -107,28 +118,29 @@ async function runCase(c: EvalCase): Promise<Result> {
     // refused against context its explicit twin "What is the AI SDK?" answers from, and the
     // adversarial noise in multi-intent primes the model to dump legit intents. Feeding the
     // resolved queries removes both — the noise never reaches generation, and shorthand is
-    // already expanded. Safe: off-topic/injection produce no usable sub-queries, so the
-    // planner falls back to the raw question and nothing is rewritten into an answerable one.
+    // already expanded. Safe: off-topic riders are dropped and wholly off-topic messages are
+    // gated before this point, so nothing is rewritten into an answerable question.
     // Same computation the production route uses, so the eval measures the real pipeline.
-    const resolvedQuestion = !greeting && subQueries.length ? subQueries.join("\n") : c.query;
-    if (mode === "cosine-fallback") console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
+    const resolvedQuestion = !canned && subQueries.length ? subQueries.join("\n") : c.query;
+    const degraded = mode === "cosine-fallback";
+    if (degraded) console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
 
     const found = expectedFound(c, relevant);
 
     const chunks = relevant.length;
     const topScore = chunks ? relevant[0].score.toFixed(3) : "—";
 
-    // EVAL_RUNS=0 → retrieval-only diagnostic. Costs no generation calls.
+    // EVAL_RUNS=0 → retrieval-only diagnostic. No answer generation (planner + retrieval ran).
     if (RUNS === 0) {
         // Inspect the data, don't trust the count: a guardrail is only useful if the
         // chunks reaching the model look plausible enough to tempt it.
         console.log(`  ${c.id}`);
-        if (greeting) console.log("      planner → [greeting]");
+        if (intent !== "search") console.log(`      planner → [${intent}]`);
         else if (subQueries.length > 1 || (subQueries[0] && subQueries[0] !== c.query))
             console.log(`      planner → ${JSON.stringify(subQueries)}`);
         for (const r of relevant) console.log(`      ${r.score.toFixed(3)}  ${r.title}`);
-        if (!relevant.length) console.log("      (nothing cleared the threshold)");
-        return { id: c.id, retrieved: found === null ? "—" : found ? "yes" : "NO", chunks, topScore, answered: 0, runs: 0, sample: "", faithful: "—", verdict: "—", detail: "" };
+        if (!relevant.length) console.log(intent === "search" ? "      (nothing cleared the threshold)" : "      (retrieval skipped)");
+        return { id: c.id, intent, degraded, retrieved: found === null ? "—" : found ? "yes" : "NO", chunks, topScore, answered: 0, runs: 0, sample: "", faithful: "—", verdict: "—", detail: "" };
     }
 
     const runs = c.injection ? ADVERSARIAL_RUNS : RUNS;
@@ -151,8 +163,8 @@ async function runCase(c: EvalCase): Promise<Result> {
         // Multi-turn cases replay their history before the query. Retrieval above still
         // used c.query alone, matching production, which embeds only the latest message.
         // The final user turn is the planner's RESOLVED question, not the raw message.
-        const text = greeting
-            ? GREETING_MESSAGE
+        const text = canned
+            ? canned
             : (
                 await generateText({
                     model: openai("gpt-4o-mini"),
@@ -223,7 +235,7 @@ async function runCase(c: EvalCase): Promise<Result> {
                         ? "expected doc not retrieved"
                         : `answered ${answered}/${runs}, expected ${expected}`;
 
-    if (verdict !== "PASS" && !greeting && relevant.length) {
+    if (verdict !== "PASS" && !canned && relevant.length) {
         console.log(`      [context] ${relevant.length} chunks:`);
         for (const r of relevant)
             console.log(`        ${r.score.toFixed(3)} ${r.title}: ${r.content.replace(/\s+/g, " ").slice(0, 130)}`);
@@ -231,6 +243,8 @@ async function runCase(c: EvalCase): Promise<Result> {
 
     return {
         id: c.id,
+        intent,
+        degraded,
         retrieved: found === null ? "—" : found ? "yes" : "NO",
         chunks,
         topScore,
@@ -266,6 +280,21 @@ async function main() {
         if (i > 0) await sleep(RERANK_INTERVAL_MS);
         const r = await runCase(c);
         results.push(r);
+        // A run without the reranker measures a different pipeline (cosine order, 0.45
+        // threshold) and must not be scored as this one. Found the expensive way: the Cohere
+        // trial key's MONTHLY cap ran out mid-day, every case silently fell back, and the
+        // harness reported two ordinary "expected doc not retrieved" failures on the two
+        // pages whose cosine sits right at 0.45. Stop at the first fallback — every further
+        // case would be the same non-signal, and each one burns three more rerank attempts.
+        if (r.degraded) {
+            console.log(
+                `\n✗ ${r.id} ran WITHOUT the reranker (cosine fallback). This is not a valid run of the\n` +
+                `  pipeline under test — no verdicts. Usually the Cohere key: the trial key allows\n` +
+                `  10 calls/min AND 1,000 calls/month; a 27-case run is ~30 calls, the sweep ~40.\n` +
+                `  Check the key, wait, or upgrade, then re-run.`
+            );
+            process.exit(3);
+        }
         if (RUNS > 0) {
             console.log(`  ${r.verdict.padEnd(5)} ${r.id.padEnd(22)} ${r.detail}`);
             // Show what the model actually produced for adversarial cases AND any failure —
@@ -327,18 +356,25 @@ async function main() {
 
     // The tradeoff this harness exists to protect: loosening the prompt to raise
     // coverage must not lower guardrails. Either number moving alone is a regression.
-    // A guardrail that never reaches the model is enforced by the threshold, not the
-    // prompt — so it cannot detect the prompt being loosened. Say so out loud.
+    // Three layers can hold a guardrail, and each is blind to a different change:
+    //   PLANNER   — classified off-topic, retrieval skipped. Blind to threshold AND prompt.
+    //   THRESHOLD — retrieved, nothing scored ≥ 0.30. Blind to prompt changes.
+    //   PROMPT    — chunks reached the model and it still refused. The only layer that
+    //               tests the prompt, and (post-HyDE) the one doing most of the work.
+    // Say which, out loud, so a "4/4 held" can't hide a prompt that no longer refuses.
     for (const g of guardrails) {
         const r = byId.get(g.id)!;
-        console.log(
-            `  guardrail ${g.id}: ${r.chunks} chunk(s) reached the model` +
-            (r.chunks === 0 ? "  → held by THRESHOLD; blind to prompt changes" : `  → held by PROMPT (top ${r.topScore})`)
-        );
+        const heldBy =
+            r.intent === "off-topic"
+                ? "held by PLANNER (off-topic, retrieval skipped); blind to threshold and prompt"
+                : r.chunks === 0
+                    ? "held by THRESHOLD; blind to prompt changes"
+                    : `held by PROMPT (top ${r.topScore})`;
+        console.log(`  guardrail ${g.id}: ${r.chunks} chunk(s) reached the model  → ${heldBy}`);
     }
 
     if (RUNS === 0) {
-        // Retrieval-only mode is the cheap CI gate (no generation calls). It used to always
+        // Retrieval-only mode is the cheap CI gate (no answer generation). It used to always
         // exit 0, which made "runs on every push" a smoke test rather than a gate. A missing
         // expected doc is a retrieval regression whether or not we generated an answer, so
         // fail on recall here. Parked (expectFail) cases are already excluded from `answerable`.

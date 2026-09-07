@@ -14,14 +14,17 @@ expected to hold to that, not just to keep the tests green.
 | Path | Owns |
 |---|---|
 | `app/api/chat/route.ts` | The **only** route: rate-limit → parse → plan → retrieve → generate |
-| `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; `DEBUG_PLAN=1` |
+| `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; intents search / greeting / off-topic; `DEBUG_PLAN=1` |
+| `lib/corpus.ts` | The 37-page list, shared by ingestion and experiments |
 | `lib/retrieve.ts` | embed → pgvector (top 40) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
 | `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
 | `lib/chat-request.ts` | zod parse-then-construct of the request body |
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
-| `evals/dataset.ts` · `run.ts` | 25 hand-labelled cases; the harness that gates CI |
+| `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
+| `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval |
+| `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
 | `db/000..003_*.sql` | schema · content hash · query log · visitor attribution + views |
@@ -49,10 +52,13 @@ expected to hold to that, not just to keep the tests green.
    tail and a must-refuse case went flaky (Day 13).
 6. **Thresholds are calibrated, not guessed.** Rerank 0.30, cosine-fallback 0.45, 40
    candidates, top 5. Move one only with an eval run showing coverage *and* guardrails.
-7. **Planner rewrites nothing malicious into something retrievable.** Off-topic and
-   "ignore the docs" parts are *dropped*, never expanded into an AI-SDK-shaped query.
-   That is a security property. Greeting intent applies only when the whole message is a
-   greeting — a greeting attached to a question is a search.
+7. **Planner rewrites nothing off-topic into something retrievable.** Off-topic and
+   "ignore the docs" parts are *dropped*; a wholly off-topic message gets intent
+   `off-topic` (retrieval skipped, canned refusal). Never expand "deploy to AWS" into
+   "deploy the Vercel AI SDK to AWS" — the planner did exactly that until Day 14 and
+   guard-aws held only because the prompt refused. `evals/planner.ts` asserts this
+   directly; the main suite can only see its consequences. Greeting intent applies only
+   when the whole message is a greeting — a greeting attached to a question is a search.
 8. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
    is never an accepted role; caps 20 msgs / 4k chars / 24k total. Never `String(err)`
    to the client. Rate limit runs before any paid work.
@@ -88,17 +94,26 @@ expected to hold to that, not just to keep the tests green.
   never pad it with neighbours to make recall pass.
 - Refusal detection is compositional (lib/refusal.ts): negative opener about the docs +
   only canonical refusal sentences after it. Don't add one-off regexes per new shape.
+- **A guardrail is held by one of three layers** — planner (off-topic), threshold, or
+  prompt — and the harness prints which. Post-HyDE the threshold holds almost nothing on
+  its own (see the sweep in the README); a "4/4 held" that moved from PROMPT to PLANNER or
+  back is a change worth understanding, not a pass.
+- **Every number in the README has a runnable source** under `scripts/experiments/`. A
+  number whose script was deleted is a rumour; re-run the script, don't re-type the number.
 
 ## Commands
 
 ```
 npm run dev                          # local app; limiter fails open without Upstash keys
-npm run eval                         # full suite: 25 cases × 3 gens (8 for injection); exits non-zero on fail
-EVAL_RUNS=0 npm run eval             # retrieval-only, no generation cost; fails on a recall miss
+npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail
+EVAL_RUNS=0 npm run eval             # retrieval-only (still pays planner+embed+rerank); fails on a recall miss twice
+npm run eval:planner                 # planner-only: intent, sub-query count, must/must-not strings; cheap
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
 DEBUG_PLAN=1 EVAL_RUNS=0 npm run eval # hypotheticals + vector candidates per sub-query
 EVAL_JUDGE=1 npm run eval            # + faithfulness judge per answered case
 npm run eval:calibrate               # validate the judge against known-labelled answers first
+npm run exp:sweep                    # threshold / rerank / HyDE gap numbers for the README (~5 min)
+npm run exp:chunking                 # chunker comparison on the real corpus vs the eval queries
 npm run ingest / -- --write          # dry run prints the diff; --write applies it
 npx tsc --noEmit                     # typecheck (CI runs this before eval)
 ```
@@ -108,11 +123,15 @@ npx tsc --noEmit                     # typecheck (CI runs this before eval)
 - Node **24** (`.nvmrc`). `npm i <one package>` can move others; re-check `tsc` after.
 - Secrets live in `.env.local` (never committed). `.env.example` *is* tracked — keep it
   in sync when a new env var is read anywhere (`grep -r "process.env"`).
-- The Cohere trial key allows 10 rerank calls/min. The harness sleeps 6.5 s per case
-  (`RERANK_INTERVAL_MS`) and `retrieve()` degrades to cosine ordering on failure. Don't
-  remove either.
-- CI (`.github/workflows/eval.yml`): retrieval-only on every push, full suite on PRs to
-  `main`. Needs 4 repo secrets. Workflow files can't be written through the remote bridge.
+- Cohere key is a PRODUCTION key since Day 15 (the trial's 1,000 calls/month ran out
+  mid-eval; every case silently fell back to cosine and looked like two retrieval failures).
+  Rerank costs ~$0.002 per call now, one per sub-query — `RATE_DAILY_GLOBAL` was re-derived
+  to 200. The harness refuses to score a cosine-fallback run (exit 3). On a trial key set
+  `RERANK_INTERVAL_MS=6500`. `retrieve()` degrades to cosine ordering on failure with one
+  retry, not two — don't remove the fallback or raise the retries (12 s per visitor).
+- CI (`.github/workflows/eval.yml`): planner eval on every push; retrieval-only gate on
+  branches; full suite on pushes to `main`, PRs and manual runs; weekly full + judge on
+  Mondays. Needs 4 repo secrets. Workflow files can't be written through the remote bridge.
 - Evals must run on the Mac, not in the Cowork bridge VM (`@esbuild/darwin-x64` is what's
   installed). `tsc` works anywhere.
 

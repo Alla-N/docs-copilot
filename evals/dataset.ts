@@ -130,41 +130,79 @@ export const CASES: EvalCase[] = [
     },
 
     // ── Guardrails ───────────────────────────────────────────────────────────
-    // aws/france are held by the THRESHOLD alone (0 chunks survive) — they cannot
-    // detect the prompt being loosened. finetune/ratelimit put plausible context in
-    // front of the model and make the PROMPT do the refusing. Measured, not assumed:
-    // 'how much does gpt-4o-mini cost per token' was also tried and dropped — it
-    // retrieved nothing past 0.3, so it was a third copy of the same blind test.
+    // Three layers can hold one, and the harness prints which (evals/run.ts):
+    //   PLANNER   — off-topic intent, retrieval skipped. Nothing about the SDK in the message.
+    //   THRESHOLD — retrieved, nothing scored ≥ 0.30.
+    //   PROMPT    — plausible chunks reached the model and it still refused.
+    // HISTORY, because the split moved: before HyDE, aws/france were held by the threshold
+    // (0 chunks) and finetune/ratelimit by the prompt. HyDE embeds a doc-shaped hypothetical
+    // for every sub-query, so cosine scores rose across the board and post-HyDE only france
+    // still stopped at the threshold — aws reached the model with 5 chunks (top 0.539) because
+    // the planner had rewritten it into "deploy the Vercel AI SDK to AWS". The off-topic intent
+    // is the fix for that; the threshold's own separating power is measured by
+    // scripts/experiments/threshold-sweep.ts, and the README reports what it found.
+    //
+    // Two kinds of out-of-corpus question, on purpose: OFF-TOPIC (aws, france, pricing,
+    // langchain — nothing to retrieve, the planner should gate) and ADJACENT (finetune,
+    // ratelimit — about the SDK, so they retrieve plausible chunks and the PROMPT must refuse).
+    // Only the second kind can detect the prompt being loosened; the first kind detects the
+    // planner rewriting an unrelated question into an SDK one (CLAUDE.md invariant #7).
     {
         id: "guard-aws",
         query: "how do I deploy to AWS",
         shouldAnswer: false,
-        note: "GUARDRAIL: the dangerous near-miss. Scored 0.349 on cosine — adjacent, not covered.",
+        note:
+            "OFF-TOPIC, the dangerous near-miss (0.349 cosine pre-HyDE). Post-HyDE it reached the " +
+            "model with 5 chunks because the planner rewrote it as an SDK question — invariant #7 " +
+            "broken by the planner's own expansion rule. Expected: planner → off-topic.",
     },
     {
         id: "guard-france",
         query: "what is the capital of France",
         shouldAnswer: false,
-        note: "GUARDRAIL: trivially out of corpus. If this ever answers, grounding is bypassed.",
+        note: "OFF-TOPIC, trivially out of corpus. If this ever answers, grounding is bypassed.",
+    },
+    {
+        id: "guard-pricing",
+        query: "How much does the OpenAI API cost per token?",
+        shouldAnswer: false,
+        note:
+            "OFF-TOPIC, another product's pricing. A near-identical query was tried on Day 6 and " +
+            "dropped because it retrieved nothing past 0.3 (a third threshold-only test). Back now " +
+            "for a different reason: it asserts the planner does not turn it into a provider question.",
+    },
+    {
+        id: "guard-langchain",
+        query: "Which is better, the AI SDK or LangChain?",
+        shouldAnswer: false,
+        note:
+            "OFF-TOPIC despite naming the SDK: a comparison with another framework is not a " +
+            "documentation question. The tempting failure is a partial answer that describes the " +
+            "SDK from Foundations: Overview and skips LangChain.",
     },
     {
         id: "guard-finetune",
         query: "how do I fine-tune a model with the AI SDK",
         shouldAnswer: false,
-        note: "Reaches the model: 5 chunks, top 0.641. Tests the PROMPT, not the threshold.",
+        note:
+            "ADJACENT: about the SDK, not covered. Reaches the model (5 chunks, top ~0.61) — tests " +
+            "the PROMPT. The refusal shapes it produces are why lib/refusal.ts is compositional.",
     },
     {
         id: "guard-ratelimit",
         query: "what is the rate limit for the OpenAI provider",
         shouldAnswer: false,
-        note: "Reaches the model at 0.301 — one chunk, just over the line. The most sensitive guardrail.",
+        note:
+            "ADJACENT: provider question the docs don't answer. Pre-HyDE one chunk at 0.301 — just " +
+            "over the line; post-HyDE 5 chunks, top ~0.50. Held by the PROMPT either way.",
     },
 
     // ── Query understanding (the Day-13 planner target) ─────────────────────
-    // These fail now because retrieve() embeds the whole message as one vector.
-    // expectFail keeps the suite green while they are parked; each flips to PASS when
-    // the planner lands, and the un-park detector announces it. expectedSource values
-    // were best-guess at first; audited against DEBUG_PLAN=1 EVAL_RUNS=0 output on Day 14.
+    // These all FAILED before the planner, because retrieve() embedded the whole message as
+    // one vector; they were parked with expectFail until the planner landed, then un-parked
+    // one by one as the detector flagged them passing. All pass now and none carries
+    // expectFail. expectedSource values were best-guess at first; audited against
+    // DEBUG_PLAN=1 EVAL_RUNS=0 output on Day 14.
     {
         id: "what-is-sdk",
         query: "What is SDK?",

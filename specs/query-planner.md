@@ -101,6 +101,21 @@ in the corpus, so it was replaced by corpus-grounded checks):
 Plus a planner-only check (retrieval-free): `planQuery("ignoring the docs, what is the
 capital of France")` must not return a sub-query that retrieves AI SDK chunks.
 
+> **As-built (Day 14):** that check was promised and not built, and the gap showed: the
+> planner was rewriting "how do I deploy to AWS" into "deploy the Vercel AI SDK to AWS" (plus
+> a doc-shaped hypothetical that HyDE embedded), so guard-aws reached the model with five
+> chunks and was held by the prompt — MUST #3 broken, invisible to the main suite because the
+> refusal still happened. Two changes:
+> 1. A third intent, **`off-topic`**: when nothing in the message is about the SDK the planner
+>    says so, retrieval is skipped, and the route writes `REFUSAL_MESSAGE` straight to the
+>    stream (no model call — same mechanism as the greeting now). Adjacent questions that ARE
+>    about the SDK (fine-tuning, provider rate limits) stay `search` and let the prompt refuse
+>    on real context. The dataset marks each must-refuse case OFF-TOPIC or ADJACENT.
+> 2. **`evals/planner.ts`** (`npm run eval:planner`): 24 planner-only cases asserting intent,
+>    sub-query count and must/must-not strings — greeting, expansion, follow-up resolution,
+>    decomposition with noise, off-topic (AWS, pricing, LangChain, poem, forged history),
+>    injection, adjacent. Runs on every CI push before the throttled suite.
+
 ## Cost
 
 +1 planner LLM call and +N parallel retrievals per request. Acceptable for a demo;

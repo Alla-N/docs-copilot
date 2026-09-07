@@ -1,6 +1,6 @@
 # Spec — Visitor analytics (who comes, from where, what they ask)
 
-**Status:** approved 2026-09-05, building.
+**Status:** SHIPPED 2026-09-05 (db/003, lib/visitor.ts, lib/landing.ts, `<Analytics />`). Spec kept as the design record.
 **Why now:** the app is on LinkedIn and in the CV. The question is not "does it work" but
 "did anyone come, from which channel, and what did they do" — per channel, so the next
 post/application can be judged by evidence.

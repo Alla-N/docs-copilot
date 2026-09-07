@@ -25,24 +25,29 @@ const configured = Boolean(
  * Three limits, because they protect three different things. Env-configurable so the
  * budget can be raised before an interview without editing code.
  *
- *   BURST_PER_MIN   responsiveness. 10 also matches Cohere's trial ceiling of 10
- *                   rerank calls/minute — past that the pipeline degrades to the
- *                   cosine fallback anyway, so the limit is set by the tightest real
- *                   constraint in the system rather than a round number.
+ *   BURST_PER_MIN   responsiveness. 10/min was originally also Cohere's TRIAL ceiling
+ *                   (past it the pipeline degraded to cosine fallback). The key is a
+ *                   production one now (Day 15), so this is purely a responsiveness
+ *                   choice — kept at 10 because nobody types faster than that.
  *
  *   DAILY_PER_IP    stops one visitor eating the whole budget (~6% cap each).
  *
  *   DAILY_GLOBAL    THE ACTUAL COST CEILING. A per-IP limit bounds abuse but not
  *                   spend: a public link gets hundreds of distinct IPs, each with
  *                   its own allowance. Only a global counter bounds the bill.
- *                   800 ≈ €0.50/day at ~€0.0005 per request (2,500 in + 250 out on
- *                   gpt-4o-mini; rerank free on the Cohere trial). Re-derive this if
- *                   pricing changes or Cohere moves off the trial — rerank then
- *                   becomes the dominant per-request cost.
+ *                   RE-DERIVED on Day 15 when the Cohere key moved off the trial (its
+ *                   1,000 calls/month ran out mid-eval). Rerank is now the dominant
+ *                   per-request cost, as the previous version of this comment
+ *                   predicted: ~$0.002 per rerank call at $2/1k searches, and the
+ *                   planner issues one call per sub-query (1–2 typical, 4 max), plus
+ *                   ~€0.0005 of gpt-4o-mini. Call it ~€0.004 per request worst-ish
+ *                   case. 200/day ≈ €0.80/day, ≈ €25/month if someone saturates it —
+ *                   was 800 ≈ €0.50/day when rerank was free. Raise via env before
+ *                   an interview, not in code.
  */
 const BURST_PER_MIN = Number(process.env.RATE_BURST_PER_MIN ?? 10);
 const DAILY_PER_IP = Number(process.env.RATE_DAILY_PER_IP ?? 50);
-const DAILY_GLOBAL = Number(process.env.RATE_DAILY_GLOBAL ?? 800);
+const DAILY_GLOBAL = Number(process.env.RATE_DAILY_GLOBAL ?? 200);
 
 const redis = configured ? Redis.fromEnv() : null;
 

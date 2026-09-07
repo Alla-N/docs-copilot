@@ -22,7 +22,7 @@ import { retrieve, buildSystemPrompt, type RetrievedChunk } from "../lib/retriev
 import { CASES } from "./dataset";
 import { judgeFaithfulness } from "./judge";
 
-const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 6500);
+const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 250); // 6500 on a trial Cohere key
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /**

@@ -1,20 +1,27 @@
 # Eval as a CI gate.
 #
-# Two tiers, priced on purpose:
-#   push            → EVAL_RUNS=0  retrieval-only. No generation calls. Fails on a retrieval
-#                     regression (an answerable case whose expected doc no longer survives
-#                     rerank + threshold). Cheap enough to run on every push.
-#   pull_request    → full suite: 3 generations per case, 8 per injection case, verdicts,
-#     / manual        guardrails, injection. Costs real (small) money, so PRs to main only.
+# Three tiers, priced on purpose:
+#   push to any other branch → planner eval + EVAL_RUNS=0 retrieval-only. No ANSWER generation
+#                              (it still pays one planner call, one embed and one rerank per
+#                              case — about a cent). Fails on a planner regression or on an
+#                              answerable case whose expected doc no longer survives.
+#   push to main / PR / manual → planner eval + the full suite: 3 generations per case, 8 per
+#                              injection case, verdicts, guardrails, injection. About €0.10 a
+#                              run. main gets the full tier because this repo is pushed to
+#                              directly — a PR-only full tier would never have run (it never
+#                              had, before this change).
+#   weekly (Monday 06:00 UTC)  → full suite + EVAL_JUDGE=1 faithfulness. The judge is a model
+#                              verdict, so it stays out of the per-push gate and reports on a
+#                              schedule; the figure goes into the README with its n.
 #
 # Constraints the design respects:
-#   - The Cohere trial key allows 10 rerank calls/min. The harness already sleeps 6.5 s
-#     between cases (RERANK_INTERVAL_MS), so a 24-case run is ~3–5 min wall clock.
-#   - `npm run eval` reads .env.local, which does not exist in CI. `eval:ci` is the same
-#     harness without --env-file, so secrets flow in as ordinary environment variables.
-#   - The harness exits non-zero on any failing verdict, on an expectFail case that has
-#     started passing, and (retrieval-only mode) on a recall miss — that is what makes
-#     this a gate rather than a log.
+#   - Cohere key is a production one (the trial ran out of its 1,000 calls/month mid-eval).
+#     A full run is ~30 rerank calls ≈ $0.06 and ~1–2 min. A cosine-fallback run exits 3.
+#   - `npm run eval` reads .env.local, which does not exist in CI. The `:ci` scripts are the
+#     same harnesses without --env-file, so secrets flow in as ordinary environment variables.
+#   - The harnesses exit non-zero on any failing verdict, on an expectFail case that has
+#     started passing, and (retrieval-only mode) on a recall miss that survives one retry —
+#     that is what makes this a gate rather than a log.
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
 #   OPENAI_API_KEY  COHERE_API_KEY  SUPABASE_URL  SUPABASE_SERVICE_KEY
@@ -27,6 +34,8 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
 
 # A newer push to the same branch supersedes an in-flight run — no point spending
 # rerank/generation budget on a commit that has already been replaced.
@@ -37,14 +46,16 @@ concurrency:
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-      # push → retrieval-only gate; PR / manual → full suite.
-      EVAL_RUNS: ${{ github.event_name == 'push' && '0' || '3' }}
+      # Full tier on main, PRs, manual and scheduled runs; retrieval-only on other branches.
+      FULL: ${{ github.event_name != 'push' || github.ref == 'refs/heads/main' }}
+      EVAL_RUNS: ${{ (github.event_name != 'push' || github.ref == 'refs/heads/main') && '3' || '0' }}
+      EVAL_JUDGE: ${{ github.event_name == 'schedule' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,5 +69,10 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
-      - name: Eval (${{ github.event_name == 'push' && 'retrieval-only gate' || 'full suite' }})
+      # Planner-only: intent, sub-query count, must/must-not strings. Cheap, no rerank, so it
+      # runs on every tier and fails fast before the throttled suite spends five minutes.
+      - name: Planner eval
+        run: npm run eval:planner:ci
+
+      - name: Eval (${{ env.FULL == 'true' && 'full suite' || 'retrieval-only gate' }}${{ env.EVAL_JUDGE == '1' && ' + faithfulness judge' || '' }})
         run: npm run eval:ci

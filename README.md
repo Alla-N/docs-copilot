@@ -17,17 +17,39 @@ made by measuring the alternative.
 
 | Change | Before | After | How it was measured |
 |---|---|---|---|
-| Structure-aware chunking | 0.546 | **0.643** | Top-1 cosine similarity, same content, same query, only chunk boundaries differ |
-| Cohere reranking | — | **2 of 6** | Queries where vector search ranked the right chunk below a worse one, fixed by the cross-encoder |
-| Answerable vs unanswerable score gap | ~1.7× | **~8×** | Widening this gap is what makes a threshold able to separate the two |
+| Structure-aware chunking, recall@40 | 11/12 (fixed 500 chars) | **12/12** | Real 37-page corpus, the 12 answerable eval queries, pure vector search — but recall@5 is *worse* (8/12 vs 10/12); see below (`npm run exp:chunking`) |
+| Cohere reranking | 4 of 12 right pages outside the cosine top-5 | **3 rescued** into the rerank top-5 | Pre-HyDE; post-HyDE 2 were outside and both rescued (`npm run exp:sweep`) |
+| Answerable-min vs unanswerable-max, rerank score | 0.106 vs 0.722 pre-HyDE — not separable | **0.732 vs 0.586** post-HyDE, 1.25× | n = 11 answerable / 2 must-refuse that reach the threshold; the other 4 are gated by the planner (`npm run exp:sweep`) |
 | Idempotent ingestion | 853 embeds | **154** | Re-ingest after real upstream doc drift — 82% fewer embedding calls |
 | Query planner + HyDE | terse/multi-part refused | **answered** | "What is SDK?" and multi-intent questions now resolve; verified by the suite below |
-| Eval suite | 9 cases · coverage 5/5 | **25 cases · coverage 12/12** | hand-labelled golden set; also guardrails 4/4, injection 8/8, retrieval recall 12/12 |
 
-**Retrieval threshold was calibrated, not guessed.** Cosine similarity needed 0.45 to
-separate answerable from unanswerable queries; after reranking the useful cut moved to
-0.30, because rerank scores are distributed differently. Reusing the old number would
-have silently rejected good results.
+Every number above has a runnable source under `scripts/experiments/`; the eval suite's own
+figures (coverage, guardrails, injection) are in [Evals](#evals).
+
+**The threshold, and what HyDE did to it.** The 0.30 rerank cut was calibrated on a 9-case set
+before HyDE. Re-swept on the current 18 cases with every rerank score exposed
+(`npm run exp:sweep`): pre-HyDE the two planner-target cases score 0.106 and 0.238 (that is the
+bug the planner fixed) while a must-refuse comparison question scores 0.722 — no threshold
+separates them. Post-HyDE every answerable page scores ≥ 0.732 and the two must-refuse questions
+that still reach the threshold score 0.586 and 0.566 — separable, 1.25× of room, on 11 vs 2
+samples. The 0.30 cut sits far below that room, so **at 0.30 the numeric gate holds 0 of the 6
+guardrails**: 4 are gated by the planner's off-topic intent before retrieval, 2 reach the model
+with five plausible chunks and are refused by the prompt. Raising the cut to ~0.60 would let the
+threshold hold those two — but on two samples, with ±0.05 run-to-run movement and 0.15 of room,
+that is a guess wearing a decimal point; the cut stays at 0.30 as a floor on context quality,
+and the refusal work is done by the planner and the prompt. HyDE bought recall (12/12) and cost
+the numeric gate its refusal job. The harness prints which layer held each guardrail so that
+trade can't drift unnoticed.
+
+**And the chunking number was wrong.** The old headline (0.546 → 0.643) came from a
+three-paragraph toy and a chunker that wasn't the deployed one. On the real corpus, fixed
+500-char chunks beat the structure-aware chunker on top-5 recall (10/12 vs 8/12) and MRR (0.660
+vs 0.565); the structure-aware chunker wins only on recall@40 (12/12 vs 11/12) — with half as
+many chunks (865 vs 1760, so half the embedding and rerank cost) and one query's difference.
+recall@40 is the number the pipeline actually depends on, because the reranker can only reorder
+what vector search hands it, so the chunker stays. But the honest statement is "not worse for
+the pipeline, cheaper, and it keeps sections whole for the model" — not "17% better". The
+next experiment is the end-to-end one: fixed-500 *plus* rerank, on the same queries.
 
 ---
 
@@ -37,6 +59,7 @@ have silently rejected good results.
 flowchart LR
     Q[User question] --> P[query planner<br/>gpt-4o-mini<br/>expand · split · resolve]
     P -->|greeting| GR[Friendly scope reply]
+    P -->|off-topic| OT[Refuse:<br/>nothing here is about the SDK]
     P -->|sub-queries| E[embed HyDE answer<br/>text-embedding-3-small]
     E --> V[(Supabase pgvector<br/>853 chunks · cosine)]
     V -->|top 40| R[rerank on the question<br/>cohere rerank-v3.5]
@@ -69,10 +92,15 @@ on the real question. Vector search pulls 40 candidates and the cross-encoder re
 recovering chunks buried at rank 8. The threshold runs on the *rerank* score, not the cosine
 score — the reranker is the component that actually knows what relevance means.
 
-**Two-layer refusal.** A numeric gate drops low-scoring chunks before the model sees
-them, and the system prompt instructs refusal when context is empty. Either alone
-leaks: the gate can't judge semantics, and the prompt alone will happily answer from
-the model's own knowledge.
+**Three-layer refusal — and the harness says which layer did the work.** The planner gates
+messages with nothing about the SDK in them (no retrieval, no model call); the numeric threshold
+drops low-scoring chunks; the system prompt refuses when the context that reached it doesn't
+answer the question. This used to be described as two layers with the threshold doing half the
+work. Post-HyDE that is no longer true (see the sweep above): the threshold holds 0 of the 6
+guardrails by itself, the planner gates 4 and the prompt refuses 2 — so the prompt is
+load-bearing, which is exactly why the eval reports `held by PLANNER / THRESHOLD / PROMPT` per
+guardrail, and why the off-topic intent exists: before it, "how do I deploy to AWS" was
+rewritten by the planner into an SDK question and reached the model with five plausible chunks.
 
 ---
 
@@ -152,8 +180,9 @@ Leave the Upstash keys unset for local development: the limiter detects it's unc
 rerank depth, rate ceilings, planner/judge model) are listed with their defaults in
 `.env.example`.
 
-Then, in the Supabase SQL editor, run `db/000_schema.sql`, `db/001_content_hash.sql`, and
-`db/002_query_log.sql` in order. Populate the corpus and start:
+Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/003_visitor_analytics.sql`
+in order — all four; the query log insert writes the `003` columns, and a missing column fails
+silently (logged, swallowed, never shown to the user). Populate the corpus and start:
 
 ```bash
 npm run ingest              # dry run — prints the diff, writes nothing
@@ -161,14 +190,19 @@ npm run ingest -- --write   # apply it
 npm run dev
 ```
 
-`npm run exp:chunking` re-runs the chunking experiment behind the 0.546 → 0.643 number.
+`npm run exp:chunking` and `npm run exp:sweep` re-run the experiments behind the numbers at
+the top of this README.
 
 ## Security
 
 Public endpoint, personal API keys — so the threat model is cost first, then grounding.
 
 **Cost.** Three sliding windows in Redis (Upstash): burst 10/min, per-visitor 50/day, and a
-**global 800/day ceiling ≈ €0.50**, derived from measured per-request cost rather than picked.
+**global 200/day ceiling ≈ €0.80 worst case**, derived from per-request cost rather than picked —
+and re-derived once: it was 800 ≈ €0.50 while rerank was free on Cohere's trial key. The trial's
+1,000 calls/month ran out mid-eval on Day 15, the key moved to production, and at $2 per 1,000
+rerank searches (one per sub-query) rerank became the dominant per-request cost, so the ceiling
+came down. The comment in `lib/rate-limit.ts` had predicted exactly that re-derivation.
 The global one is the point: a per-user limit bounds abuse, but a public link means hundreds
 of distinct IPs each with their own allowance, so only a global counter bounds spend. Redis
 rather than Postgres because a limiter must be atomic — count-then-insert races exactly when
@@ -212,24 +246,30 @@ worded.
 ## Evals
 
 ```bash
-npm run eval                 # 25 labelled cases × 3 generations (injection cases × 8)
-EVAL_RUNS=0 npm run eval     # retrieval-only diagnostic — free, no generation calls
+npm run eval                 # 27 labelled cases × 3 generations (injection cases × 8)
+EVAL_RUNS=0 npm run eval     # retrieval-only: no answer generation (planner + embed + rerank still run — about a cent)
+npm run eval:planner         # planner-only: 24 cases on intent and sub-queries, no retrieval
 EVAL_JUDGE=1 npm run eval    # + LLM faithfulness check per answered case
 npm run eval:calibrate       # validate that judge against known-labelled answers first
 ```
 
-The golden set is **25 hand-labelled cases** — every one added because it was *observed*
-passing or failing, not to pad a number: 5 core answerable, 4 out-of-corpus guardrails, 8
-query-understanding (terse / multi-part / follow-up / greeting / greeting+question / typo), and 8 prompt-injection.
-Latest run: coverage **12/12**, guardrails **4/4**, injection resisted **8/8** (8 attempts each),
-retrieval recall **12/12**.
+The golden set is **27 hand-labelled cases** — every one added because it was *observed*
+passing or failing, not to pad a number (it started at 9): 5 core answerable, 6 out-of-corpus
+guardrails (4 off-topic, 2 adjacent-to-the-SDK), 8 query-understanding (terse / multi-part /
+follow-up / greeting / greeting+question / typo), and 8 prompt-injection. A separate
+**planner-only suite** (`evals/planner.ts`, 24 cases) asserts the planner's intent and
+sub-queries directly — that off-topic input yields no SDK-shaped query, that "it" resolves from
+history, that noise is dropped — because the main suite only sees the planner's consequences.
+Latest run: coverage **12/12**, guardrails **6/6**, injection resisted **8/8** (8 attempts each),
+retrieval recall **12/12**, planner **24/24** (5 runs each).
 
 Reports retrieval recall, answer coverage, guardrails held, injection resisted, and median
-retrieval latency — and, per guardrail, **which layer refused it**. That last one matters: two
-of the four guardrails retrieve nothing past the threshold, so the model never sees them and
-they stay green no matter what the prompt says. A test that can't fail in the direction you're
-changing is decoration, and the harness says so out loud rather than quietly counting it as a
-pass.
+retrieval latency — and, per guardrail, **which layer refused it**: planner (off-topic, never
+retrieved), threshold (retrieved, nothing scored ≥ 0.30), or prompt (plausible chunks reached the
+model and it still refused). Only the last kind can detect the prompt being loosened; the first
+kind detects the planner rewriting an unrelated question into an SDK one. A test that can't
+fail in the direction you're changing is decoration, and the harness says so out loud rather
+than quietly counting it as a pass.
 
 Retrieval runs once per case; generation runs N times, because temperature 0 lowers variance
 without eliminating it. A case passing 2 of 3 is reported `FLAKY`, not rounded up. Retrieval
@@ -250,16 +290,22 @@ For hands-on checks beyond the automated set, `evals/manual-qa.md` is a 50-quest
 (terse, multi-part, follow-up, out-of-scope, injection) with a note on what a good reply looks
 like for each group.
 
-**It runs in CI** (`.github/workflows/eval.yml`), priced in two tiers. Every push runs the
-retrieval-only mode — no generation calls — and **fails if an answerable case's expected doc no
+**It runs in CI** (`.github/workflows/eval.yml`), priced in three tiers. Every push runs the
+planner suite and the retrieval-only mode — no *answer* generation, though each case still pays
+a planner call, an embed and a rerank — and **fails if an answerable case's expected doc no
 longer survives rerank + threshold** on two consecutive tries, so a retrieval regression can't
-land quietly and a single HyDE coin-flip can't turn the badge red. Pull
-requests to `main` (and manual runs) execute the full suite: 3 generations per case, 8 per
-injection case, verdicts, guardrails, injection. The harness exits non-zero on any failing
-verdict, on a recall miss, and on a parked case that has started passing — that's what makes it
-a gate rather than a log. Needs four repository secrets: `OPENAI_API_KEY`, `COHERE_API_KEY`,
-`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`. Wall clock is ~3–5 minutes, bounded by the 6.5 s/case
-throttle that keeps the Cohere trial key under its 10 calls/min ceiling.
+land quietly and a single HyDE coin-flip can't turn the badge red. Pushes to `main`, pull
+requests and manual runs execute the full suite: 3 generations per case, 8 per injection case,
+verdicts, guardrails, injection (about €0.10 a run; `main` gets it because this repo is pushed
+to directly). A weekly scheduled run adds the faithfulness judge (`EVAL_JUDGE=1`); its figure is not yet
+measured in CI — it goes here, with its n, after the first Monday run. The harness exits non-zero on any
+failing verdict, on a recall miss, and on a parked case that has started passing — that's what
+makes it a gate rather than a log. Needs four repository secrets: `OPENAI_API_KEY`,
+`COHERE_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`. Wall clock is ~1–2 minutes on a
+production Cohere key (a full run is ~30 rerank calls ≈ $0.06); on a trial key set
+`RERANK_INTERVAL_MS=6500` for its 10 calls/min window and budget ~5 minutes — and know that
+its 1,000 calls/**month** is about 30 valid full runs. A run in which the reranker fails and
+retrieval falls back to cosine is refused by the harness (exit 3), not scored.
 
 ---
 
