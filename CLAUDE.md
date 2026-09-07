@@ -24,7 +24,7 @@ expected to hold to that, not just to keep the tests green.
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
-| `tests/` | Vitest unit tests for the pure functions; `npm test`, first CI step |
+| `tests/` | Vitest: the pure functions plus the chat route's stream framing (`chat-stream.test.ts`, planner/log/model mocked); `npm test`, first CI step |
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
 | `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
 | `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval |
@@ -73,6 +73,12 @@ expected to hold to that, not just to keep the tests green.
 9. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
    function after the response and the insert is lost. Greetings and off-topic refusals are
    logged too (mode `skipped`).
+10. **One `start` chunk per response, written before any data part.** The client keys the
+    streaming assistant message by id and `start` assigns it: a data part written first
+    pushes the message under a provisional id, and a later `start` (the merged generation
+    stream sends one unless `sendStart: false`) renames it and pushes it a SECOND time —
+    which is exactly the duplicate empty bubble Day 15 shipped. `tests/chat-stream.test.ts`
+    asserts it on both the answered and the canned path.
 
 ## How to change things here
 

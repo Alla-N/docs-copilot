@@ -332,8 +332,8 @@ like for each group.
 **It runs in CI** (`.github/workflows/eval.yml`), priced in three tiers. Every push runs the
 unit tests first (`npm test`, Vitest — the refusal detector, the request parser, the chunker,
 the content hash's parity with the SQL, the judge's quote matcher and its guards, citations,
-source pills, visitor attribution: each one a function that had a documented bug, with that
-bug as a test), then the planner suite and the retrieval-only mode — no *answer* generation, though each case still pays
+source pills, visitor attribution, and the chat route's stream framing: each one a place that
+had a documented bug, with that bug as a test), then the planner suite and the retrieval-only mode — no *answer* generation, though each case still pays
 a planner call, an embed and a rerank — and **fails if an answerable case's expected doc no
 longer survives rerank + threshold** on two consecutive tries, so a retrieval regression can't
 land quietly and a single HyDE coin-flip can't turn the badge red. Pushes to `main`, pull

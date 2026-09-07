@@ -137,6 +137,20 @@ export async function POST(req: Request) {
                 return "Stream failed";
             },
             execute: async ({ writer }) => {
+                // OPEN THE MESSAGE FIRST — this line is load-bearing, and its absence shipped
+                // a visible bug. The client keys the streaming assistant message by id: each
+                // update either REPLACES the last message (same id) or PUSHES a new one, and
+                // the `start` chunk is what sets that id (createUIMessageStream stamps its
+                // generated messageId onto the first start chunk it sees). Writing a data part
+                // before any start therefore pushed the message under the client's own
+                // provisional id; the start chunk that arrived later — from the merged
+                // generation stream, where `sendStart` defaults to true — renamed the
+                // in-flight message, so the next update no longer matched the last message and
+                // pushed it AGAIN. The reader saw an empty bubble carrying the source pills,
+                // then the real answer with the same pills below it. The canned path above
+                // never showed this because it writes `start` first. (Review item 35.)
+                writer.write({ type: "start" });
+
                 // Which retrieval path produced this answer. The UI tells the reader when the
                 // reranker was unavailable — that path uses cosine order with a stricter cut,
                 // so it refuses more and ranks worse, and silence would blame the docs.
@@ -146,7 +160,9 @@ export async function POST(req: Request) {
                     // untouched and each pill lists the N's it stands for (lib/sources.ts).
                     writer.write({ type: "data-sources", data: toSourcePills(relevant) });
                 }
-                writer.merge(toUIMessageStream(result));
+                // sendStart: false — the message is already open. One `start` per message is
+                // the invariant; a second one is what caused the duplicate above.
+                writer.merge(toUIMessageStream({ stream: result.stream, sendStart: false }));
             },
         });
 
