@@ -26,6 +26,9 @@
  * 1-in-8 is a working attack). A parked, known-failing case is marked `expectFail`: it runs
  * and reports but does not fail the suite, and is flagged if it ever starts passing.
  */
+import { execSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+
 import { generateText } from "ai";
 
 import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
@@ -424,6 +427,43 @@ async function main() {
     const parkedIds = new Set(parked.map((c) => c.id));
     const unfaithful = results.filter((r) => r.faithful === "NO" && !parkedIds.has(r.id));
     const failed = results.filter((r) => r.verdict !== "PASS" && !parkedIds.has(r.id));
+
+    // Every full run leaves a record: knobs, per-case verdicts, the headline numbers, the
+    // commit it ran against. README numbers cite one of these files instead of a memory of a
+    // terminal — a number nobody can trace to a stored run is a rumour with a decimal point.
+    // Subsets (EVAL_ONLY) and retrieval-only runs (EVAL_RUNS=0, the branch CI gate) are
+    // diagnostics, not results, and are not recorded. (Review item 29.)
+    if (!ONLY.length && RUNS > 0) {
+        let commit = "unknown";
+        try { commit = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { /* not a git checkout */ }
+        const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+        const record = {
+            date: new Date().toISOString(),
+            commit,
+            knobs: { runs: RUNS, adversarialRuns: ADVERSARIAL_RUNS, judge: JUDGE, candidates: VECTOR_CANDIDATES, rerankTopN: RERANK_TOP_N, threshold: RERANK_THRESHOLD },
+            summary: {
+                cases: active.length,
+                recall: `${recall}/${answerable.length}`,
+                coverage: `${coverage}/${answerable.length}`,
+                guardrails: `${held}/${guardrails.length}`,
+                injection: `${injections.filter((c) => byId.get(c.id)!.verdict === "PASS").length}/${injections.length}`,
+                ...(JUDGE ? { faithful: `${results.filter((r) => r.faithful === "yes").length}/${results.filter((r) => r.faithful !== "—").length}` } : {}),
+                retrievalMsMedian: Math.round(median),
+                retrievalMsWorst: Math.round(Math.max(...sorted)),
+                parked: parked.map((c) => c.id),
+                failing: failed.map((r) => r.id),
+            },
+            cases: results.map((r) => ({
+                id: r.id, verdict: r.verdict, intent: r.intent, retrieved: r.retrieved, chunks: r.chunks,
+                topScore: r.topScore, answered: `${r.answered}/${r.runs}`, faithful: r.faithful, detail: r.detail,
+            })),
+        };
+        mkdirSync("evals/results", { recursive: true });
+        const file = `evals/results/${stamp}.json`;
+        writeFileSync(file, JSON.stringify(record, null, 2) + "\n");
+        console.log(`\nrecorded → ${file}  (commit ${commit})`);
+    }
+
     if (unfaithful.length) {
         console.log(`\n${unfaithful.length} unfaithful: ${unfaithful.map((f) => f.id).join(", ")}`);
         process.exit(1);

@@ -10,7 +10,7 @@ import { ChatMessage } from "@/lib/chat-types";
 import { REFUSAL_MESSAGE } from "@/lib/retrieve";
 import { plannedRetrieve, GREETING_MESSAGE } from "@/lib/plan";
 import { generationSettings, generationMessages } from "@/lib/generation";
-import { logQuery } from "@/lib/query-log";
+import { logQuery, type RequestMetrics } from "@/lib/query-log";
 import { parseChatRequest, BadRequestError } from "@/lib/chat-request";
 import { checkRateLimit, clientKey } from "@/lib/rate-limit";
 import { visitorFrom } from "@/lib/visitor";
@@ -61,18 +61,28 @@ export async function POST(req: Request) {
         // The request's abort signal rides along: a closed tab cancels the planner call and
         // the generation below instead of billing for an answer nobody will read.
         const startedAt = Date.now();
-        const { intent, relevant, mode, subQueries } = await plannedRetrieve(question, history, {
-            signal: req.signal,
-        });
+        const { intent, relevant, mode, subQueries, plannerUsage, rerankCalls } = await plannedRetrieve(
+            question,
+            history,
+            { signal: req.signal }
+        );
         const retrievalMs = Date.now() - startedAt;
 
         // Logging runs in `after()`: on serverless the function can be frozen the moment the
         // response finishes, and a bare `void logQuery(...)` inside onFinish raced that
         // freeze — some rows never landed. `after()` keeps the function alive until the
         // insert resolves, without delaying the response. (Review item 16.)
+        // Cost and timing ride along (db/005): the planner's tokens and rerank calls from the
+        // retrieval step, the generation's tokens and timings from onFinish. Measured, so the
+        // spend ceiling can be re-derived from traffic instead of an estimate. (Review item 25.)
         const visitor = visitorFrom(req);
-        const log = (answer: string) =>
-            after(() => logQuery({ question, answer, relevant, mode, latencyMs: retrievalMs, visitor }));
+        const log = (answer: string, generation: RequestMetrics["generation"] = { inputTokens: null, outputTokens: null }, timing: Pick<RequestMetrics, "ttftMs" | "generationMs"> = { ttftMs: null, generationMs: null }) =>
+            after(() =>
+                logQuery({
+                    question, answer, relevant, mode, latencyMs: retrievalMs, visitor,
+                    metrics: { planner: plannerUsage, rerankCalls, generation, ...timing },
+                })
+            );
 
         // ── 4a. Canned replies — no model call at all ────────────────
         // greeting  → the friendly scope message instead of cold-refusing "hi".
@@ -110,7 +120,15 @@ export async function POST(req: Request) {
             ...generationSettings(relevant),
             messages: generationMessages(messages.slice(0, -1), question, subQueries),
             abortSignal: req.signal,
-            onFinish: ({ text }) => log(text),
+            onFinish: ({ text, usage, steps }) => {
+                // The SDK measures the step: time to first output chunk and the whole call.
+                const perf = steps[steps.length - 1]?.performance;
+                log(
+                    text,
+                    { inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null },
+                    { ttftMs: perf?.timeToFirstOutputMs ?? null, generationMs: perf?.responseTimeMs ?? null }
+                );
+            },
         });
 
         const stream = createUIMessageStream<ChatMessage>({

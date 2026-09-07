@@ -180,9 +180,9 @@ Leave the Upstash keys unset for local development: the limiter detects it's unc
 rerank depth, rate ceilings, planner/judge model) are listed with their defaults in
 `.env.example`.
 
-Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/004_retrieval_health.sql`
-in order — all five; the query log insert writes the `003` columns, and a missing column fails
-silently (logged, swallowed, never shown to the user). Populate the corpus and start:
+Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/005_cost.sql`
+in order — all six; the query log insert writes the `003` and `005` columns, and a missing
+column fails silently (logged, swallowed, never shown to the user). Populate the corpus and start:
 
 ```bash
 npm run ingest              # dry run — prints the diff, writes nothing
@@ -203,7 +203,11 @@ and re-derived once: it was 800 ≈ €0.50 while rerank was free on Cohere's tr
 1,000 calls/month ran out mid-eval on Day 15, the key moved to production, and at $2 per 1,000
 rerank searches (one per sub-query) rerank became the dominant per-request cost, so the ceiling
 came down. The comment in `lib/rate-limit.ts` had predicted exactly that re-derivation.
-The global one is the point: a per-user limit bounds abuse, but a public link means hundreds
+Both derivations were *estimates* (~€0.004 per request is the current one); since `db/005`
+every row in `query_log` carries the planner's and the generation's token usage as the
+provider reported it and the number of rerank calls that reached Cohere, and the `cost_daily`
+view prices real traffic at list prices — so the next ceiling comes from measured
+`usd_per_request`, not from arithmetic in a comment. The global one is the point: a per-user limit bounds abuse, but a public link means hundreds
 of distinct IPs each with their own allowance, so only a global counter bounds spend. Redis
 rather than Postgres because a limiter must be atomic — count-then-insert races exactly when
 you're being hit hardest. In-memory is worse: serverless instances don't share memory, so the
@@ -217,9 +221,10 @@ Two more bounds on spend: generation is capped at 1,024 output tokens and the pl
 closed tab stops the bill instead of finishing an answer nobody reads.
 
 **What's logged.** Every question goes to `query_log` (the text, whether it was refused, top
-rerank score, latency, which retrieval path answered it — greetings and off-topic refusals
-included, since "asked hi and left" is a visitor too) so production traffic can be mined for
-eval cases. The write runs in Next's `after()`, which keeps the serverless function alive
+rerank score, retrieval latency, which retrieval path answered it — greetings and off-topic
+refusals included, since "asked hi and left" is a visitor too — plus, per request, planner and
+generation tokens, rerank calls, time to first output token and total generation time) so
+production traffic can be mined for eval cases and priced. The write runs in Next's `after()`, which keeps the serverless function alive
 until the insert lands; a fire-and-forget promise raced the platform freezing the function
 and some rows never arrived. Since the app is
 linked from LinkedIn and a CV, each row also carries *attribution*: the same salted visitor
@@ -231,7 +236,8 @@ which is cookieless and beacons to Vercel rather than to this app — so it adds
 write surface of our own. Retention is 90 days. `visits_by_source` and `recent_visitors`
 (`db/003`) answer "which channel sent people, and what did they ask?"; `retrieval_health`
 (`db/004`) answers "how often did the reranker fail, per day?" — the day the trial key's
-quota ran out, nothing in the data said so. The UI now tells the reader when a reply came
+quota ran out, nothing in the data said so; `cost_daily` (`db/005`) answers "what did a day
+cost, and what would the ceiling be for a €0.80 budget?" The UI now tells the reader when a reply came
 from the cosine fallback, too.
 
 **Input.** The request body is parsed and rebuilt rather than trusted — only `role` and text
@@ -274,7 +280,11 @@ follow-up / greeting / greeting+question / typo), and 8 prompt-injection. A sepa
 sub-queries directly — that off-topic input yields no SDK-shaped query, that "it" resolves from
 history, that noise is dropped — because the main suite only sees the planner's consequences.
 Latest run: coverage **12/12**, guardrails **6/6**, injection resisted **8/8** (8 attempts each),
-retrieval recall **12/12**, planner **24/24** (5 runs each).
+retrieval recall **12/12**, planner **24/24** (5 runs each). Every full run writes
+`evals/results/<timestamp>.json` — the commit it ran against, the knobs (runs, candidates,
+rerank depth, threshold, judge on/off), the summary and a per-case verdict — and those files
+are committed, so each number in this README can be traced to a stored run rather than to a
+terminal session nobody kept.
 
 Reports retrieval recall, answer coverage, guardrails held, injection resisted, and median
 retrieval latency — and, per guardrail, **which layer refused it**: planner (off-topic, never

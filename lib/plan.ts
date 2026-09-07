@@ -102,7 +102,17 @@ const PlanSchema = z.object({
             "Standalone documentation searches. Empty for a greeting or off-topic message. One per distinct question."
         ),
 });
-type Plan = z.infer<typeof PlanSchema>;
+/** Token usage of one model call, as the provider reported it. Null when unknown. */
+export type TokenUsage = { inputTokens: number | null; outputTokens: number | null };
+const NO_USAGE: TokenUsage = { inputTokens: null, outputTokens: null };
+
+/** What the model returns — the schema's shape, nothing else. */
+type PlanOutput = z.infer<typeof PlanSchema>;
+/** What planQuery returns: the model's plan plus what the call cost. */
+type Plan = PlanOutput & {
+    /** What the planner call cost, so the query log can price a request from real numbers. */
+    usage: TokenUsage;
+};
 type SubQuery = z.infer<typeof SubQuerySchema>;
 
 type HistoryTurn = { role: "user" | "assistant"; text: string };
@@ -116,6 +126,10 @@ export type PlannedResult = {
     subQueries: string[];
     /** Degraded if any retrieval fell back to cosine. */
     mode: RetrievalMode;
+    /** Planner call tokens (null on fallback) — for the cost columns in query_log. */
+    plannerUsage: TokenUsage;
+    /** Rerank calls that actually reached Cohere (one per sub-query, minus fallbacks). */
+    rerankCalls: number;
 };
 
 /**
@@ -141,12 +155,12 @@ export async function planQuery(
         .join("\n");
 
     try {
-        const { output } = await generateText({
+        const { output, usage } = await generateText({
             model: openai(PLANNER_MODEL),
             temperature: 0,
             maxOutputTokens: PLANNER_MAX_OUTPUT_TOKENS,
             abortSignal: opts.signal,
-            output: Output.object<Plan>({ schema: PlanSchema, name: "query_plan" }),
+            output: Output.object<PlanOutput>({ schema: PlanSchema, name: "query_plan" }),
             system: `You turn a user's message into standalone search queries for a Vercel AI SDK
 documentation search. You do NOT answer — you only rewrite and split.
 
@@ -202,22 +216,24 @@ Return at most 4 queries.`,
         const queries: SubQuery[] = (output.queries ?? [])
             .map((q) => ({ query: (q.query ?? "").trim(), hypothetical: (q.hypothetical ?? "").trim() }))
             .filter((q) => q.query.length > 0);
-        if (output.intent === "greeting") return { intent: "greeting", queries: [] };
+        const used: TokenUsage = { inputTokens: usage.inputTokens ?? null, outputTokens: usage.outputTokens ?? null };
+        if (output.intent === "greeting") return { intent: "greeting", queries: [], usage: used };
         // off-topic is trusted even if the model also emitted queries: the intent is the
         // decision, the queries would be exactly the SDK-shaped rewrite the gate forbids.
-        if (output.intent === "off-topic") return { intent: "off-topic", queries: [] };
+        if (output.intent === "off-topic") return { intent: "off-topic", queries: [], usage: used };
         // A search that produced no usable sub-queries (the model returned nothing) falls back
         // to the raw question so retrieval still runs and can refuse. No hypothetical here —
         // the fallback embeds the raw question, i.e. pre-HyDE behaviour.
         return {
             intent: "search",
             queries: queries.length ? queries.slice(0, 4) : [{ query: question, hypothetical: "" }],
+            usage: used,
         };
     } catch (err) {
         // The planner is an enhancement, not a dependency. Any failure degrades to today's
         // behaviour: retrieve on the raw question.
         console.error("PLANNER FAILED — falling back to raw query:", err);
-        return { intent: "search", queries: [{ query: question, hypothetical: "" }] };
+        return { intent: "search", queries: [{ query: question, hypothetical: "" }], usage: NO_USAGE };
     }
 }
 
@@ -231,7 +247,7 @@ export async function plannedRetrieve(
     // Greeting and off-topic never reach retrieval: no embed, no rerank, no chunks. Mode is
     // "skipped" so the query log can tell "nothing survived the threshold" from "never looked".
     if (plan.intent !== "search") {
-        return { intent: plan.intent, relevant: [], subQueries: [], mode: "skipped" };
+        return { intent: plan.intent, relevant: [], subQueries: [], mode: "skipped", plannerUsage: plan.usage, rerankCalls: 0 };
     }
 
     // Execute: retrieve every sub-query in parallel. Latency is one round-trip, not N.
@@ -270,5 +286,6 @@ export async function plannedRetrieve(
         .sort((a, b) => b.score - a.score)
         .slice(0, UNION_CAP);
 
-    return { intent: "search", relevant, subQueries: plan.queries.map((q) => q.query), mode };
+    const rerankCalls = results.filter((r) => r.mode === "reranked" && r.candidates.length > 0).length;
+    return { intent: "search", relevant, subQueries: plan.queries.map((q) => q.query), mode, plannerUsage: plan.usage, rerankCalls };
 }

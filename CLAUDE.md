@@ -26,11 +26,12 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
 | `tests/` | Vitest unit tests for the pure functions; `npm test`, first CI step |
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
+| `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
 | `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval |
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
-| `db/000..004_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view |
+| `db/000..005_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view |
 
 ## Invariants — do not break these
 
@@ -119,7 +120,7 @@ expected to hold to that, not just to keep the tests green.
 ```
 npm run dev                          # local app; limiter fails open without Upstash keys
 npm test                             # Vitest unit tests (Mac, not the bridge VM)
-npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail
+npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail; writes evals/results/<stamp>.json (commit it)
 EVAL_RUNS=0 npm run eval             # retrieval-only (still pays planner+embed+rerank); fails on a recall miss twice
 npm run eval:planner                 # planner-only: intent, sub-query count, must/must-not strings; cheap
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
@@ -140,7 +141,9 @@ npx tsc --noEmit                     # typecheck (CI runs this before eval)
 - Cohere key is a PRODUCTION key since Day 15 (the trial's 1,000 calls/month ran out
   mid-eval; every case silently fell back to cosine and looked like two retrieval failures).
   Rerank costs ~$0.002 per call now, one per sub-query — `RATE_DAILY_GLOBAL` was re-derived
-  to 200. The harness refuses to score a cosine-fallback run (exit 3). On a trial key set
+  to 200 from an ESTIMATE. Since db/005 every request logs measured tokens + rerank calls;
+  re-derive the ceiling from `cost_daily.usd_per_request` once there is traffic, and change
+  prices in `db/005_cost.sql` only (the view recomputes history). The harness refuses to score a cosine-fallback run (exit 3). On a trial key set
   `RERANK_INTERVAL_MS=6500`. `retrieve()` degrades to cosine ordering on failure with one
   retry, not two — don't remove the fallback or raise the retries (12 s per visitor).
 - CI (`.github/workflows/eval.yml`): planner eval on every push; retrieval-only gate on
