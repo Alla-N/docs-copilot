@@ -118,7 +118,23 @@ export type PlannedResult = {
     mode: RetrievalMode;
 };
 
-export async function planQuery(question: string, history: HistoryTurn[] = []): Promise<Plan> {
+/**
+ * A plan is at most 4 sub-queries of ~30 tokens plus a 1–2 sentence hypothetical each —
+ * well under 400 tokens of JSON. The cap bounds a runaway structured output; a normal plan
+ * never meets it.
+ */
+const PLANNER_MAX_OUTPUT_TOKENS = 512;
+
+export type PlanOptions = {
+    /** The request's abort signal — a closed tab cancels the planner call instead of billing it. */
+    signal?: AbortSignal;
+};
+
+export async function planQuery(
+    question: string,
+    history: HistoryTurn[] = [],
+    opts: PlanOptions = {}
+): Promise<Plan> {
     const historyText = history
         .slice(-4) // last two exchanges is plenty to resolve a pronoun
         .map((t) => `${t.role}: ${t.text}`)
@@ -128,6 +144,8 @@ export async function planQuery(question: string, history: HistoryTurn[] = []): 
         const { output } = await generateText({
             model: openai(PLANNER_MODEL),
             temperature: 0,
+            maxOutputTokens: PLANNER_MAX_OUTPUT_TOKENS,
+            abortSignal: opts.signal,
             output: Output.object<Plan>({ schema: PlanSchema, name: "query_plan" }),
             system: `You turn a user's message into standalone search queries for a Vercel AI SDK
 documentation search. You do NOT answer — you only rewrite and split.
@@ -205,9 +223,10 @@ Return at most 4 queries.`,
 
 export async function plannedRetrieve(
     question: string,
-    history: HistoryTurn[] = []
+    history: HistoryTurn[] = [],
+    opts: PlanOptions = {}
 ): Promise<PlannedResult> {
-    const plan = await planQuery(question, history);
+    const plan = await planQuery(question, history, opts);
 
     // Greeting and off-topic never reach retrieval: no embed, no rerank, no chunks. Mode is
     // "skipped" so the query log can tell "nothing survived the threshold" from "never looked".

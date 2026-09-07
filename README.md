@@ -180,8 +180,8 @@ Leave the Upstash keys unset for local development: the limiter detects it's unc
 rerank depth, rate ceilings, planner/judge model) are listed with their defaults in
 `.env.example`.
 
-Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/003_visitor_analytics.sql`
-in order — all four; the query log insert writes the `003` columns, and a missing column fails
+Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/004_retrieval_health.sql`
+in order — all five; the query log insert writes the `003` columns, and a missing column fails
 silently (logged, swallowed, never shown to the user). Populate the corpus and start:
 
 ```bash
@@ -209,10 +209,19 @@ rather than Postgres because a limiter must be atomic — count-then-insert race
 you're being hit hardest. In-memory is worse: serverless instances don't share memory, so the
 effective ceiling rises with the load it exists to stop.
 
-Callers are identified by a salted hash of their IP, never the raw address.
+Callers are identified by a salted hash of their IP, never the raw address — and the route
+refuses to start if the limiter is configured without a salt, because a hash keyed on a
+constant that lives in a public repo is a lookup table over the IPv4 space, not a pseudonym.
+Two more bounds on spend: generation is capped at 1,024 output tokens and the planner at 512
+(a normal answer is 300–600), and the request's abort signal is passed to both calls, so a
+closed tab stops the bill instead of finishing an answer nobody reads.
 
 **What's logged.** Every question goes to `query_log` (the text, whether it was refused, top
-rerank score, latency) so production traffic can be mined for eval cases. Since the app is
+rerank score, latency, which retrieval path answered it — greetings and off-topic refusals
+included, since "asked hi and left" is a visitor too) so production traffic can be mined for
+eval cases. The write runs in Next's `after()`, which keeps the serverless function alive
+until the insert lands; a fire-and-forget promise raced the platform freezing the function
+and some rows never arrived. Since the app is
 linked from LinkedIn and a CV, each row also carries *attribution*: the same salted visitor
 hash, the linking site's hostname (captured once on landing — the API call's own referrer is
 always this origin), `utm_source`, country (ISO-2 from Vercel's edge), and device class.
@@ -220,7 +229,10 @@ No raw IP, no full referrer URL, no city, no user-agent string; all client-suppl
 are re-validated server-side (`lib/visitor.ts`). Page views come from Vercel Web Analytics,
 which is cookieless and beacons to Vercel rather than to this app — so it adds no public
 write surface of our own. Retention is 90 days. `visits_by_source` and `recent_visitors`
-(`db/003`) answer "which channel sent people, and what did they ask?".
+(`db/003`) answer "which channel sent people, and what did they ask?"; `retrieval_health`
+(`db/004`) answers "how often did the reranker fail, per day?" — the day the trial key's
+quota ran out, nothing in the data said so. The UI now tells the reader when a reply came
+from the cosine fallback, too.
 
 **Input.** The request body is parsed and rebuilt rather than trusted — only `role` and text
 parts are read, capped at 20 messages / 4,000 chars each / 24,000 total, and `system` is not
@@ -285,6 +297,22 @@ claim in an answer is grounded in the retrieved chunks — but the model only *p
 evidence quote per claim; code then verifies each quote literally appears in the source, so the
 verdict can't be talked into existence. `npm run eval:calibrate` tests that judge against clean,
 fabricated, and source-swapped answers before any number it produces is trusted.
+
+**Calibration, as recorded (2026-09-07, one run, n = 35):** false alarms **0/12**, missed lies
+**0/23** (12 fabricated across four kinds — invented date, wrong API name, wrong default,
+invented option — and 11 source-swapped), agreement 35/35. The number before that was
+**12/12 false alarms**: the judge had been calibrated on Day 11 against Day-11 answers, and the
+Day-14 format contract changed every answer's shape ("Here's an example:", a closing "the
+documentation doesn't cover…") into sentences with nothing to quote. Getting back to 0/0 took
+six calibration runs and five code-side rules — claim kinds with a guard that treats anything
+carrying an identifier, number or quoted value as factual whatever the model called it; an
+invented "scope" claim only counts when the answer itself says the docs don't cover something;
+a coverage check that flags any factual sentence the judge never listed; a second look at
+exactly the failed claims, whose quotes go through the same verifier; and a quote matcher
+that allows punctuation, one clipped non-identifier word, or a single unmarked gap, and
+nothing looser. Two honest caveats: the rules were developed against this calibration set, so
+the weekly CI run is the out-of-sample check; and one swapped label was wrong, not the judge
+(the partner case retrieved the same page), so partners are now chosen on retrieved pages.
 
 For hands-on checks beyond the automated set, `evals/manual-qa.md` is a 50-question bank
 (terse, multi-part, follow-up, out-of-scope, injection) with a note on what a good reply looks

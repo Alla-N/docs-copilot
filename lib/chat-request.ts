@@ -63,10 +63,16 @@ export function parseChatRequest(body: unknown): ParsedChatRequest {
     // conversation is normal use, not an attack, and should degrade rather than fail.
     const recent = result.data.messages.slice(-MAX_MESSAGES);
 
-    const messages: ModelMessage[] = [];
+    // Walk NEWEST → OLDEST and stop when the total cap is hit, so what gets dropped is the
+    // oldest history, never the current question. The first version walked oldest → newest
+    // and `break`-ed at the cap: a long conversation lost its *latest* turn and the request
+    // 400'd with "last message must be a user message" — the caller's newest message was the
+    // one thing the cap was never meant to touch. (Critical review, item 14.)
+    const kept: ModelMessage[] = [];
     let totalChars = 0;
 
-    for (const m of recent) {
+    for (let i = recent.length - 1; i >= 0; i--) {
+        const m = recent[i];
         // Text parts only. data-sources, step-start and anything else the client
         // echoes back are dropped — the model has no business reading them.
         const text = m.parts
@@ -80,8 +86,9 @@ export function parseChatRequest(body: unknown): ParsedChatRequest {
         if (totalChars + text.length > MAX_TOTAL_CHARS) break;
 
         totalChars += text.length;
-        messages.push({ role: m.role, content: text });
+        kept.push({ role: m.role, content: text });
     }
+    const messages = kept.reverse();
 
     const last = messages[messages.length - 1];
     if (!last || last.role !== "user") {

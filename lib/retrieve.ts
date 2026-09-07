@@ -12,6 +12,7 @@ import { createClient } from "@supabase/supabase-js";
 // Defined in a dependency-free module so the client bundle can import it too;
 // re-exported here so existing importers keep working.
 import { REFUSAL_MESSAGE } from "./refusal";
+import { requireEnv } from "./env";
 export { REFUSAL_MESSAGE, isRefusal } from "./refusal";
 
 /**
@@ -52,10 +53,7 @@ export type RetrievedChunk = {
  */
 export type RetrievalMode = "reranked" | "cosine-fallback" | "skipped";
 
-const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!
-);
+const supabase = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_KEY"));
 
 /**
  * @param query     the real question — used for RERANKING (a cross-encoder judges

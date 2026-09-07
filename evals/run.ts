@@ -27,9 +27,9 @@
  * and reports but does not fail the suite, and is flagged if it ever starts passing.
  */
 import { generateText } from "ai";
-import { openai } from "@ai-sdk/openai";
 
-import { buildSystemPrompt, isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { generationSettings, generationMessages } from "../lib/generation";
 import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
 import { CASES, type EvalCase } from "./dataset";
 import { judgeFaithfulness } from "./judge";
@@ -55,9 +55,9 @@ const ONLY = (process.env.EVAL_ONLY ?? "").split(",").map((x) => x.trim()).filte
 /**
  * Faithfulness is opt-in: EVAL_JUDGE=1 npm run eval
  * It costs one extra model call per answered case, and — unlike every other metric
- * here — the number comes from a model rather than a comparison. Calibrated at
- * 14–15/15 with 0 false alarms (see eval:calibrate), which is good enough to act on,
- * not good enough to publish without saying n=15.
+ * here — the number comes from a model rather than a comparison. Calibrated 2026-09-07 at
+ * 0/12 false alarms, 0/23 missed lies, n=35 (see eval:calibrate) — after finding it at
+ * 12/12 false alarms on the current answer style. Good enough to act on; publish with the n.
  */
 const JUDGE = process.env.EVAL_JUDGE === "1";
 
@@ -112,16 +112,10 @@ async function runCase(c: EvalCase): Promise<Result> {
     const canned =
         intent === "greeting" ? GREETING_MESSAGE : intent === "off-topic" ? REFUSAL_MESSAGE : null;
 
-    // Plan-and-execute: generation ANSWERS the planner's resolved sub-queries, not the raw
-    // message. This is the "execute/synthesize" step actually using the plan. It matters
-    // because the answerer anchors on the literal user turn: a terse "What is SDK?" gets
-    // refused against context its explicit twin "What is the AI SDK?" answers from, and the
-    // adversarial noise in multi-intent primes the model to dump legit intents. Feeding the
-    // resolved queries removes both — the noise never reaches generation, and shorthand is
-    // already expanded. Safe: off-topic riders are dropped and wholly off-topic messages are
-    // gated before this point, so nothing is rewritten into an answerable question.
-    // Same computation the production route uses, so the eval measures the real pipeline.
-    const resolvedQuestion = !canned && subQueries.length ? subQueries.join("\n") : c.query;
+    // Plan-and-execute, execute half: generation answers the planner's RESOLVED sub-queries.
+    // The settings and the swap live in lib/generation.ts, shared with the route and the
+    // judge calibration — one code path (invariants #3 and #4), not three kept in sync.
+    const history = (c.history ?? []).map((h) => ({ role: h.role, content: h.text }));
     const degraded = mode === "cosine-fallback";
     if (degraded) console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
 
@@ -167,13 +161,8 @@ async function runCase(c: EvalCase): Promise<Result> {
             ? canned
             : (
                 await generateText({
-                    model: openai("gpt-4o-mini"),
-                    temperature: 0,
-                    system: buildSystemPrompt(relevant),
-                    messages: [
-                        ...(c.history ?? []).map((h) => ({ role: h.role, content: h.text })),
-                        { role: "user" as const, content: resolvedQuestion },
-                    ],
+                    ...generationSettings(relevant),
+                    messages: generationMessages(history, c.query, subQueries),
                 })
             ).text;
         const refused = isRefusal(text);
@@ -254,7 +243,7 @@ async function runCase(c: EvalCase): Promise<Result> {
         ...(oddRun ? { odd: oddRun } : {}),
         faithful,
         verdict,
-        detail: detail || firstAnswer.slice(0, 0),
+        detail,
     };
 }
 
@@ -413,7 +402,7 @@ async function main() {
     if (JUDGE) {
         const judged = results.filter((r) => r.faithful !== "—");
         const grounded = judged.filter((r) => r.faithful === "yes").length;
-        console.log(`faithfulness       ${grounded}/${judged.length}   answers fully supported by their own retrieved chunks (judge, n=15 calibration)`);
+        console.log(`faithfulness       ${grounded}/${judged.length}   answers fully supported by their own retrieved chunks (judge calibrated 0/12 FA, 0/23 missed, n=35)`);
     }
 
     // Parked, known-failing cases: reported here, never counted against the suite.

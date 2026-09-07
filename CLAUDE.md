@@ -17,6 +17,8 @@ expected to hold to that, not just to keep the tests green.
 | `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; intents search / greeting / off-topic; `DEBUG_PLAN=1` |
 | `lib/corpus.ts` | The 37-page list, shared by ingestion and experiments |
 | `lib/retrieve.ts` | embed → pgvector (top 40) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
+| `lib/generation.ts` | Generation settings + the resolved-query message swap, shared by route, harness and judge calibration |
+| `lib/env.ts` | `requireEnv` — the only way to read a required variable |
 | `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
 | `lib/chat-request.ts` | zod parse-then-construct of the request body |
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
@@ -27,7 +29,7 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
-| `db/000..003_*.sql` | schema · content hash · query log · visitor attribution + views |
+| `db/000..004_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view |
 
 ## Invariants — do not break these
 
@@ -43,8 +45,10 @@ expected to hold to that, not just to keep the tests green.
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
    retrieval inside `evals/` — a copy drifts, and drifts toward passing.
 4. **Generation answers the planner's *resolved* query, not the raw message** — in the
-   route AND the harness. Change one, change the other. This is what makes "What is SDK?"
-   behave like "What is the AI SDK?".
+   route, the harness AND the judge calibration, all through `lib/generation.ts`
+   (`generationSettings` + `generationMessages`). Never inline a generation call with its
+   own settings; the calibration script drifted that way once (Day 15). This is what makes
+   "What is SDK?" behave like "What is the AI SDK?".
 5. **Refusal detection is positional.** `isRefusal` matches the refusal's core sentence at
    the *start* (or after a "The documentation doesn't cover…" prefix). Do not loosen it to
    `includes()` — that scored partial answers as refusals and poisoned the production
@@ -60,8 +64,13 @@ expected to hold to that, not just to keep the tests green.
    directly; the main suite can only see its consequences. Greeting intent applies only
    when the whole message is a greeting — a greeting attached to a question is a search.
 8. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
-   is never an accepted role; caps 20 msgs / 4k chars / 24k total. Never `String(err)`
-   to the client. Rate limit runs before any paid work.
+   is never an accepted role; caps 20 msgs / 4k chars / 24k total — the total cap trims the
+   OLDEST turns (it once dropped the newest and 400'd). Malformed JSON is a 400. Never
+   `String(err)` to the client. Rate limit runs before any paid work. `IP_HASH_SALT` is
+   mandatory whenever Upstash is configured — the module throws otherwise.
+9. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
+   function after the response and the insert is lost. Greetings and off-topic refusals are
+   logged too (mode `skipped`).
 
 ## How to change things here
 
@@ -111,7 +120,7 @@ npm run eval:planner                 # planner-only: intent, sub-query count, mu
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
 DEBUG_PLAN=1 EVAL_RUNS=0 npm run eval # hypotheticals + vector candidates per sub-query
 EVAL_JUDGE=1 npm run eval            # + faithfulness judge per answered case
-npm run eval:calibrate               # validate the judge against known-labelled answers first
+npm run eval:calibrate               # validate the judge against known-labelled answers first (last: 0/12 FA, 0/23 missed, n=35)
 npm run exp:sweep                    # threshold / rerank / HyDE gap numbers for the README (~5 min)
 npm run exp:chunking                 # chunker comparison on the real corpus vs the eval queries
 npm run ingest / -- --write          # dry run prints the diff; --write applies it

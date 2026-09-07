@@ -1,5 +1,9 @@
 import { UIMessage } from "ai";
 
+// Type-only: neither module's runtime (Supabase, OpenAI clients) reaches the browser bundle.
+import type { RetrievalMode } from "./retrieve";
+import type { PlanIntent } from "./plan";
+
 /**
  * Custom data parts. Each key becomes a part type: "sources" -> "data-sources".
  *
@@ -11,6 +15,12 @@ import { UIMessage } from "ai";
  * already satisfies `extends UIDataTypes` on its own.
  */
 export type ChatDataParts = {
+    /**
+     * Which path produced this reply. Sent on every response, before any text. The UI
+     * tells the reader when the reranker was unavailable ("cosine-fallback") — that path
+     * refuses more and ranks worse, and saying nothing would blame the documentation.
+     */
+    retrieval: { mode: RetrievalMode; intent: PlanIntent };
     /** One entry per PAGE (deduped by url), not per chunk — see lib/sources.ts. */
     sources: {
         id: number;

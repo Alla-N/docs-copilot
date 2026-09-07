@@ -12,14 +12,12 @@
  */
 import { createClient } from "@supabase/supabase-js";
 
+import { requireEnv } from "./env";
 import { isRefusal } from "./refusal";
 import { type RetrievalMode, type RetrievedChunk } from "./retrieve";
 import { type Visitor } from "./visitor";
 
-const supabase = createClient(
-    process.env.SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_KEY!
-);
+const supabase = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_KEY"));
 
 export async function logQuery(entry: {
     question: string;

@@ -16,9 +16,10 @@
  * A judge that catches one and not the other is only half working.
  */
 import { generateText } from "ai";
-import { openai } from "@ai-sdk/openai";
 
-import { retrieve, buildSystemPrompt, type RetrievedChunk } from "../lib/retrieve";
+import { type RetrievedChunk } from "../lib/retrieve";
+import { plannedRetrieve } from "../lib/plan";
+import { generationSettings, generationMessages } from "../lib/generation";
 import { CASES } from "./dataset";
 import { judgeFaithfulness } from "./judge";
 
@@ -31,9 +32,21 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  */
 const CROSS_CUTTING = ["migration-guide-7-0"];
 
-/** A specific, checkable, invented fact. Specificity matters — vague filler is genuinely ambiguous. */
-const FABRICATION =
-    " AI SDK 7 was released on 12 March 2026 and requires Node.js 24 or newer.";
+/**
+ * Specific, checkable, invented facts — one per fabrication KIND, rotated across cases so the
+ * judge is tested on the shapes a real fabrication takes, not on one reused sentence it could
+ * learn to spot. Specificity matters — vague filler is genuinely ambiguous. (Review item 20.)
+ */
+const FABRICATIONS = [
+    // invented date / requirement
+    " AI SDK 7 was released on 12 March 2026 and requires Node.js 24 or newer.",
+    // wrong API name (does not exist)
+    " For a non-streaming variant with the same options, call `streamTextSync` instead.",
+    // wrong default (the SDK's is 2)
+    " By default `maxRetries` is 5, so a failing request is retried five times before it throws.",
+    // invented option
+    " Pass `{ cache: 'aggressive' }` in the settings to have identical prompts served from cache.",
+];
 
 type Sample = {
     caseId: string;
@@ -52,12 +65,15 @@ async function main() {
     const base: { id: string; question: string; source?: string; chunks: RetrievedChunk[]; answer: string }[] = [];
     for (const [i, c] of answerable.entries()) {
         if (i > 0) await sleep(RERANK_INTERVAL_MS);
-        const { relevant } = await retrieve(c.query);
+        // The PRODUCTION pipeline — planner, HyDE, resolved query, shared generation settings —
+        // not a raw `retrieve(c.query)`. The first version bypassed all of that and so
+        // calibrated the judge on answers the app never produces (invariants #3/#4).
+        const { relevant, intent, subQueries } = await plannedRetrieve(c.query, c.history ?? []);
+        if (intent !== "search") { console.log(`  skipped ${c.id} (${intent})`); continue; }
+        const history = (c.history ?? []).map((h) => ({ role: h.role, content: h.text }));
         const { text } = await generateText({
-            model: openai("gpt-4o-mini"),
-            temperature: 0,
-            system: buildSystemPrompt(relevant),
-            prompt: c.query,
+            ...generationSettings(relevant),
+            messages: generationMessages(history, c.query, subQueries),
         });
         // `source` only picks a topically DISTANT partner below. For an any-of case the first
         // slug is the primary page, which is all the distance check needs.
@@ -69,17 +85,29 @@ async function main() {
     // ── 2. Build the labelled samples ────────────────────────────
     const samples: Sample[] = [];
     for (const [i, b] of base.entries()) {
+        const fabrication = FABRICATIONS[i % FABRICATIONS.length];
         samples.push({ caseId: b.id, kind: "clean", question: b.question, chunks: b.chunks, answer: b.answer, expectSupported: true });
-        samples.push({ caseId: b.id, kind: "fabricated", question: b.question, chunks: b.chunks, answer: b.answer + FABRICATION, expectSupported: false });
+        samples.push({ caseId: `${b.id} (fab ${i % FABRICATIONS.length})`, kind: "fabricated", question: b.question, chunks: b.chunks, answer: b.answer + fabrication, expectSupported: false });
         // Judge this answer against another case's chunks. The partner must be topically
-        // DISTANT, which took two corrections to get right:
+        // DISTANT, which took three corrections to get right:
         //   1. new-7 and changed-7 retrieve the same page — swapping them is not unfaithful
         //   2. the Migration guide is a survey doc covering the whole SDK surface, so it
         //      partially supports almost any answer. Judged against it, "unfaithful" is
         //      genuinely arguable — and an arguable label teaches you nothing about the
         //      judge, it just adds noise you'll misread as a judge failure.
+        //   3. (Day 15) comparing expectedSource labels is not enough: tool-calling's chunks
+        //      include Core: Overview, which states the generateText/streamText comparison
+        //      verbatim. The judge quoted it and was scored a "missed lie". The partner's
+        //      RETRIEVED PAGES must be disjoint from this case's — compared on chunk urls.
         // A calibration set may only contain samples whose correct label is beyond dispute.
-        const other = base.find((o) => o.source !== b.source && !CROSS_CUTTING.includes(o.source ?? ""));
+        const pages = new Set(b.chunks.map((c) => c.source_url));
+        const other = base.find(
+            (o) =>
+                o.source !== b.source &&
+                !CROSS_CUTTING.includes(o.source ?? "") &&
+                o.chunks.every((c) => !pages.has(c.source_url))
+        );
+        if (!other) console.log(`  (no page-disjoint swap partner for ${b.id} — swapped sample skipped)`);
         if (other) {
             samples.push({ caseId: `${b.id}←${other.id}`, kind: "swapped", question: b.question, chunks: other.chunks, answer: b.answer, expectSupported: false });
         }
@@ -106,7 +134,7 @@ async function main() {
             console.log(`  judge said: ${v.reasoning}`);
             console.log(`  --- claims and the quotes it offered as evidence ---`);
             for (const c of v.checked) {
-                console.log(`  ${c.found ? "OK  " : "FAIL"}  claim: ${c.claim.slice(0, 90)}`);
+                console.log(`  ${c.found === "skipped" ? `skip` : c.found ? "OK  " : "FAIL"}  [${c.kind}] claim: ${c.claim.slice(0, 90)}`);
                 console.log(`        quote: ${JSON.stringify(c.quote.slice(0, 140))}`);
             }
             console.log(`  --- answer being judged ---`);

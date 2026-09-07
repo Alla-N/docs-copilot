@@ -51,6 +51,22 @@ const DAILY_GLOBAL = Number(process.env.RATE_DAILY_GLOBAL ?? 200);
 
 const redis = configured ? Redis.fromEnv() : null;
 
+/**
+ * The salt is what makes the IP hash a pseudonym rather than a lookup table: the IPv4 space
+ * is 4 billion values, and sha256 of each of them keyed on a constant that is in a public
+ * repo is an afternoon's brute force. The first version fell back to "docs-copilot" when
+ * IP_HASH_SALT was unset — silently, in production. Now: Upstash configured (= this is a
+ * real deployment) and no salt is a misconfiguration that must be visible on the first
+ * request, not a quiet downgrade. Local dev (no Upstash) still works without one.
+ * (Review item 19.)
+ */
+const IP_HASH_SALT = process.env.IP_HASH_SALT;
+if (configured && !IP_HASH_SALT) {
+    throw new Error(
+        "IP_HASH_SALT is not set but the rate limiter is configured. Refusing to hash visitor IPs with a public constant — set IP_HASH_SALT in the deployment's environment."
+    );
+}
+
 const burst = redis
     ? new Ratelimit({
         redis,
@@ -80,8 +96,9 @@ const globalDaily = redis
 export function clientKey(req: Request): string {
     const forwarded = req.headers.get("x-forwarded-for") ?? "";
     const ip = forwarded.split(",")[0]?.trim() || req.headers.get("x-real-ip") || "unknown";
+    // "dev" only ever applies with no limiter configured (see the check above).
     return createHash("sha256")
-        .update(`${ip}:${process.env.IP_HASH_SALT ?? "docs-copilot"}`)
+        .update(`${ip}:${IP_HASH_SALT ?? "dev"}`)
         .digest("hex")
         .slice(0, 32);
 }

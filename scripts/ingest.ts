@@ -19,6 +19,7 @@ import { createClient } from "@supabase/supabase-js";
 // Relative, not "@/..." — tsx runs this outside Next.js, so the tsconfig alias isn't applied.
 import { chunkPage, stripBoilerplate } from "../lib/chunker";
 import { PAGES } from "../lib/corpus";
+import { requireEnv } from "../lib/env";
 
 type DocumentRow = {
     content: string;
@@ -43,16 +44,6 @@ type Database = {
         CompositeTypes: Record<string, never>;
     };
 };
-
-function requireEnv(name: string): string {
-    const value = process.env[name];
-    if (!value) {
-        throw new Error(
-            `Missing ${name}. Run via "npm run ingest" so --env-file=.env.local is applied.`
-        );
-    }
-    return value;
-}
 
 const supabase = createClient<Database>(
     requireEnv("SUPABASE_URL"),

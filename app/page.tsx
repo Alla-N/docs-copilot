@@ -143,6 +143,14 @@ export default function Chat() {
                     const sourcesPart = message.parts.find((p) => p.type === "data-sources");
                     const sources = sourcesPart?.type === "data-sources" ? sourcesPart.data : undefined;
 
+                    // The route says which retrieval path produced the reply. When the reranker
+                    // was unavailable the answer came from cosine order behind a stricter cut —
+                    // more refusals, worse ranking — and the reader should know that the
+                    // documentation is not what fell short. (Review item 22.)
+                    const retrievalPart = message.parts.find((p) => p.type === "data-retrieval");
+                    const degraded =
+                        retrievalPart?.type === "data-retrieval" && retrievalPart.data.mode === "cosine-fallback";
+
                     // Sources stream BEFORE the model has answered, so the route cannot know
                     // whether it will refuse. Chunks can clear the 0.3 threshold and the prompt
                     // layer still (correctly) decline — as with "What is SDK?" at 0.35.
@@ -181,6 +189,14 @@ export default function Chat() {
                                     so the order here is explicit rather than incidental. Block-level
                                     markdown (fences, lists, tables): components/markdown.tsx. */}
                                 <Markdown text={text} citeTarget={citeTarget} />
+
+                                {degraded && (
+                                    <p className="mt-3 rounded-lg border px-3 py-2 text-xs leading-relaxed border-amber-200 bg-amber-50 text-amber-800 dark:border-amber-900/60 dark:bg-amber-950/30 dark:text-amber-200/90">
+                                        The reranking service was unavailable for this reply, so retrieval used
+                                        a stricter fallback. It may have refused, or ranked pages less precisely,
+                                        than it normally would.
+                                    </p>
+                                )}
 
                                 {sources && sources.length > 0 && (
                                     <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-800">
