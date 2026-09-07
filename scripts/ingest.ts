@@ -10,8 +10,6 @@
  * The deployed app only ever READS the vector store. Writing is an ops job,
  * so it lives here instead of behind a public URL.
  */
-import { createHash } from "node:crypto";
-
 import { embedMany } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { createClient } from "@supabase/supabase-js";
@@ -20,6 +18,7 @@ import { createClient } from "@supabase/supabase-js";
 import { chunkPage, stripBoilerplate } from "../lib/chunker";
 import { PAGES } from "../lib/corpus";
 import { requireEnv } from "../lib/env";
+import { hashChunk } from "../lib/content-hash";
 
 type DocumentRow = {
     content: string;
@@ -49,16 +48,6 @@ const supabase = createClient<Database>(
     requireEnv("SUPABASE_URL"),
     requireEnv("SUPABASE_SERVICE_KEY")
 );
-
-/**
- * MUST stay byte-identical to db/001_content_hash.sql:
- *   encode(sha256(convert_to(source_url || E'\n' || content, 'UTF8')), 'hex')
- * source_url is in the hash so two pages may legitimately share identical text
- * without one of them being rejected by the unique index.
- */
-function hashChunk(sourceUrl: string, content: string): string {
-    return createHash("sha256").update(`${sourceUrl}\n${content}`, "utf8").digest("hex");
-}
 
 const WRITE = process.argv.includes("--write");
 const EMBED_BATCH = 50;

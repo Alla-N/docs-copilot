@@ -258,6 +258,7 @@ worded.
 ## Evals
 
 ```bash
+npm test                     # unit tests: every pure function that has had a bug (~80 cases, seconds)
 npm run eval                 # 27 labelled cases × 3 generations (injection cases × 8)
 EVAL_RUNS=0 npm run eval     # retrieval-only: no answer generation (planner + embed + rerank still run — about a cent)
 npm run eval:planner         # planner-only: 24 cases on intent and sub-queries, no retrieval
@@ -319,7 +320,10 @@ For hands-on checks beyond the automated set, `evals/manual-qa.md` is a 50-quest
 like for each group.
 
 **It runs in CI** (`.github/workflows/eval.yml`), priced in three tiers. Every push runs the
-planner suite and the retrieval-only mode — no *answer* generation, though each case still pays
+unit tests first (`npm test`, Vitest — the refusal detector, the request parser, the chunker,
+the content hash's parity with the SQL, the judge's quote matcher and its guards, citations,
+source pills, visitor attribution: each one a function that had a documented bug, with that
+bug as a test), then the planner suite and the retrieval-only mode — no *answer* generation, though each case still pays
 a planner call, an embed and a rerank — and **fails if an answerable case's expected doc no
 longer survives rerank + threshold** on two consecutive tries, so a retrieval regression can't
 land quietly and a single HyDE coin-flip can't turn the badge red. Pushes to `main`, pull

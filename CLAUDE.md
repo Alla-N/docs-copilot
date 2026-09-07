@@ -24,6 +24,7 @@ expected to hold to that, not just to keep the tests green.
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
+| `tests/` | Vitest unit tests for the pure functions; `npm test`, first CI step |
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
 | `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval |
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
@@ -87,6 +88,9 @@ expected to hold to that, not just to keep the tests green.
   existed in the docs. Use `shouldAnswer: "either"` + `mustNotContain` when
   answer-vs-refuse is the wrong axis. The canned greeting is *not* a refusal, so
   `shouldAnswer: true` alone passes a short-circuit.
+- **Every fixed bug in a pure function gets a unit test with the bug as the case** (`tests/`).
+  The Day-12 `includes()` refusal, the newest-turn cap drop, the bag-of-words quote matcher —
+  all sit in `tests/` now. `npm test` runs in seconds and before anything paid in CI.
 - **Every eval case is added because it was observed**, with a note saying how.
   `evals/manual-qa.md` is where the hand tests live; a bug found there becomes a case.
 - **Look, don't guess.** `EVAL_RUNS=0` for retrieval-only; `DEBUG_PLAN=1` prints each
@@ -114,6 +118,7 @@ expected to hold to that, not just to keep the tests green.
 
 ```
 npm run dev                          # local app; limiter fails open without Upstash keys
+npm test                             # Vitest unit tests (Mac, not the bridge VM)
 npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail
 EVAL_RUNS=0 npm run eval             # retrieval-only (still pays planner+embed+rerank); fails on a recall miss twice
 npm run eval:planner                 # planner-only: intent, sub-query count, must/must-not strings; cheap

@@ -4,6 +4,8 @@ import { useMemo, useState, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { CITE_PREFIX, linkCitations } from "@/lib/citations";
+
 /**
  * Renders an assistant answer as markdown.
  *
@@ -29,30 +31,6 @@ import remarkGfm from "remark-gfm";
 function safeHref(href: string | undefined): string | null {
     if (!href) return null;
     return /^https?:\/\//i.test(href) ? href : null;
-}
-
-/** Internal href scheme for citations. No protocol, so react-markdown's url transform keeps it. */
-const CITE_PREFIX = "#source-";
-
-/**
- * "(Source 3)", "(Sources 1 and 2)", "(Source 1, Source 4)" → one markdown link per number,
- * "[3](#source-3)", which the `a` override renders as a superscript that jumps to the matching
- * pill. Only the parenthesised form the prompt asks for is rewritten; anything else stays text.
- * Fenced code is skipped so a literal "(Source 1)" in a snippet is left alone.
- */
-const CITATION = /\((Sources?)\s+(\d+(?:\s*(?:,|and|&)\s*(?:Sources?\s+)?\d+)*)\)/gi;
-
-function linkCitations(text: string): string {
-    return text
-        .split(/(```[\s\S]*?(?:```|$))/)
-        .map((part, i) =>
-            i % 2 === 1
-                ? part
-                : part.replace(CITATION, (_m, _word, nums: string) =>
-                      (nums.match(/\d+/g) ?? []).map((n) => `[${n}](${CITE_PREFIX}${n})`).join("")
-                  )
-        )
-        .join("");
 }
 
 function CodeBlock({ lang, code }: { lang?: string; code: string }) {

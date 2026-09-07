@@ -69,6 +69,11 @@ jobs:
       - name: Typecheck
         run: npx tsc --noEmit
 
+      # Unit tests: the pure functions, each with its documented bug as a case. Seconds, no
+      # secrets, no network — so they run before anything that costs money.
+      - name: Unit tests
+        run: npm test
+
       # Planner-only: intent, sub-query count, must/must-not strings. Cheap, no rerank, so it
       # runs on every tier and fails fast before the throttled suite spends five minutes.
       - name: Planner eval
