@@ -2,38 +2,33 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { Markdown } from "@/components/markdown";
 import { ChatMessage } from "@/lib/chat-types";
 import { captureLanding, landingHeaders } from "@/lib/landing";
 import { isRefusal } from "@/lib/refusal";
 import { parseRateLimit, REPO_URL } from "@/lib/rate-limit-message";
 
 /**
- * Minimal inline markdown: `code` and **bold**. The model emits both and rendering
- * them as literal asterisks and backticks made every answer look broken. Deliberately
- * not a markdown library — two constructs cover ~all of what a docs assistant returns,
- * and this keeps the dependency list honest.
+ * Empty-state prompts. Drawn from evals/manual-qa.md (groups 1 and 2) so each is a question
+ * the corpus is known to answer — a suggested question that refuses would be a bad first
+ * impression. The last one is deliberately OUT of scope: refusing is the project's central
+ * claim, and a visitor should be able to see it happen without having to think of a trap.
  */
-function renderInline(text: string) {
-    const parts = text.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
-    return parts.map((part, i) => {
-        if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
-            return (
-                <code
-                    key={i}
-                    className="rounded px-1 py-0.5 text-[0.9em] font-mono bg-gray-100 text-gray-800 dark:bg-gray-800 dark:text-gray-200"
-                >
-                    {part.slice(1, -1)}
-                </code>
-            );
-        }
-        if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
-            return <strong key={i} className="font-semibold">{part.slice(2, -2)}</strong>;
-        }
-        return <span key={i}>{part}</span>;
-    });
-}
+const SUGGESTIONS: { text: string; hint?: string }[] = [
+    { text: "How do I stream text with streamText?" },
+    { text: "How do I generate structured JSON with a Zod schema?" },
+    { text: "What is tool calling?" },
+    { text: "What's new in AI SDK 7?" },
+    { text: "embeddings?", hint: "terse on purpose" },
+    { text: "How do I fine-tune a model with the AI SDK?", hint: "out of scope — watch it refuse" },
+];
+
+const CORPUS_URL = `${REPO_URL}/blob/main/scripts/ingest.ts`;
+
+/** Pixels from the bottom within which the reader counts as "following along". */
+const STICK_THRESHOLD = 80;
 
 export default function Chat() {
     const [input, setInput] = useState("");
@@ -47,19 +42,96 @@ export default function Chat() {
         () => new DefaultChatTransport<ChatMessage>({ api: "/api/chat", headers: landingHeaders }),
         []
     );
-    const { messages, sendMessage, status, error, regenerate } = useChat<ChatMessage>({ transport });
+    const { messages, sendMessage, status, error, regenerate, stop } = useChat<ChatMessage>({ transport });
 
     const isBusy = status === "submitted" || status === "streaming";
     const rateLimit = parseRateLimit(error);
 
+    // ── Layout: the input bar is fixed, so the list needs exactly its height as bottom
+    // padding — a guessed constant was too small on some viewports and hid the last lines
+    // of an answer under the bar. Measured live; ResizeObserver covers font/width changes.
+    const barRef = useRef<HTMLDivElement>(null);
+    const [barHeight, setBarHeight] = useState(176);
+    useEffect(() => {
+        const el = barRef.current;
+        if (!el) return;
+        const update = () => setBarHeight(el.offsetHeight);
+        update();
+        const ro = new ResizeObserver(update);
+        ro.observe(el);
+        return () => ro.disconnect();
+    }, []);
+
+    // ── Auto-scroll: follow the stream while the reader is at the bottom; the moment they
+    // scroll up to re-read something, stop yanking the page. "At the bottom" is re-evaluated
+    // on every scroll, so scrolling back down re-engages following.
+    const stickRef = useRef(true);
+    useEffect(() => {
+        const onScroll = () => {
+            const distance = document.documentElement.scrollHeight - window.innerHeight - window.scrollY;
+            stickRef.current = distance < STICK_THRESHOLD;
+        };
+        window.addEventListener("scroll", onScroll, { passive: true });
+        return () => window.removeEventListener("scroll", onScroll);
+    }, []);
+    useEffect(() => {
+        if (stickRef.current) window.scrollTo({ top: document.documentElement.scrollHeight });
+    }, [messages, status]);
+
+    const ask = useCallback(
+        (text: string) => {
+            if (!text.trim() || isBusy) return;
+            stickRef.current = true; // a new question always starts at the bottom
+            sendMessage({ text });
+            setInput("");
+        },
+        [isBusy, sendMessage]
+    );
+
     return (
-        <div className="flex flex-col w-full max-w-3xl mx-auto px-4 pt-10 pb-44">
+        <div className="flex flex-col w-full max-w-3xl mx-auto px-4 pt-10" style={{ paddingBottom: barHeight + 24 }}>
             <header className="mb-8">
                 <h1 className="text-lg font-semibold tracking-tight">docs-copilot</h1>
                 <p className="text-sm text-gray-500 dark:text-gray-400">
                     Grounded answers from the Vercel AI SDK documentation — with sources, or a refusal.
                 </p>
             </header>
+
+            {messages.length === 0 && !error && (
+                // Empty state. A first-time visitor (often a recruiter) sees what to type, what the
+                // thing knows, and where the code is — same voice as the rate-limit banner.
+                <section className="space-y-5">
+                    <div className="flex flex-wrap gap-2">
+                        {SUGGESTIONS.map((s) => (
+                            <button
+                                key={s.text}
+                                type="button"
+                                onClick={() => ask(s.text)}
+                                className="group inline-flex items-center gap-2 rounded-lg border px-3 py-1.5 text-left text-sm transition-colors border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-300 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-200 dark:hover:bg-gray-700/70 dark:hover:border-gray-600"
+                            >
+                                <span>{s.text}</span>
+                                {s.hint && (
+                                    <span className="text-[11px] text-gray-400 group-hover:text-gray-500 dark:text-gray-500 dark:group-hover:text-gray-400">
+                                        {s.hint}
+                                    </span>
+                                )}
+                            </button>
+                        ))}
+                    </div>
+                    <p className="text-sm leading-relaxed text-gray-500 dark:text-gray-400">
+                        It answers from{" "}
+                        <a href={CORPUS_URL} target="_blank" rel="noopener noreferrer" className="underline decoration-gray-300 underline-offset-2 hover:decoration-gray-500 dark:decoration-gray-600 dark:hover:decoration-gray-400">
+                            37 pages of the AI SDK docs
+                        </a>{" "}
+                        — Core, UI, Agents, Foundations, the v7 migration guide and the main reference pages —
+                        and says so when a question falls outside them. Every answer shows the pages it
+                        came from.{" "}
+                        <a href={REPO_URL} target="_blank" rel="noopener noreferrer" className="underline decoration-gray-300 underline-offset-2 hover:decoration-gray-500 dark:decoration-gray-600 dark:hover:decoration-gray-400">
+                            How it works, with measured results, on GitHub →
+                        </a>
+                    </p>
+                </section>
+            )}
 
             <div className="space-y-6">
                 {messages.map((message) => {
@@ -83,6 +155,14 @@ export default function Chat() {
                     // retrieval, so it cannot weaken a guardrail.
                     const refused = isRefusal(text);
 
+                    // "(Source 3)" in the answer → the pill whose chunks include 3. Pills are per
+                    // page and chunks per section, so several numbers can point at one pill.
+                    const pillId = (s: { id: number }) => `m-${message.id}-src-${s.id}`;
+                    const citeTarget = (n: number) => {
+                        const pill = sources?.find((s) => s.chunks.includes(n));
+                        return pill ? pillId(pill) : null;
+                    };
+
                     if (message.role === "user") {
                         return (
                             <div key={message.id} className="flex justify-end">
@@ -98,10 +178,9 @@ export default function Chat() {
                             <div className="max-w-[92%] rounded-2xl rounded-bl-md px-4 py-3 border shadow-sm border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900/70">
                                 {/* Answer first, citations underneath — the reader wants the answer,
                                     then the provenance. Sources arrive on the stream before the text,
-                                    so the order here is explicit rather than incidental. */}
-                                <div className="whitespace-pre-wrap leading-relaxed text-[15px]">
-                                    {renderInline(text)}
-                                </div>
+                                    so the order here is explicit rather than incidental. Block-level
+                                    markdown (fences, lists, tables): components/markdown.tsx. */}
+                                <Markdown text={text} citeTarget={citeTarget} />
 
                                 {sources && sources.length > 0 && (
                                     <div className="mt-4 pt-3 border-t border-gray-200 dark:border-gray-800">
@@ -118,11 +197,18 @@ export default function Chat() {
                                             {sources.map((s) => (
                                                 <a
                                                     key={s.id}
+                                                    id={pillId(s)}
                                                     href={s.url}
                                                     target="_blank"
                                                     rel="noopener noreferrer"
-                                                    className="inline-flex items-center gap-2 px-3 py-1.5 text-xs rounded-lg border transition-colors border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-300 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-200 dark:hover:bg-gray-700/70 dark:hover:border-gray-600"
+                                                    title={s.chunks.length > 1 ? `Sources ${s.chunks.join(", ")}` : `Source ${s.chunks[0]}`}
+                                                    className="inline-flex items-center gap-2 px-3 py-1.5 text-xs rounded-lg border transition-colors scroll-mt-24 border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100 hover:border-gray-300 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-200 dark:hover:bg-gray-700/70 dark:hover:border-gray-600"
                                                 >
+                                                    {!refused && (
+                                                        <span className="tabular-nums text-[10px] text-gray-400 dark:text-gray-500">
+                                                            {s.chunks.join(",")}
+                                                        </span>
+                                                    )}
                                                     <span>{s.title}</span>
                                                     {!refused && (
                                                         <span className="tabular-nums text-gray-400 dark:text-gray-500">
@@ -182,23 +268,34 @@ export default function Chat() {
                 )}
             </div>
 
-            <div className="fixed inset-x-0 bottom-0 bg-gradient-to-t from-[var(--background)] via-[var(--background)] to-transparent pt-8 pb-6">
+            <div ref={barRef} className="fixed inset-x-0 bottom-0 bg-gradient-to-t from-[var(--background)] via-[var(--background)] to-transparent pt-8 pb-6">
                 <form
                     onSubmit={(e) => {
                         e.preventDefault();
-                        if (!input.trim() || isBusy) return;
-                        sendMessage({ text: input });
-                        setInput("");
+                        ask(input);
                     }}
                     className="w-full max-w-3xl mx-auto px-4"
                 >
-                    <input
-                        className="w-full px-4 py-3 rounded-xl border shadow-sm outline-none transition-colors disabled:opacity-50 border-gray-300 bg-white text-gray-900 placeholder-gray-400 focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-500"
-                        value={input}
-                        placeholder={isBusy ? "Waiting for response…" : "Ask about the AI SDK…"}
-                        onChange={(e) => setInput(e.target.value)}
-                        disabled={isBusy}
-                    />
+                    <div className="relative">
+                        <input
+                            className="w-full px-4 py-3 pr-24 rounded-xl border shadow-sm outline-none transition-colors disabled:opacity-50 border-gray-300 bg-white text-gray-900 placeholder-gray-400 focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:placeholder-gray-500 dark:focus:border-blue-500"
+                            value={input}
+                            placeholder={isBusy ? "Waiting for response…" : "Ask about the AI SDK…"}
+                            onChange={(e) => setInput(e.target.value)}
+                            disabled={isBusy}
+                        />
+                        {/* Stop aborts the stream client-side; useChat keeps whatever was already
+                            streamed as the final message, so nothing is lost. */}
+                        {isBusy && (
+                            <button
+                                type="button"
+                                onClick={() => stop()}
+                                className="absolute right-2 top-1/2 -translate-y-1/2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors border-gray-300 bg-white text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
+                            >
+                                Stop
+                            </button>
+                        )}
+                    </div>
                 </form>
             </div>
         </div>

@@ -13,6 +13,7 @@ import { logQuery } from "@/lib/query-log";
 import { parseChatRequest, BadRequestError } from "@/lib/chat-request";
 import { checkRateLimit, clientKey } from "@/lib/rate-limit";
 import { visitorFrom } from "@/lib/visitor";
+import { toSourcePills } from "@/lib/sources";
 
 export async function POST(req: Request) {
     try {
@@ -89,15 +90,9 @@ export async function POST(req: Request) {
             },
             execute: async ({ writer }) => {
                 if (!greeting && relevant.length > 0) {
-                    writer.write({
-                        type: "data-sources",
-                        data: relevant.map((c, i) => ({
-                            id: i + 1,
-                            title: c.title,
-                            url: c.source_url,
-                            score: c.score,
-                        })),
-                    });
+                    // One pill per page, not per chunk; the prompt's "[Source N]" numbering is
+                    // untouched and each pill lists the N's it stands for (lib/sources.ts).
+                    writer.write({ type: "data-sources", data: toSourcePills(relevant) });
                 }
                 writer.merge(toUIMessageStream(result));
             },

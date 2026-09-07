@@ -11,11 +11,15 @@ import { UIMessage } from "ai";
  * already satisfies `extends UIDataTypes` on its own.
  */
 export type ChatDataParts = {
+    /** One entry per PAGE (deduped by url), not per chunk — see lib/sources.ts. */
     sources: {
         id: number;
         title: string;
         url: string;
+        /** Best rerank score among this page's chunks. */
         score: number;
+        /** 1-based chunk numbers the prompt labelled "[Source N]" that belong to this page. */
+        chunks: number[];
     }[];
 };
 
