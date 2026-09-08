@@ -21,6 +21,13 @@ export type ChatDataParts = {
      * refuses more and ranks worse, and saying nothing would blame the documentation.
      */
     retrieval: { mode: RetrievalMode; intent: PlanIntent };
+    /**
+     * HMAC over this assistant answer's text (lib/assistant-signature.ts). The client stores it
+     * with the message and sends it back with the next request; the route drops any assistant
+     * turn whose text does not match its signature. The value is opaque to the UI, which never
+     * renders it — it exists so history can be proven server-produced rather than trusted.
+     */
+    signature: { sig: string };
     /** One entry per PAGE (deduped by url), not per chunk — see lib/sources.ts. */
     sources: {
         id: number;

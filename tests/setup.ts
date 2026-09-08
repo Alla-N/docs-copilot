@@ -10,5 +10,8 @@ process.env.SUPABASE_URL ??= "http://localhost:54321";
 process.env.SUPABASE_SERVICE_KEY ??= "test-service-key";
 process.env.OPENAI_API_KEY ??= "test-openai-key";
 process.env.COHERE_API_KEY ??= "test-cohere-key";
+// Assistant-turn signing: set so the tests exercise the CONFIGURED path a deployment uses,
+// not the dev-constant fallback.
+process.env.ASSISTANT_SIGNING_SECRET ??= "test-signing-secret";
 delete process.env.UPSTASH_REDIS_REST_URL;
 delete process.env.UPSTASH_REDIS_REST_TOKEN;

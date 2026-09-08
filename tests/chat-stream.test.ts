@@ -21,9 +21,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { GREETING_MESSAGE } from "@/lib/plan";
 import { REFUSAL_MESSAGE } from "@/lib/refusal";
+import { verifyAssistantText } from "@/lib/assistant-signature";
 
 const mocks = vi.hoisted(() => ({
     plannedRetrieve: vi.fn(),
+    /** What the mocked model "streams". The route signs exactly this string. */
+    answerText: "Tool calling lets the model call functions.",
     /** Options the route passed to toUIMessageStream — `sendStart` is the one that matters. */
     uiStreamOptions: [] as Record<string, unknown>[],
 }));
@@ -44,7 +47,7 @@ vi.mock("ai", async (importOriginal) => {
     return {
         ...actual,
         // No model call. `stream` is what toUIMessageStream reads, and that is mocked too.
-        streamText: () => ({ stream: new ReadableStream({ start: (c) => c.close() }) }),
+        streamText: () => ({ stream: new ReadableStream({ start: (c) => c.close() }), text: Promise.resolve(mocks.answerText) }),
         // Stands in for the generation stream — faithfully, including the part that made the
         // bug: the SDK sends its OWN `start` unless told not to. Keeping that default here is
         // what makes this test fail against the old route (whose first chunk was a data part,
@@ -55,7 +58,7 @@ vi.mock("ai", async (importOriginal) => {
                 start(c) {
                     if (options.sendStart !== false) c.enqueue({ type: "start" });
                     c.enqueue({ type: "text-start", id: "t" });
-                    c.enqueue({ type: "text-delta", id: "t", delta: "Tool calling lets the model call functions." });
+                    c.enqueue({ type: "text-delta", id: "t", delta: mocks.answerText });
                     c.enqueue({ type: "text-end", id: "t" });
                     c.enqueue({ type: "finish" });
                     c.close();
@@ -114,6 +117,28 @@ describe("chat route stream framing", () => {
         expect(types.filter((t) => t === "start")).toHaveLength(1);
         expect(types[0]).toBe("start");
         expect(types.indexOf("data-sources")).toBeGreaterThan(0);
+    });
+
+    it("signs the answer it streamed, so the next turn can prove the server wrote it", async () => {
+        mocks.plannedRetrieve.mockResolvedValue(ANSWERED);
+
+        const chunks = await ask("What is tool calling?");
+        const streamed = chunks.filter((c) => c.type === "text-delta").map((c) => c.delta).join("");
+        const sig = (chunks.find((c) => c.type === "data-signature")?.data as { sig: string } | undefined)?.sig;
+
+        expect(verifyAssistantText(streamed, sig)).toBe(true);
+    });
+
+    it("signs canned replies too — an unsigned greeting would vanish from the next request", async () => {
+        mocks.plannedRetrieve.mockResolvedValue({
+            intent: "greeting", relevant: [], subQueries: [], mode: "skipped",
+            plannerUsage: { inputTokens: 210, outputTokens: 12 }, rerankCalls: 0,
+        });
+
+        const chunks = await ask("hi");
+        const sig = (chunks.find((c) => c.type === "data-signature")?.data as { sig: string } | undefined)?.sig;
+
+        expect(verifyAssistantText(GREETING_MESSAGE, sig)).toBe(true);
     });
 
     it("suppresses the generation stream's own `start`", async () => {

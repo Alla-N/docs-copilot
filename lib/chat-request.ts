@@ -22,6 +22,8 @@
 import { z } from "zod";
 import type { ModelMessage } from "ai";
 
+import { verifyAssistantText } from "./assistant-signature";
+
 /** History beyond this is dropped (older first). Bounds cost per request. */
 export const MAX_MESSAGES = 20;
 /** Per-message character cap. ~4000 chars ≈ 1000 tokens. */
@@ -37,7 +39,21 @@ const RawBody = z.object({
                 // instruction-injection vector straight into the prompt.
                 role: z.enum(["user", "assistant"]),
                 parts: z
-                    .array(z.object({ type: z.string(), text: z.string().optional() }).loose())
+                    .array(
+                        z
+                            .object({
+                                type: z.string(),
+                                text: z.string().optional(),
+                                // `unknown`, deliberately. The client echoes back EVERY data part
+                                // the route ever sent it, and their payloads have different shapes
+                                // — `data-sources` is an array, `data-signature` an object. Typing
+                                // this as an object rejected the whole body on any request that
+                                // carried a previous answer's source pills: a 400 on every
+                                // follow-up. The parts test caught it. Read what we trust below.
+                                data: z.unknown().optional(),
+                            })
+                            .loose()
+                    )
                     .default([]),
             })
         )
@@ -52,6 +68,18 @@ export type ParsedChatRequest = {
 };
 
 export class BadRequestError extends Error {}
+
+/**
+ * The one field we trust out of a client-supplied data part. Anything that is not an object
+ * carrying a string `sig` returns undefined, which `verifyAssistantText` treats as "no proof" —
+ * so a hostile payload (an array, a number, a nested object) fails the check instead of throwing.
+ */
+function signatureOf(parts: { type: string; data?: unknown }[]): unknown {
+    const data = parts.find((p) => p.type === "data-signature")?.data;
+    return data && typeof data === "object" && !Array.isArray(data)
+        ? (data as Record<string, unknown>).sig
+        : undefined;
+}
 
 export function parseChatRequest(body: unknown): ParsedChatRequest {
     const result = RawBody.safeParse(body);
@@ -75,14 +103,27 @@ export function parseChatRequest(body: unknown): ParsedChatRequest {
         const m = recent[i];
         // Text parts only. data-sources, step-start and anything else the client
         // echoes back are dropped — the model has no business reading them.
-        const text = m.parts
+        const joined = m.parts
             .filter((p) => p.type === "text" && typeof p.text === "string")
             .map((p) => p.text as string)
-            .join(" ")
-            .slice(0, MAX_CHARS_PER_MESSAGE)
-            .trim();
+            .join(" ");
+        const text = joined.slice(0, MAX_CHARS_PER_MESSAGE).trim();
 
         if (!text) continue;
+
+        // An assistant turn must PROVE this server wrote it. History is client-supplied and the
+        // model reads it as its own prior words, so a forged turn is an instruction channel that
+        // never touches the system prompt. Verification runs on the joined text BEFORE the caps
+        // below, because that is the string the route signed. An unsigned or altered turn is
+        // dropped, not rejected with a 400: the user of a stale tab loses context, which is
+        // recoverable, while the forger simply finds their sentence missing. (Review item 30.)
+        if (m.role === "assistant") {
+            if (!verifyAssistantText(joined, signatureOf(m.parts))) {
+                console.warn("DROPPED UNSIGNED ASSISTANT TURN — forged, or from before a secret rotation");
+                continue;
+            }
+        }
+
         if (totalChars + text.length > MAX_TOTAL_CHARS) break;
 
         totalChars += text.length;

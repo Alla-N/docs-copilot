@@ -15,6 +15,7 @@ import { parseChatRequest, BadRequestError } from "@/lib/chat-request";
 import { checkRateLimit, clientKey } from "@/lib/rate-limit";
 import { visitorFrom } from "@/lib/visitor";
 import { toSourcePills } from "@/lib/sources";
+import { signAssistantText } from "@/lib/assistant-signature";
 
 /**
  * Explicit, not the platform default. Measured retrieval worst case is ~6 s BEFORE
@@ -107,6 +108,9 @@ export async function POST(req: Request) {
                     writer.write({ type: "text-start", id });
                     writer.write({ type: "text-delta", id, delta: canned });
                     writer.write({ type: "text-end", id });
+                    // Canned replies are assistant turns too: unsigned, they would be dropped
+                    // from the next request's history and a follow-up after "hi" would lose it.
+                    writer.write({ type: "data-signature", data: { sig: signAssistantText(canned) } });
                     writer.write({ type: "finish" });
                 },
             });
@@ -163,6 +167,15 @@ export async function POST(req: Request) {
                 // sendStart: false — the message is already open. One `start` per message is
                 // the invariant; a second one is what caused the duplicate above.
                 writer.merge(toUIMessageStream({ stream: result.stream, sendStart: false }));
+
+                // Sign the finished answer so the next request can prove this server wrote it —
+                // `parseChatRequest` drops assistant turns that fail this check, which is what
+                // stops a forged prior turn from instructing the model (lib/assistant-signature.ts,
+                // review item 30). Awaiting the text here is what orders this after the stream:
+                // createUIMessageStream keeps the response open until execute's promise settles,
+                // so the part lands before the message ends. Signing the streamed text (not the
+                // eventual `onFinish` value) is deliberate — the client verifies what it received.
+                writer.write({ type: "data-signature", data: { sig: signAssistantText(await result.text) } });
             },
         });
 

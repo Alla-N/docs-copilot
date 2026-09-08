@@ -20,7 +20,8 @@ expected to hold to that, not just to keep the tests green.
 | `lib/generation.ts` | Generation settings + the resolved-query message swap, shared by route, harness and judge calibration |
 | `lib/env.ts` | `requireEnv` — the only way to read a required variable |
 | `lib/refusal.ts` | `REFUSAL_MESSAGE` + `isRefusal` — dependency-free, shared by route/log/UI/evals |
-| `lib/chat-request.ts` | zod parse-then-construct of the request body |
+| `lib/chat-request.ts` | zod parse-then-construct of the request body; drops assistant turns that fail signature check |
+| `lib/assistant-signature.ts` | HMAC over each assistant answer — history the client sends back must be server-produced |
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
@@ -70,19 +71,27 @@ expected to hold to that, not just to keep the tests green.
    guard-aws held only because the prompt refused. `evals/planner.ts` asserts this
    directly; the main suite can only see its consequences. Greeting intent applies only
    when the whole message is a greeting — a greeting attached to a question is a search.
-8. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
+8. **Assistant turns are signed, and history is verified before anything reads it.** The
+   route HMACs every answer it emits (canned replies included); `parseChatRequest` drops any
+   assistant turn whose text does not match its signature, BEFORE the caps are applied —
+   verification runs on the text as streamed, which is what was signed. Never accept an
+   unsigned assistant turn "just for dev": `ASSISTANT_SIGNING_SECRET` falls back to a constant
+   locally and the module throws in a deployment without it. The eval suite cannot see this
+   layer (the harness builds its own history and never crosses the route), so
+   `tests/chat-request.test.ts` and `tests/assistant-signature.test.ts` are the only guard.
+9. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
    is never an accepted role; caps 20 msgs / 4k chars / 24k total — the total cap trims the
    OLDEST turns (it once dropped the newest and 400'd). Malformed JSON is a 400. Never
    `String(err)` to the client. Rate limit runs before any paid work. `IP_HASH_SALT` is
    mandatory whenever Upstash is configured — the module throws otherwise.
-9. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
+10. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
    function after the response and the insert is lost. Greetings and off-topic refusals are
    logged too (mode `skipped`).
-10. **A refusal on an answerable case is a bug, even when recall says 12/12.** `expectedSource`
+11. **A refusal on an answerable case is a bug, even when recall says 12/12.** `expectedSource`
     is a PAGE, so any chunk of it satisfies recall — including one carrying none of the answer.
     The harness reports these as `false refusals`; never treat that line as noise, and never
     "fix" it by widening `expectedSource`.
-11. **One `start` chunk per response, written before any data part.** The client keys the
+12. **One `start` chunk per response, written before any data part.** The client keys the
     streaming assistant message by id and `start` assigns it: a data part written first
     pushes the message under a provisional id, and a later `start` (the merged generation
     stream sends one unless `sendStart: false`) renames it and pushes it a SECOND time —
