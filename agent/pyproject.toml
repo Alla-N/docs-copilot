@@ -8,6 +8,9 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "httpx>=0.28.1",
+    "openai>=3.13.0",
+    "psycopg[binary,pool]>=3.3.5",
     "pydantic-settings>=2.15.0",
 ]
 
@@ -39,7 +42,9 @@ select = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+# -m "not integration" by default: a plain `uv run pytest` never spends money or needs secrets.
+# `uv run pytest -m integration` overrides it (the last -m wins) to run only the live tests.
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib", "-m", "not integration"]
 markers = [
     "integration: needs network and secrets (Supabase, OpenAI, Cohere); excluded from the pre-commit hook",
 ]
