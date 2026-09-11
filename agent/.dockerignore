@@ -1,0 +1,14 @@
+# An allowlist: nothing enters the build context unless it is listed here.
+#
+# The main thing kept out is .venv/: 95 MB built on the Mac, with a python symlink into the
+# Mac's home directory and Mach-O .so files (psycopg_binary). Inside a Linux image it would
+# break the build, or worse, half-work. Tests, caches and any stray .env file stay out too,
+# and a file added to agent/ later stays out until someone adds it here on purpose.
+*
+!pyproject.toml
+!uv.lock
+!.python-version
+!README.md
+!src
+**/__pycache__
+**/*.py[cod]

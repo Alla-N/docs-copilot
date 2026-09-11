@@ -30,3 +30,34 @@ at http://127.0.0.1:8000/docs. Startup opens the database pool and exits if it c
 
 While the TypeScript retrieval still exists, `tests/test_ts_parity.py` keeps the calibrated
 numbers identical on both sides.
+
+## Running in Docker (local)
+
+From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):
+
+```
+docker build -t copilot-agent agent
+
+docker run --rm --name copilot-agent -p 127.0.0.1:8000:8000 \
+  --env-file <(grep -E '^(OPENAI_API_KEY|COHERE_API_KEY|DATABASE_URL)=' .env.local) \
+  copilot-agent
+curl http://127.0.0.1:8000/health          # {"status":"ok"}
+docker stop copilot-agent                  # SIGTERM: the lifespan closes the pool
+```
+
+Add `-e ENABLE_SEARCH_ENDPOINT=1` before the image name to get `POST /search`.
+
+- **No secrets in the image.** They arrive as environment variables at `docker run`, and only
+  the three the service reads. Not `--env-file .env.local`: that would also hand the
+  container the Upstash token and the signing secret, and Docker's env-file is not dotenv, so
+  a quoted value keeps its quotes.
+- **`-p 127.0.0.1:8000:8000`, not `-p 8000:8000`.** The short form publishes on every
+  interface of the Mac, and `/search` spends credits. Inside the container uvicorn binds
+  `0.0.0.0` on purpose: Docker's port forward does not reach the container's own loopback.
+- **Runs as uid 999, not root**, and cannot modify its own virtualenv.
+- **A dead database fails startup** after psycopg's 10 s pool timeout, and the container exits.
+- The uv version (0.12.5) is pinned in three places: the Mac, `Dockerfile` and
+  `.github/workflows/agent.yml`. Bump them together.
+
+CI (`.github/workflows/agent.yml`) runs ruff, pytest (no integration tests, no secrets) and a
+`docker build` with an import smoke test on every push that touches `agent/`.

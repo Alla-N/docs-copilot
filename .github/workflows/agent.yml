@@ -1,0 +1,91 @@
+# The Python agent service (agent/): lint, tests and the Docker image.
+#
+# Free and deterministic: no secrets, no network calls that cost money. Tests marked
+# integration (live Supabase / OpenAI / Cohere, the golden parity run) stay out, exactly as in
+# the pre-commit hook. The paid gates live in eval.yml.
+#
+# Runs only when something the Python side depends on changes: agent/, the TypeScript files
+# its tests pin (test_ts_parity.py reads lib/retrieve.ts and lib/plan.ts, test_content_hash.py
+# mirrors lib/content-hash.ts), or this file. Same list as the pre-commit pytest hook.
+
+name: agent
+
+on:
+  push:
+    paths:
+      - "agent/**"
+      - "lib/retrieve.ts"
+      - "lib/plan.ts"
+      - "lib/content-hash.ts"
+      - ".github/workflows/agent.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent/**"
+      - "lib/retrieve.ts"
+      - "lib/plan.ts"
+      - "lib/content-hash.ts"
+      - ".github/workflows/agent.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: agent-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read the repo, nothing else. No job here needs to write anything or read a secret.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ruff + pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to a full release: setup-uv stopped publishing moving major tags (v8) after the
+      # tj-actions supply-chain attack. The uv version matches the Mac that wrote uv.lock and
+      # the Dockerfile. Bump all three together. The uv cache is on by default on hosted runners.
+      - uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.12.5"
+
+      # --locked fails if pyproject.toml changed without uv.lock. Python 3.13 comes from
+      # agent/.python-version (uv downloads it if the runner does not have it).
+      - name: Install
+        run: uv sync --locked
+
+      # No --fix in CI: a lint error fails the job instead of being rewritten and forgotten.
+      - name: ruff check
+        run: uv run --locked ruff check .
+
+      - name: ruff format
+        run: uv run --locked ruff format --check .
+
+      - name: pytest (no network)
+        run: uv run --locked pytest -m "not integration"
+
+  image:
+    name: docker build + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches what pytest cannot: a dependency that will not install on the slim image, a
+      # file the build needs that .dockerignore keeps out, a venv that does not run in the
+      # runtime stage. Built, never pushed (ECR arrives in phase 2b).
+      - name: Build
+        run: docker build -t copilot-agent:ci agent
+
+      # Imports the app inside the runtime stage: proves the venv's interpreter exists there
+      # and every dependency is installed. Needs no secrets (settings are read at startup).
+      - name: Import smoke test
+        run: docker run --rm copilot-agent:ci python -c "import copilot_agent.api"
+
+      - name: Runs as non-root
+        run: test "$(docker run --rm copilot-agent:ci id -u)" = "999"

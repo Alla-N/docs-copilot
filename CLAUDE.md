@@ -161,6 +161,7 @@ npx tsc --noEmit                     # typecheck (CI runs this before eval)
 pre-commit run --all-files           # the local commit gate by hand (ruff, pytest, tsc, eslint, vitest); install once: uv tool install pre-commit && pre-commit install
 cd agent && uv run pytest            # Python agent service tests
 cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000
+docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 ```
 
 ## Environment gotchas
@@ -178,7 +179,9 @@ cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:
   retry, not two — don't remove the fallback or raise the retries (12 s per visitor).
 - CI (`.github/workflows/eval.yml`): planner eval on every push; retrieval-only gate on
   branches; full suite on pushes to `main`, PRs and manual runs; weekly full + judge on
-  Mondays. Needs 4 repo secrets. Workflow files can't be written through the remote bridge.
+  Mondays. Needs 4 repo secrets. `agent.yml`: ruff + pytest (no integration) + docker
+  build and smoke for `agent/`, no secrets, path-filtered like the pre-commit hook. Workflow
+  files can't be written through the remote bridge's commit path (use a device_bash heredoc).
 - Evals must run on the Mac, not in the Cowork bridge VM (`@esbuild/darwin-x64` is what's
   installed). `tsc` works anywhere.
 
