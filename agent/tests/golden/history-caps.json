@@ -1,10 +1,10 @@
 {
   "meta": {
-    "generatedAt": "2026-09-11T18:37:12.154Z",
-    "commit": "5c33f893479750688eb66e8f6f42b29435717efa",
+    "generatedAt": "2026-09-11T19:47:42.136Z",
+    "commit": "a2941e86e56b735c1a81f3d43eb8baf06f05d379",
     "dirty": true,
     "sourcesSha256": {
-      "lib/chat-request.ts": "c338cc9e3709323c4c90d3ae5492c0fccbbd0726f15e49837e3b5067dc6cdfba",
+      "lib/chat-request.ts": "63b9eaeb807d01e6e8124e6bc6fee5c6d40f7583814d8989b7f447468c577b21",
       "lib/assistant-signature.ts": "7a0334b9bc7d2bcf57a2a93078cca6164693240ac6c50fbb129e455fed65aaa3"
     },
     "caps": {

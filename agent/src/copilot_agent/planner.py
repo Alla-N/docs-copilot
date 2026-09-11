@@ -275,15 +275,16 @@ def planner_messages(question: str, history: Sequence[HistoryTurn] = ()) -> list
 
 # JavaScript's String.prototype.trim removes these (WhiteSpace and LineTerminator in the spec).
 # Python's str.strip() removes a different set: it keeps U+FEFF and removes \x1c to \x1f. Model
-# output rarely holds either, but the port should not differ from the original on purpose.
-_JS_WHITESPACE = (
+# output rarely holds either, but the port should not differ from the original on purpose. The
+# same set is JavaScript's regex \s (refusal.py builds its patterns from it).
+JS_WHITESPACE = (
     "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009"
     "\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 )
 
 
 def js_trim(text: str) -> str:
-    return text.strip(_JS_WHITESPACE)
+    return text.strip(JS_WHITESPACE)
 
 
 def _fallback(question: str) -> Plan:

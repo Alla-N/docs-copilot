@@ -1,0 +1,207 @@
+{
+  "meta": {
+    "generatedAt": "2026-09-11T19:47:42.795Z",
+    "commit": "a2941e86e56b735c1a81f3d43eb8baf06f05d379",
+    "dirty": true,
+    "sourcesSha256": {
+      "lib/refusal.ts": "a2ee3fa4b4aa0f2ef52e046cf585200858627cacc2f0603d27b0fb8c8fd77ee9"
+    }
+  },
+  "cases": [
+    {
+      "id": "canonical",
+      "answer": "I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "core-alone",
+      "answer": "I don't have information about that in the documentation",
+      "refused": true
+    },
+    {
+      "id": "core-plus-offer",
+      "answer": "I don't have information about that in the documentation I can help with AI SDK docs.",
+      "refused": true
+    },
+    {
+      "id": "opener-then-canonical",
+      "answer": "The documentation doesn't cover fine-tuning. I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "opener-with-topic",
+      "answer": "The documentation doesn't cover fine-tuning a model with the Vercel AI SDK.",
+      "refused": true
+    },
+    {
+      "id": "opener-no-period",
+      "answer": "The documentation doesn't cover fine-tuning a model with the Vercel AI SDK",
+      "refused": true
+    },
+    {
+      "id": "opener-then-tail",
+      "answer": "The documentation doesn't cover fine-tuning a model with the Vercel AI SDK. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "does-not-mention",
+      "answer": "The documentation does not mention fine-tuning. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "curly-apostrophe",
+      "answer": "The documentation doesn’t cover fine-tuning.",
+      "refused": true
+    },
+    {
+      "id": "partial-answer-declines-at-end",
+      "answer": "To stream text, use streamText. I don't have information about the second part in the documentation.",
+      "refused": false
+    },
+    {
+      "id": "leak-after-opener",
+      "answer": "The documentation doesn't cover fine-tuning. The capital of France is Paris.",
+      "refused": false
+    },
+    {
+      "id": "clause-punctuation-in-topic",
+      "answer": "The documentation doesn't cover X, but here's how: use streamText.",
+      "refused": false
+    },
+    {
+      "id": "leak-after-offer",
+      "answer": "The documentation doesn't cover fine-tuning. I can help with AI SDK docs. Also, Paris is the capital of France.",
+      "refused": false
+    },
+    {
+      "id": "does-not-require",
+      "answer": "The documentation does not require you to call convertToModelMessages.",
+      "refused": false
+    },
+    {
+      "id": "describes",
+      "answer": "The documentation describes streamText as a function that streams text.",
+      "refused": false
+    },
+    {
+      "id": "answer-then-offer",
+      "answer": "streamText streams text from a model. I can help with AI SDK docs.",
+      "refused": false
+    },
+    {
+      "id": "empty",
+      "answer": "",
+      "refused": false
+    },
+    {
+      "id": "has-no-information",
+      "answer": "The documentation has no information about pricing.",
+      "refused": true
+    },
+    {
+      "id": "has-no-details-then-core",
+      "answer": "The documentation has no details on that. I don't have information about that in the documentation.",
+      "refused": true
+    },
+    {
+      "id": "uppercase",
+      "answer": "I DON'T HAVE INFORMATION ABOUT THAT IN THE DOCUMENTATION. I CAN HELP WITH AI SDK DOCS. ASK ME ABOUT THOSE AND I'LL HELP.",
+      "refused": true
+    },
+    {
+      "id": "opener-exclamation",
+      "answer": "The documentation doesn't cover fine-tuning! I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "opener-question-mark-boundary",
+      "answer": "The documentation doesn't cover fine-tuning. Ask me about those and I'll help? Sure.",
+      "refused": false
+    },
+    {
+      "id": "core-inside-opener-reply",
+      "answer": "The documentation is limited here: I don't have information about that in the documentation.",
+      "refused": true
+    },
+    {
+      "id": "core-not-first",
+      "answer": "Sure! I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": false
+    },
+    {
+      "id": "whitespace-only",
+      "answer": " \n\t ",
+      "refused": false
+    },
+    {
+      "id": "trailing-newline-after-opener",
+      "answer": "The documentation doesn't cover fine-tuning\n",
+      "refused": true
+    },
+    {
+      "id": "trailing-newline-then-text",
+      "answer": "The documentation doesn't cover fine-tuning\nParis.",
+      "refused": true
+    },
+    {
+      "id": "bom-around-canonical",
+      "answer": "﻿I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.﻿",
+      "refused": true
+    },
+    {
+      "id": "bom-before-opener",
+      "answer": "﻿The documentation doesn't cover fine-tuning.",
+      "refused": true
+    },
+    {
+      "id": "nbsp-sentence-boundary",
+      "answer": "The documentation doesn't cover fine-tuning. I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "bom-sentence-boundary",
+      "answer": "The documentation doesn't cover fine-tuning. Ask me about those and I'll help.﻿I can help with AI SDK docs.",
+      "refused": true
+    },
+    {
+      "id": "line-separator-boundary",
+      "answer": "The documentation doesn't cover fine-tuning. Ask me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "file-separator-before-opener",
+      "answer": "\u001cThe documentation doesn't cover fine-tuning.",
+      "refused": false
+    },
+    {
+      "id": "file-separator-boundary",
+      "answer": "The documentation doesn't cover fine-tuning.\u001cAsk me about those and I'll help.",
+      "refused": true
+    },
+    {
+      "id": "kelvin-sign-in-opener",
+      "answer": "The documentation doesn't cover Kubernetes.",
+      "refused": true
+    },
+    {
+      "id": "long-s-in-verb",
+      "answer": "The documentation doeſn't cover fine-tuning.",
+      "refused": false
+    },
+    {
+      "id": "accented-letter-after-verb",
+      "answer": "The documentation doesn't coveré anything.",
+      "refused": true
+    },
+    {
+      "id": "dotted-capital-i-in-core",
+      "answer": "İ don't have information about that in the documentation.",
+      "refused": true
+    },
+    {
+      "id": "tab-inside-core",
+      "answer": "I don't have\tinformation about that in the documentation.",
+      "refused": false
+    }
+  ]
+}

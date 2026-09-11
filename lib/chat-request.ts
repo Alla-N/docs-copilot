@@ -32,6 +32,10 @@ export const MAX_CHARS_PER_MESSAGE = 4000;
 export const MAX_TOTAL_CHARS = 24000;
 
 const RawBody = z.object({
+    // useChat's chat id (DefaultChatTransport sends it as `id`). Read as unknown, so a body without
+    // one, or with a non-string one, parses exactly as before; only the forward to the agent
+    // service uses it, and lib/agent-forward.ts checks its shape there. (Step 2.6.)
+    id: z.unknown().optional(),
     messages: z
         .array(
             z.object({
@@ -65,6 +69,11 @@ export type ParsedChatRequest = {
     question: string;
     /** Clean history for the model: role + text only, capped. */
     messages: ModelMessage[];
+    /**
+     * useChat's chat id, when the body carried a string one. UNTRUSTED: the client picks it. It
+     * names the conversation (the agent service's thread), so it is checked before use.
+     */
+    chatId: string | undefined;
 };
 
 export class BadRequestError extends Error {}
@@ -138,5 +147,6 @@ export function parseChatRequest(body: unknown): ParsedChatRequest {
         throw new BadRequestError("The last message must be a non-empty user message.");
     }
 
-    return { question: last.content as string, messages };
+    const chatId = typeof result.data.id === "string" ? result.data.id : undefined;
+    return { question: last.content as string, messages, chatId };
 }

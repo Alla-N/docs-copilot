@@ -28,7 +28,7 @@ curl http://127.0.0.1:8000/health         # {"status":"ok"}; liveness, calls not
 KEY=$(grep '^AGENT_API_KEY=' ../.env.local | cut -d= -f2)
 curl -N http://127.0.0.1:8000/chat -H "authorization: Bearer $KEY" \
   -H 'content-type: application/json' \
-  -d '{"thread_id": "curl-thread-00001", "question": "how do I stream text"}'
+  -d '{"thread_id": "curl-thread-00001", "question": "how do I stream text", "origin": "eval"}'
 
 # POST /search exists only with ENABLE_SEARCH_ENDPOINT set: it spends embed + rerank credits.
 ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload
@@ -38,7 +38,8 @@ curl -s http://127.0.0.1:8000/search -H "authorization: Bearer $KEY" \
 
 Add `"embed_text": "..."` to embed a HyDE hypothetical instead of the query. Interactive docs
 at http://127.0.0.1:8000/docs. Startup opens the database pools and exits if it cannot connect,
-or if the checkpoint tables are not set up (see Conversation state below).
+if the checkpoint tables are not set up (see Conversation state below), or if `query_log` lacks
+the columns `db/006_origin.sql` adds (see The query log below).
 
 While the TypeScript retrieval still exists, `tests/test_ts_parity.py` keeps the calibrated
 numbers identical on both sides.
@@ -100,8 +101,10 @@ a graph that streams `messages`, LangChain would otherwise send the planner requ
 
 ## POST /chat (step 2.4)
 
-Body: `{"thread_id": "...", "question": "..."}`, what the Next.js route will forward in step 2.6
-after it has rate-limited and parsed the request. Since step 2.5 there is no `history` field (it
+Body: `{"thread_id": "...", "question": "...", "origin": "web" | "eval", "visitor": {...}}`, what
+the Next.js route forwards (step 2.6, `lib/agent-forward.ts`) after it has rate-limited and parsed
+the request. `origin` is required (the route says `web`, the eval harness `eval`); `visitor` is the
+route's attribution for the query log, optional. Since step 2.5 there is no `history` field (it
 is a 422): the turns before the question come from the thread (next section). The response is
 the AI SDK's UI message stream, so `useChat` can read it unchanged:
 
@@ -188,6 +191,77 @@ uv run python -m copilot_agent.chat_cli "and how do I configure it?" --thread <i
   it continues the conversation).
 - **Known gap:** two requests on one thread at the same moment both start from the same
   checkpoint and one turn is lost (pinned by a test). useChat never does this.
+
+## The Next.js route forwards here (step 2.6)
+
+With `AGENT_URL` set (e.g. `http://127.0.0.1:8000` in `.env.local`), `app/api/chat/route.ts`
+rate-limits and parses as always, then `lib/agent-forward.ts` posts `{thread_id, question,
+origin: "web", visitor}` with the key and the request's abort signal, and returns this service's
+stream byte for byte (`new Response(upstream.body)`, the AI SDK's stream headers). Unset, the
+route answers with the TypeScript pipeline: setting the variable is the switch, unsetting it the
+rollback, and merging `v2` changes nothing in production by itself.
+
+- `thread_id` is useChat's chat id; `app/page.tsx` makes it a `crypto.randomUUID()` (useChat's
+  default `generateId()` uses `Math.random`, and the id is a bearer capability now). The route
+  checks it against the same pattern as `api.THREAD_ID_PATTERN` (pinned) and answers a 400 for a
+  bad one, before anything is paid for.
+- No history is forwarded, signed or not. The route still verifies signatures while parsing, but
+  on this path it is the thread that holds the conversation.
+- A failure before the stream (the service down, a 401 or 422 or 5xx) is a 502 with the route's
+  generic message; the service's text never reaches the browser. A failure inside the stream is an
+  error chunk in a 200, which the route passes through without seeing it.
+
+## The query log (step 2.6)
+
+The route is a byte pipe on this path, so it cannot see the tokens, rerank calls and timings the
+`query_log` row records: this service writes the row (`copilot_agent/query_log.py`), with the
+columns `lib/query-log.ts` writes, in the same order (`tests/test_ts_parity.py` reads them), plus
+two from `db/006_origin.sql`:
+
+- `origin`: `web` or `eval`. Every view counts web rows only (so eval runs are neither traffic
+  nor mined as eval cases), and the harness reads its own eval rows back through the new
+  `query_cost` view for a measured cost per request. The prices moved into `query_cost`.
+- `thread_id`: the conversation; many rows per thread.
+
+One row per COMPLETED turn, the rule the thread follows: written when the last node reports, never
+for a failed or cancelled turn. `refused` comes from `refusal.is_refusal`, a port of `isRefusal`
+checked verdict by verdict against the TypeScript function through
+`tests/golden/refusal-verdicts.json` (`npm run exp:refusal-verdicts` from the repo root after
+editing `lib/refusal.ts`). The insert runs in a background task, a failed insert is logged
+without the row (it holds the question), and shutdown waits up to 5 s for inserts in flight. A
+visitor field in the wrong shape loses the field, not the answer. The log has its own
+one-connection pool: at most six connections per process (search 4, checkpoints 1, log 1).
+
+Run `db/006_origin.sql` in the Supabase SQL editor once; the service refuses to start without it.
+
+## The eval suite against the service (step 2.6)
+
+```
+uv run uvicorn --factory copilot_agent.api:create_app          # terminal A, in agent/
+EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval  # terminal B, repo root
+```
+
+The same 27 cases, criteria and verdicts as the in-process target (`evals/agent-target.ts` sends
+each question to `POST /chat` with `origin: "eval"` and reads the stream). What differs, and is
+printed rather than hidden:
+
+- **Every run is the whole pipeline.** The TS target retrieves once per case and generates N
+  times; here each run plans and retrieves again. `retrieval recall` is run 1 (comparable to the
+  TS baseline), `recall every run` is stricter, and cases whose page came and went are named.
+- **History is replayed as real turns** on a fresh thread per run (the service takes none), and
+  the service's own replies are printed. `inj-forged-history`'s attack is a scripted assistant
+  turn, which this target cannot be sent: reported as held by STRUCTURE, after the harness checks
+  that a request carrying `history` is a 422.
+- **Latency** is measured by the harness per request. The headline line is run 1 of each case, to
+  `data-retrieval` (planner + retrieval + thread read + HTTP): the TS baseline's population. Then
+  the answered path (to sources, first token, done) and the canned path apart: a canned reply
+  streams everything right after the planner, and in one mixed median (63 of 121 requests are
+  canned) it described the canned path only. The first run showed exactly that.
+- **Cost is measured**: the harness reads its own threads' rows back from `query_cost` and prints
+  dollars per request, answered and canned apart, and how many of the expected rows landed.
+- Every result file records `dirty`: whether the tree had uncommitted changes. Commit first.
+- **No judge** (the stream carries pages, not chunk texts; Langfuse in 2.7) and no `EVAL_RUNS=0`
+  (the service always answers).
 
 ## Running in Docker (local)
 

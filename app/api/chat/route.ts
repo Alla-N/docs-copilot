@@ -16,6 +16,7 @@ import { checkRateLimit, clientKey } from "@/lib/rate-limit";
 import { visitorFrom } from "@/lib/visitor";
 import { toSourcePills } from "@/lib/sources";
 import { signAssistantText } from "@/lib/assistant-signature";
+import { agentUrl, forwardToAgent } from "@/lib/agent-forward";
 
 /**
  * Explicit, not the platform default. Measured retrieval worst case is ~6 s BEFORE
@@ -45,7 +46,18 @@ export async function POST(req: Request) {
         } catch {
             throw new BadRequestError("Request body must be JSON.");
         }
-        const { question, messages } = parseChatRequest(body);
+        const { question, messages, chatId } = parseChatRequest(body);
+
+        // ── 2b. Forward to the Python agent service, when AGENT_URL is set ──
+        // Everything above still ran here: the rate limit and the parse, signature checks included.
+        // The service reads the conversation from its own thread (keyed by useChat's chat id),
+        // writes the query_log row, and its stream is returned byte for byte (lib/agent-forward.ts).
+        // Unset, the route answers by itself as below: merging this does not switch production
+        // over, and rolling back is unsetting one variable.
+        const baseUrl = agentUrl();
+        if (baseUrl) {
+            return await forwardToAgent({ baseUrl, chatId, question, visitor: visitorFrom(req), signal: req.signal });
+        }
 
         // Prior turns (everything before the current question) feed the planner so it can
         // resolve "it"/"that" in a follow-up. Text only, user/assistant only.

@@ -41,11 +41,12 @@ from pydantic import ConfigDict, Field
 from copilot_agent import ui_stream
 from copilot_agent.api import create_app, in_own_task
 from copilot_agent.checkpoint import serializer
-from copilot_agent.generation import REFUSAL_MESSAGE
 from copilot_agent.graph import build_graph
 from copilot_agent.history import MAX_CHARS_PER_MESSAGE
 from copilot_agent.planner import GREETING_MESSAGE, HistoryTurn
-from copilot_agent.retrieval import RetrievalResult, RetrievedChunk
+from copilot_agent.query_log import COLUMNS, QueryLog
+from copilot_agent.refusal import REFUSAL_MESSAGE
+from copilot_agent.retrieval import Candidate, RetrievalResult, RetrievedChunk
 from copilot_agent.settings import Settings
 
 pytestmark = pytest.mark.anyio
@@ -63,6 +64,19 @@ LEAK = "sk-must-never-reach-the-client"
 USAGE = {"input_tokens": 1500, "output_tokens": 60, "total_tokens": 1560}
 # Shaped like useChat's chat id: 16 characters of the AI SDK's alphabet.
 THREAD = "PyTestThread0001"
+VISITOR = {
+    "visitor_hash": "0123456789abcdef0123456789abcdef",
+    "landing_referrer": "linkedin.com",
+    "utm_source": "cv",
+    "country": "GR",
+    "device": "desktop",
+}
+
+
+def body(question: str = "q", thread_id: str = THREAD, **extra: Any) -> dict[str, Any]:
+    """What the Next.js route forwards (lib/agent-forward.ts): origin web, no visitor unless
+    given."""
+    return {"thread_id": thread_id, "question": question, "origin": "web"} | extra
 
 
 def make_settings(**overrides: Any) -> Settings:
@@ -137,8 +151,15 @@ class CountingSaver(InMemorySaver):
 class ScriptedSearch:
     """Answers every query with the same chunks; can fail, or hang until cancelled."""
 
-    def __init__(self, relevant: list[RetrievedChunk], *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        relevant: list[RetrievedChunk],
+        *,
+        error: Exception | None = None,
+        candidates: list[Candidate] | None = None,
+    ) -> None:
         self.relevant = relevant
+        self.candidates = candidates or []
         self.error = error
         self.hang = False
         self.calls: list[str] = []
@@ -157,7 +178,7 @@ class ScriptedSearch:
         if self.error is not None:
             raise self.error
         return RetrievalResult(
-            candidates=[], relevant=self.relevant, mode="reranked", timings_ms={}
+            candidates=self.candidates, relevant=self.relevant, mode="reranked", timings_ms={}
         )
 
 
@@ -182,6 +203,8 @@ class Rig:
     search: ScriptedSearch
     model: ScriptedChatModel
     saver: CountingSaver
+    log: QueryLog
+    rows: list[dict[str, Any]]
 
     async def turns(self, thread_id: str = THREAD) -> list[HistoryTurn]:
         config = {"configurable": {"thread_id": thread_id}}
@@ -195,10 +218,14 @@ def make_rig(
     relevant: list[RetrievedChunk] | None = None,
     model: ScriptedChatModel | None = None,
     search_error: Exception | None = None,
+    candidates: list[Candidate] | None = None,
+    insert_error: Exception | None = None,
     **settings: Any,
 ) -> Rig:
     planner, planner_calls = scripted_planner(intent, list(queries))
-    search = ScriptedSearch(relevant if relevant is not None else [], error=search_error)
+    search = ScriptedSearch(
+        relevant if relevant is not None else [], error=search_error, candidates=candidates
+    )
     model = model or ScriptedChatModel(deltas=["Use ", "streamText."])
 
     # LangGraph's in-process saver, with the service's strict serializer: one per app, like the
@@ -213,6 +240,21 @@ def make_rig(
     async def checkpointer_factory(settings: Settings) -> AsyncIterator[InMemorySaver]:
         yield saver
 
+    # The real QueryLog around a recording insert: writes still go through background tasks.
+    rows: list[dict[str, Any]] = []
+
+    async def insert(row: Any) -> None:
+        if insert_error is not None:
+            raise insert_error
+        rows.append(dict(row))
+
+    log = QueryLog(insert)
+
+    @asynccontextmanager
+    async def query_log_factory(settings: Settings) -> AsyncIterator[QueryLog]:
+        yield log
+        await log.drain()
+
     def graph_factory(settings: Settings, search_docs: Any, checkpointer: Any) -> Any:
         return build_graph(
             planner=planner, search=search_docs, model=model, checkpointer=checkpointer
@@ -223,8 +265,9 @@ def make_rig(
         search_factory=search_factory,
         checkpointer_factory=checkpointer_factory,
         graph_factory=graph_factory,
+        query_log_factory=query_log_factory,
     )
-    return Rig(app, planner_calls, search, model, saver)
+    return Rig(app, planner_calls, search, model, saver, log, rows)
 
 
 @asynccontextmanager
@@ -269,9 +312,7 @@ def page(n: int, score: float, url: int | None = None) -> RetrievedChunk:
 async def test_chat_without_the_key_is_401_and_costs_nothing(headers: dict[str, str]) -> None:
     rig = make_rig()
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": "q"}, headers=headers
-        )
+        response = await client.post("/chat", json=body(), headers=headers)
     assert response.status_code == 401
     assert response.headers["www-authenticate"] == "Bearer"
     assert rig.planner_calls == [] and rig.search.calls == [] and rig.model.seen == []
@@ -282,7 +323,7 @@ async def test_the_scheme_is_case_insensitive() -> None:
     async with in_memory(rig.app) as client:
         response = await client.post(
             "/chat",
-            json={"thread_id": THREAD, "question": "q"},
+            json=body(),
             headers={"authorization": f"bearer {AGENT_KEY}"},
         )
     assert response.status_code == 200
@@ -316,28 +357,30 @@ def test_the_service_does_not_start_without_its_secrets(missing: str, name: str)
 @pytest.mark.parametrize(
     "payload",
     [
-        pytest.param({"thread_id": THREAD}, id="missing-question"),
-        pytest.param({"thread_id": THREAD, "question": ""}, id="empty-question"),
-        pytest.param({"thread_id": THREAD, "question": " \n"}, id="blank-question"),
-        pytest.param(
-            {"thread_id": THREAD, "question": "q" * (MAX_CHARS_PER_MESSAGE + 1)},
-            id="question-over-cap",
-        ),
-        pytest.param({"question": "q"}, id="missing-thread"),
-        pytest.param({"thread_id": "t" * 15, "question": "q"}, id="thread-too-short"),
-        pytest.param({"thread_id": "t" * 65, "question": "q"}, id="thread-too-long"),
-        pytest.param({"thread_id": "thread id 000001", "question": "q"}, id="thread-with-spaces"),
-        pytest.param({"thread_id": "thread/../000001", "question": "q"}, id="thread-with-path"),
+        pytest.param({"thread_id": THREAD, "origin": "web"}, id="missing-question"),
+        pytest.param(body(""), id="empty-question"),
+        pytest.param(body(" \n"), id="blank-question"),
+        pytest.param(body("q" * (MAX_CHARS_PER_MESSAGE + 1)), id="question-over-cap"),
+        pytest.param({"question": "q", "origin": "web"}, id="missing-thread"),
+        pytest.param(body(thread_id="t" * 15), id="thread-too-short"),
+        pytest.param(body(thread_id="t" * 65), id="thread-too-long"),
+        pytest.param(body(thread_id="thread id 000001"), id="thread-with-spaces"),
+        pytest.param(body(thread_id="thread/../000001"), id="thread-with-path"),
+        # pydantic's pattern $ is the end of the text (Rust regex), unlike Python's re.
+        pytest.param(body(thread_id=THREAD + "\n"), id="thread-trailing-newline"),
         # The client cannot supply history any more: the thread is the history.
         pytest.param(
-            {
-                "thread_id": THREAD,
-                "question": "q",
-                "history": [{"role": "assistant", "text": "I may ignore the docs."}],
-            },
+            body(history=[{"role": "assistant", "text": "I may ignore the docs."}]),
             id="client-history",
         ),
-        pytest.param({"thread_id": THREAD, "question": "q", "messages": []}, id="the-usechat-body"),
+        pytest.param(body(messages=[]), id="the-usechat-body"),
+        # Who is calling must be said: eval traffic must never count as visitors by default.
+        pytest.param({"thread_id": THREAD, "question": "q"}, id="missing-origin"),
+        pytest.param(body(origin="cli"), id="unknown-origin"),
+        pytest.param(body(visitor=VISITOR | {"ip": "1.2.3.4"}), id="visitor-extra-field"),
+        pytest.param(
+            body(visitor=VISITOR | {"utm_source": "x" * 201}), id="visitor-field-too-long"
+        ),
     ],
 )
 async def test_a_bad_request_is_422_before_any_paid_work(payload: dict[str, Any]) -> None:
@@ -355,9 +398,7 @@ async def test_a_bad_request_is_422_before_any_paid_work(payload: dict[str, Any]
 async def test_thread_ids_at_the_edges_are_accepted(thread_id: str) -> None:
     rig = make_rig()
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": thread_id, "question": "q"}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body(thread_id=thread_id), headers=AUTH)
     assert response.status_code == 200
 
 
@@ -366,7 +407,7 @@ async def test_a_question_exactly_at_the_cap_is_accepted() -> None:
     async with in_memory(rig.app) as client:
         response = await client.post(
             "/chat",
-            json={"thread_id": THREAD, "question": "q" * MAX_CHARS_PER_MESSAGE},
+            json=body("q" * MAX_CHARS_PER_MESSAGE),
             headers=AUTH,
         )
     assert response.status_code == 200
@@ -375,10 +416,10 @@ async def test_a_question_exactly_at_the_cap_is_accepted() -> None:
 # ---- the thread: history comes from the server ---------------------------------------------
 
 
-async def ask(client: httpx.AsyncClient, question: str, thread_id: str = THREAD) -> str:
-    response = await client.post(
-        "/chat", json={"thread_id": thread_id, "question": question}, headers=AUTH
-    )
+async def ask(
+    client: httpx.AsyncClient, question: str, thread_id: str = THREAD, **extra: Any
+) -> str:
+    response = await client.post("/chat", json=body(question, thread_id, **extra), headers=AUTH)
     assert response.status_code == 200
     return response.text
 
@@ -443,9 +484,122 @@ async def test_a_failed_turn_is_not_recorded(failure: str) -> None:
         search_error=RuntimeError("db down") if failure == "retrieval" else None,
     )
     async with in_memory(rig.app) as client:
-        body = await ask(client, "how do I stream text")
-    assert {"type": "error", "errorText": ui_stream.STREAM_FAILED} in chunks_of(body)
+        text = await ask(client, "how do I stream text")
+    assert {"type": "error", "errorText": ui_stream.STREAM_FAILED} in chunks_of(text)
     assert await rig.turns() == []
+    assert rig.rows == []  # and no query_log row: TypeScript's onFinish never fires for it
+
+
+# ---- the query log: one row per completed turn (query_log.py) --------------------------------
+
+
+def candidate(n: int) -> Candidate:
+    return Candidate(
+        content=f"Chunk {n}", title=f"Page {n}", source_url=f"https://x/{n}", similarity=0.5
+    )
+
+
+async def test_an_answered_turn_writes_the_row_the_typescript_route_would() -> None:
+    rig = make_rig(
+        queries=("How do I stream text?", "How do I configure streamText?"),
+        relevant=[page(1, 0.8), page(2, 0.6, url=1), page(3, 0.5)],
+        candidates=[candidate(1)],
+    )
+    async with in_memory(rig.app) as client:
+        await ask(client, "how do I stream text", visitor=VISITOR)
+    [row] = rig.rows
+    assert list(row) == list(COLUMNS)
+    timings = {name: row.pop(name) for name in ("latency_ms", "ttft_ms", "generation_ms")}
+    assert row == {
+        "question": "how do I stream text",
+        "refused": False,
+        "chunk_count": 3,
+        "top_score": 0.8,
+        "retrieval_mode": "reranked",
+        **VISITOR,
+        "planner_input_tokens": 1500,
+        "planner_output_tokens": 60,
+        "rerank_calls": 2,  # one per sub-query that had candidates to rerank
+        "gen_input_tokens": 1500,
+        "gen_output_tokens": 60,
+        "origin": "web",
+        "thread_id": THREAD,
+    }
+    assert all(isinstance(ms, int) and ms >= 0 for ms in timings.values())
+    assert timings["ttft_ms"] <= timings["generation_ms"]
+
+
+@pytest.mark.parametrize(
+    ("intent", "refused"), [("greeting", False), ("off-topic", True)], ids=["greeting", "off-topic"]
+)
+async def test_a_canned_turn_writes_a_row_with_no_answer_cost(intent: str, refused: bool) -> None:
+    # TypeScript logs greetings and off-topic refusals too, mode "skipped" (invariant 10).
+    rig = make_rig(intent=intent, queries=())
+    async with in_memory(rig.app) as client:
+        await ask(client, "hi", origin="eval")
+    [row] = rig.rows
+    assert row["refused"] is refused
+    assert row["retrieval_mode"] == "skipped"
+    assert (row["chunk_count"], row["top_score"], row["rerank_calls"]) == (0, None, 0)
+    assert (row["planner_input_tokens"], row["planner_output_tokens"]) == (1500, 60)
+    no_generation = ("gen_input_tokens", "gen_output_tokens", "ttft_ms", "generation_ms")
+    assert all(row[name] is None for name in no_generation)
+    assert isinstance(row["latency_ms"], int)
+    assert row["origin"] == "eval"
+    assert all(row[name] is None for name in VISITOR)  # none was sent
+
+
+async def test_refused_is_read_from_the_answer_not_from_the_intent() -> None:
+    # A search turn whose model declines is a refusal: the suspicious_refusals view exists for it.
+    rig = make_rig(
+        relevant=[page(1, 0.8)],
+        model=ScriptedChatModel(deltas=["The documentation doesn't cover ", "fine-tuning."]),
+    )
+    async with in_memory(rig.app) as client:
+        await ask(client, "how do I fine-tune")
+    [row] = rig.rows
+    assert row["refused"] is True
+    assert (row["chunk_count"], row["retrieval_mode"]) == (1, "reranked")
+
+
+async def test_a_visitor_field_in_the_wrong_shape_costs_the_field_not_the_answer() -> None:
+    visitor = VISITOR | {"country": "Greece", "device": "tablet", "landing_referrer": "x.com\n"}
+    rig = make_rig(relevant=[page(1, 0.8)])
+    async with in_memory(rig.app) as client:
+        text = await ask(client, "how do I stream text", visitor=visitor)
+    assert chunks_of(text)[-1] == ui_stream.DONE
+    [row] = rig.rows
+    assert (row["country"], row["device"], row["landing_referrer"]) == (None, None, None)
+    assert (row["visitor_hash"], row["utm_source"]) == (VISITOR["visitor_hash"], "cv")
+
+
+async def test_a_failed_insert_never_reaches_the_answer(caplog: pytest.LogCaptureFixture) -> None:
+    rig = make_rig(relevant=[page(1, 0.8)], insert_error=RuntimeError("pooler said no"))
+    async with in_memory(rig.app) as client:
+        text = await ask(client, "a private question")
+    chunks = chunks_of(text)
+    assert chunks[-1] == ui_stream.DONE and chunks[-2]["type"] == "finish"
+    assert rig.rows == []
+    assert "query log insert failed" in caplog.text
+    assert "a private question" not in caplog.text  # the row holds the user's question
+
+
+async def test_an_error_while_recording_the_turn_never_reaches_the_answer(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from copilot_agent import query_log
+
+    def broken(self: Any) -> dict[str, object]:
+        raise ValueError("row bug")
+
+    monkeypatch.setattr(query_log.Turn, "row", broken)
+    rig = make_rig(relevant=[page(1, 0.8)])
+    async with in_memory(rig.app) as client:
+        text = await ask(client, "how do I stream text")
+    assert chunks_of(text)[-2] == {"type": "finish", "finishReason": "stop"}
+    assert rig.rows == []
+    assert "could not record the turn" in caplog.text
+    assert len(await rig.turns()) == 2  # the conversation is unaffected
 
 
 # ---- the response -----------------------------------------------------------------------------
@@ -454,9 +608,7 @@ async def test_a_failed_turn_is_not_recorded(failure: str) -> None:
 async def test_headers_are_the_ai_sdk_ones() -> None:
     rig = make_rig()
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body(), headers=AUTH)
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["cache-control"] == "no-cache"
@@ -468,9 +620,7 @@ async def test_every_event_is_one_data_line_and_the_stream_ends_with_done() -> N
     # A delta with newlines must not break the framing: JSON escapes them inside the string.
     rig = make_rig(model=ScriptedChatModel(deltas=["line one\n", "\nline two\r\n"]))
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body(), headers=AUTH)
     events = response.text.split("\n\n")
     assert events[-1] == ""
     assert all(e.startswith("data: ") and "\n" not in e for e in events[:-1])
@@ -484,9 +634,7 @@ async def test_each_response_gets_its_own_message_id() -> None:
     async with in_memory(rig.app) as client:
         ids = []
         for _ in range(2):
-            response = await client.post(
-                "/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-            )
+            response = await client.post("/chat", json=body(), headers=AUTH)
             ids.append(chunks_of(response.text)[0]["messageId"])
     assert ids[0] != ids[1]
     assert all(len(i) == 16 and i.isalnum() for i in ids)
@@ -586,9 +734,7 @@ async def golden_body(scenario: Scenario, monkeypatch: pytest.MonkeyPatch) -> st
     monkeypatch.setattr(ui_stream, "new_message_id", lambda: GOLDEN_MESSAGE_ID)
     rig = scenario.rig()
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": scenario.question}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body(scenario.question), headers=AUTH)
     assert response.status_code == 200
     return response.text
 
@@ -652,9 +798,7 @@ async def test_the_answer_is_signed_as_streamed() -> None:
     scenario = SCENARIOS[0]
     rig = scenario.rig()
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": scenario.question}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body(scenario.question), headers=AUTH)
     chunks = chunks_of(response.text)[:-1]
     streamed = "".join(c["delta"] for c in chunks if c["type"] == "text-delta")
     [sig] = [c["data"]["sig"] for c in chunks if c["type"] == "data-signature"]
@@ -670,9 +814,7 @@ async def test_canned_replies_are_signed(intent: str, reply: str) -> None:
 
     rig = make_rig(intent=intent, queries=())
     async with in_memory(rig.app) as client:
-        response = await client.post(
-            "/chat", json={"thread_id": THREAD, "question": "hi"}, headers=AUTH
-        )
+        response = await client.post("/chat", json=body("hi"), headers=AUTH)
     chunks = chunks_of(response.text)[:-1]
     [sig] = [c["data"]["sig"] for c in chunks if c["type"] == "data-signature"]
     assert sig == sign_assistant_text(reply, TS_TEST_SIGNING_SECRET)
@@ -736,9 +878,7 @@ async def test_tokens_reach_the_client_while_the_model_is_still_answering() -> N
     rig = make_rig(model=ScriptedChatModel(deltas=["first", " second"], gates={1: release}))
     async with served(rig.app) as url, real_client() as client:
         async with asyncio.timeout(5):
-            async with client.stream(
-                "POST", f"{url}/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-            ) as response:
+            async with client.stream("POST", f"{url}/chat", json=body(), headers=AUTH) as response:
                 lines = response.aiter_lines()
                 first = await lines_until(lines, is_delta)
                 assert first[-1]["delta"] == "first"
@@ -754,9 +894,7 @@ async def test_a_disconnect_during_retrieval_cancels_the_search() -> None:
     rig.search.hang = True
     async with served(rig.app) as url, real_client() as client:
         async with asyncio.timeout(5):
-            async with client.stream(
-                "POST", f"{url}/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-            ) as response:
+            async with client.stream("POST", f"{url}/chat", json=body(), headers=AUTH) as response:
                 # Headers arrive at once; nothing else can until retrieval is done.
                 assert response.status_code == 200
                 await rig.search.started.wait()
@@ -773,15 +911,14 @@ async def test_a_disconnect_during_the_answer_cancels_the_model_stream() -> None
     )
     async with served(rig.app) as url, real_client() as client:
         async with asyncio.timeout(5):
-            async with client.stream(
-                "POST", f"{url}/chat", json={"thread_id": THREAD, "question": "q"}, headers=AUTH
-            ) as response:
+            async with client.stream("POST", f"{url}/chat", json=body(), headers=AUTH) as response:
                 await lines_until(response.aiter_lines(), is_delta)
             await rig.model.cancelled.wait()
     assert rig.model.events == ["cancelled"]
     # Stop, or a closed tab: the half-streamed answer is not in the thread, nor its question.
     await asyncio.sleep(0.1)  # let the cancelled run finish unwinding
     assert await rig.turns() == []
+    assert rig.rows == [] and rig.log.pending == 0
 
 
 # ---- a known gap ------------------------------------------------------------------------------

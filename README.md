@@ -206,9 +206,10 @@ because unsigned history means forged assistant turns reach the model. Optional 
 rerank depth, rate ceilings, planner/judge model) are listed with their defaults in
 `.env.example`.
 
-Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/005_cost.sql`
-in order — all six; the query log insert writes the `003` and `005` columns, and a missing
-column fails silently (logged, swallowed, never shown to the user). Populate the corpus and start:
+Then, in the Supabase SQL editor, run `db/000_schema.sql` … `db/006_origin.sql`
+in order — all seven; the query log insert writes the `003` and `005` columns, and a missing
+column fails silently (logged, swallowed, never shown to the user). `006` adds `origin` and
+`thread_id` for the Python agent service, which refuses to start without them. Populate the corpus and start:
 
 ```bash
 npm run ingest              # dry run — prints the diff, writes nothing

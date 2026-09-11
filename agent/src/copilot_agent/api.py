@@ -8,9 +8,12 @@ Settings are read then, not at import time (the same rule as get_settings()), so
 import this module without any secrets set.
 
 The Next.js route stays the public front door: it rate-limits and parses the useChat request
-(invariant 9), then (step 2.6) forwards {thread_id, question} here and passes the stream back.
-So /chat trusts its caller's parsing but not its identity: every paid route needs the shared
-AGENT_API_KEY.
+(invariant 9), then (step 2.6, with AGENT_URL set) forwards {thread_id, question, origin,
+visitor} here and passes the stream back byte for byte. So /chat trusts its caller's parsing but
+not its identity: every paid route needs the shared AGENT_API_KEY.
+
+Every completed turn is written to query_log by this service (query_log.py): the route, a byte
+pipe now, cannot see the tokens, rerank calls and timings the row records.
 
 History does not come in the request at all (step 2.5): the thread id names a conversation the
 checkpointer keeps, and the turns before the question are read from there (graph.py,
@@ -34,6 +37,7 @@ from copilot_agent import ui_stream
 from copilot_agent.checkpoint import open_checkpointer
 from copilot_agent.graph import ChatGraph, openai_chat_graph
 from copilot_agent.history import MAX_CHARS_PER_MESSAGE
+from copilot_agent.query_log import Origin, QueryLog, Turn, Visitor, observe, open_query_log
 from copilot_agent.retrieval import RetrievalMode, RetrievedChunk, SearchDocs, open_search
 from copilot_agent.settings import Settings, get_settings
 from copilot_agent.signing import sign_assistant_text
@@ -45,6 +49,8 @@ OpenSearch = Callable[[Settings], AbstractAsyncContextManager[SearchDocs]]
 OpenCheckpointer = Callable[[Settings], AbstractAsyncContextManager[BaseCheckpointSaver]]
 # The shape of openai_chat_graph(): the graph around a search and a saver. Tests pass fakes.
 BuildGraph = Callable[[Settings, SearchDocs, BaseCheckpointSaver], ChatGraph]
+# The shape of open_query_log(): given settings, an async context manager yielding the log.
+OpenQueryLog = Callable[[Settings], AbstractAsyncContextManager[QueryLog]]
 
 # The caps of lib/chat-request.ts (invariant 9) live in history.py since the history moved
 # server-side. The route cuts the question to MAX_CHARS_PER_MESSAGE, so what it forwards always
@@ -108,19 +114,44 @@ THREAD_ID_PATTERN = r"^[A-Za-z0-9_-]{16,64}$"
 ThreadId = Annotated[str, StringConstraints(pattern=THREAD_ID_PATTERN)]
 
 
+# Attribution text is short (lib/visitor.ts caps the longest shape at 100 characters). A value far
+# past that is not telemetry, and is refused before any paid work.
+VisitorText = Annotated[str | None, Field(max_length=200)]
+
+
+class VisitorIn(BaseModel):
+    """lib/visitor.ts's Visitor, as the route forwards it. Shapes are checked when the row is
+    built (query_log.Visitor.sanitised): a value in the wrong shape loses the field, not the
+    answer."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    visitor_hash: VisitorText = None
+    landing_referrer: VisitorText = None
+    utm_source: VisitorText = None
+    country: VisitorText = None
+    device: VisitorText = None
+
+
 class ChatRequest(BaseModel):
-    """What the Next.js route forwards: the conversation's thread id and the new question.
+    """What the Next.js route forwards: the conversation's thread id, the new question, who is
+    calling (origin) and where the person came from (visitor, for the query log).
 
     Not the useChat body. Parsing that stays in TypeScript, in front of the rate limiter's
     decision. No history: the turns before the question are the thread's (history.py), and with
     extra="forbid" a request that tries to supply them is a 422, so there is no assistant text
     a client could forge or replay from another conversation.
+
+    `origin` has no default: the route says "web", the eval harness "eval", and a caller that says
+    nothing is a 422 rather than eval traffic counted as visitors (query_log.py).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     thread_id: ThreadId
     question: Text
+    origin: Origin
+    visitor: VisitorIn | None = None
 
 
 # ---- dependencies -------------------------------------------------------------------------
@@ -147,9 +178,14 @@ def get_durability(request: Request) -> Durability:
     return request.app.state.durability
 
 
+def get_query_log(request: Request) -> QueryLog:
+    return request.app.state.query_log
+
+
 Graph = Annotated[ChatGraph, Depends(get_graph)]
 Signer = Annotated[Callable[[str], str], Depends(get_signer)]
 DurabilityMode = Annotated[Durability, Depends(get_durability)]
+Log = Annotated[QueryLog, Depends(get_query_log)]
 
 
 def require_key(key: SecretStr) -> Callable[..., None]:
@@ -251,7 +287,7 @@ def ui_message_stream_headers(response: Response) -> None:
     dependencies=[Depends(ui_message_stream_headers)],
 )
 async def chat(
-    body: ChatRequest, graph: Graph, sign: Signer, durability: DurabilityMode
+    body: ChatRequest, graph: Graph, sign: Signer, durability: DurabilityMode, log: Log
 ) -> AsyncIterator[ServerSentEvent]:
     """Run the chat graph on one question and stream the answer as the AI SDK's UI message
     stream, so useChat can read it (ui_stream.py has the protocol and the chunk order).
@@ -265,7 +301,17 @@ async def chat(
     http.disconnect next to the body and cancels it, FastAPI cancels this generator, and
     in_own_task turns that into one cancel of the graph run, wherever it is (the planner, the
     searches, the model's stream). A cancelled turn is not recorded in the thread.
+
+    A completed turn is written to query_log in the background (query_log.observe sees the run go
+    by, inside the run's own task, so the row does not depend on the client reading to the end).
     """
+    visitor = body.visitor or VisitorIn()
+    turn = Turn(
+        question=body.question,
+        thread_id=body.thread_id,
+        origin=body.origin,
+        visitor=Visitor.sanitised(**visitor.model_dump()),
+    )
     parts = graph.astream(
         {"question": body.question},
         {"configurable": {"thread_id": body.thread_id}},
@@ -273,6 +319,7 @@ async def chat(
         version="v2",
         durability=durability,
     )
+    parts = observe(parts, turn, on_complete=lambda done: log.write(done.row()))
     parts = in_own_task(parts)
     chunks = ui_stream.ui_message_chunks(parts, message_id=ui_stream.new_message_id(), sign=sign)
     async for chunk in chunks:
@@ -319,6 +366,7 @@ def create_app(
     search_factory: OpenSearch = open_search,
     checkpointer_factory: OpenCheckpointer = open_checkpointer,
     graph_factory: BuildGraph = openai_chat_graph,
+    query_log_factory: OpenQueryLog = open_query_log,
 ) -> FastAPI:
     if settings is None:
         settings = get_settings()
@@ -332,13 +380,17 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Runs once around the whole life of the server: open the pools and clients before
         # the first request, close them after the last. If opening fails, the server exits,
-        # and that includes a checkpoint database that is not set up (checkpoint.py).
+        # and that includes a checkpoint database that is not set up (checkpoint.py) and a
+        # query_log table without the columns this service writes (query_log.py). Closing runs in
+        # reverse, so the query log waits for its last inserts before anything else closes.
         async with (
             search_factory(settings) as search_docs,
             checkpointer_factory(settings) as checkpointer,
+            query_log_factory(settings) as query_log,
         ):
             app.state.search = search_docs
             app.state.graph = graph_factory(settings, search_docs, checkpointer)
+            app.state.query_log = query_log
             yield
 
     app = FastAPI(title="docs-copilot agent", lifespan=lifespan)

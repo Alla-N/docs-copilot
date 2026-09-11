@@ -23,16 +23,14 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_openai import ChatOpenAI
 
 from copilot_agent.planner import HistoryTurn
+from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import RetrievedChunk
 from copilot_agent.settings import Settings
 
-# lib/refusal.ts, verbatim. The prompt quotes it, the canned off-topic reply (step 2.3) is it,
-# and refusal detection keys on its first sentence. Pinned by the generation golden: a wrong
-# character here changes the prompt, and the golden records a hash of lib/refusal.ts.
-REFUSAL_MESSAGE = (
-    "I don't have information about that in the documentation. "
-    "I can help with AI SDK docs. Ask me about those and I'll help."
-)
+# REFUSAL_MESSAGE (lib/refusal.ts, verbatim) lives in refusal.py, next to its detector, as in
+# TypeScript. The prompt quotes it and the canned off-topic reply (step 2.3) is it. Pinned by
+# the generation golden: a wrong character changes the prompt, and the golden records a hash of
+# lib/refusal.ts.
 
 # What the prompt says when retrieval kept nothing. The rules above it refer to this sentence.
 NO_CONTEXT = "NO RELEVANT DOCUMENTATION FOUND."

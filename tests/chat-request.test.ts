@@ -23,6 +23,15 @@ describe("parseChatRequest", () => {
         ]);
     });
 
+    it("passes useChat's chat id through as chatId, unchecked, and parses without one as before", () => {
+        // The shape is checked where the id is used (lib/agent-forward.ts, before forwarding): the
+        // TypeScript path never reads it, so a missing or odd id must not change what it accepts.
+        expect(parseChatRequest({ id: "aB3dE5gH7jK9mN1p", messages: [user("q")] }).chatId).toBe("aB3dE5gH7jK9mN1p");
+        expect(parseChatRequest({ id: "not/a valid id", messages: [user("q")] }).chatId).toBe("not/a valid id");
+        expect(parseChatRequest({ messages: [user("q")] }).chatId).toBeUndefined();
+        expect(parseChatRequest({ id: 42, messages: [user("q")] }).chatId).toBeUndefined();
+    });
+
     it("rejects an empty list, a non-object, and a final assistant turn", () => {
         expect(() => parseChatRequest({ messages: [] })).toThrow(BadRequestError);
         expect(() => parseChatRequest(null)).toThrow(BadRequestError);

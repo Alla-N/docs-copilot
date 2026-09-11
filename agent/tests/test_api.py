@@ -63,6 +63,12 @@ async def no_checkpointer(settings: Settings) -> AsyncIterator[None]:
     yield None
 
 
+@asynccontextmanager
+async def no_query_log(settings: Settings) -> AsyncIterator[None]:
+    """The query log factory for these tests: nothing here completes a turn."""
+    yield None
+
+
 class FakeSearch:
     """Stands in for the function open_search() yields. Records every call."""
 
@@ -145,6 +151,7 @@ async def client(factory: FakeFactory) -> AsyncIterator[httpx.AsyncClient]:
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     async with serve(app) as client:
         client.headers.update(AUTH)
@@ -168,6 +175,7 @@ async def test_lifespan_opens_search_once_and_closes_it(factory: FakeFactory) ->
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     assert factory.events == []  # building the app opens nothing; startup does
 
@@ -190,6 +198,7 @@ async def test_startup_fails_when_search_cannot_open(factory: FakeFactory) -> No
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     with pytest.raises(OSError, match="connection refused"):
         async with serve(app):
@@ -204,12 +213,34 @@ async def test_startup_fails_when_the_checkpoint_database_is_not_ready(
     savers = FakeFactory(None)  # type: ignore[arg-type]
     savers.fail_on_open = RuntimeError("checkpoint database not ready: tables missing")
     app = create_app(
-        make_settings(), search_factory=factory, checkpointer_factory=savers, graph_factory=no_graph
+        make_settings(),
+        search_factory=factory,
+        checkpointer_factory=savers,
+        graph_factory=no_graph,
+        query_log_factory=no_query_log,
     )
     with pytest.raises(RuntimeError, match="not ready"):
         async with serve(app):
             pass
     assert factory.events == ["open", "close"]  # what opened before it is closed again
+
+
+async def test_startup_fails_when_the_query_log_is_not_ready(factory: FakeFactory) -> None:
+    # The real open_query_log() raises when query_log lacks a column this service writes (db/006
+    # not run) or has Row Level Security off (query_log.readiness_problems).
+    logs = FakeFactory(None)  # type: ignore[arg-type]
+    logs.fail_on_open = RuntimeError("query log database not ready: no column ['origin']")
+    app = create_app(
+        make_settings(),
+        search_factory=factory,
+        checkpointer_factory=no_checkpointer,
+        graph_factory=no_graph,
+        query_log_factory=logs,
+    )
+    with pytest.raises(RuntimeError, match="not ready"):
+        async with serve(app):
+            pass
+    assert factory.events == ["open", "close"]
 
 
 def test_create_app_without_arguments_reads_settings_then(
@@ -218,7 +249,10 @@ def test_create_app_without_arguments_reads_settings_then(
     # `uvicorn --factory copilot_agent.api:create_app` calls create_app() with no arguments.
     monkeypatch.setattr(api, "get_settings", lambda: make_settings(enable_search_endpoint=True))
     app = create_app(
-        search_factory=factory, graph_factory=no_graph, checkpointer_factory=no_checkpointer
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     assert "/search" in app.openapi()["paths"]
 
@@ -234,6 +268,7 @@ async def test_search_route_does_not_exist_unless_enabled(
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     async with serve(app) as client:
         response = await client.post("/search", json={"query": "how do I stream text"})
@@ -259,6 +294,7 @@ async def test_search_needs_the_agent_key_too(
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     async with serve(app) as client:
         response = await client.post("/search", json={"query": "q"}, headers=headers)
@@ -359,6 +395,7 @@ async def test_unexpected_error_is_a_bare_500(factory: FakeFactory, fake: FakeSe
         search_factory=factory,
         graph_factory=no_graph,
         checkpointer_factory=no_checkpointer,
+        query_log_factory=no_query_log,
     )
     async with serve(app, raise_app_exceptions=False) as client:
         response = await client.post("/search", json={"query": "q"}, headers=AUTH)

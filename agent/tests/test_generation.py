@@ -7,7 +7,6 @@ import pytest
 
 from copilot_agent.generation import (
     NO_CONTEXT,
-    REFUSAL_MESSAGE,
     build_system_prompt,
     finish_reason,
     generation_messages,
@@ -15,6 +14,7 @@ from copilot_agent.generation import (
     openai_generation_model,
 )
 from copilot_agent.planner import HistoryTurn
+from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import RetrievedChunk
 from copilot_agent.settings import Settings
 

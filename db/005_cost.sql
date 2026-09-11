@@ -25,6 +25,9 @@ alter table query_log
 -- Embeddings (text-embedding-3-small, $0.02 / 1M tokens) are not tracked: one short string
 -- per sub-query, well under a hundredth of a cent — noise next to the rerank line.
 -- Update here when prices move; the view recomputes history.
+-- SINCE db/006: the prices live in the query_cost view there, and cost_daily reads it (web rows
+-- only). Edit prices in 006, and do not re-run this file after it: it would put back the view
+-- without the origin filter.
 create or replace view cost_daily
 with (security_invoker = true) as
 with priced as (

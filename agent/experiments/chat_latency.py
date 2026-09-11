@@ -37,7 +37,8 @@ def one_request(client: httpx.Client, url: str, question: str) -> dict[str, floa
     def mark(name: str) -> None:
         marks.setdefault(name, (time.perf_counter() - started) * 1000)
 
-    body = {"thread_id": "latency-" + secrets.token_hex(8), "question": question}
+    # origin "eval": measurement traffic, kept out of the visitor views (db/006_origin.sql).
+    body = {"thread_id": "latency-" + secrets.token_hex(8), "question": question, "origin": "eval"}
     with client.stream("POST", f"{url}/chat", json=body) as response:
         response.raise_for_status()
         mark("headers")

@@ -35,13 +35,15 @@ repos:
       # test_planner_request_parity.py checks the sha256 of lib/plan.ts and evals/planner-cases.ts,
       # test_generation_request_parity.py that of lib/generation.ts, lib/retrieve.ts, lib/refusal.ts,
       # and test_ts_parity.py reads the caps in lib/chat-request.ts and the signature version in
-      # lib/assistant-signature.ts.
+      # lib/assistant-signature.ts. Since 2.6: test_refusal.py hashes lib/refusal.ts (already
+      # listed), and test_ts_parity.py reads the visitor shapes in lib/visitor.ts, the query_log
+      # columns in lib/query-log.ts and db/*.sql, and the chat id pattern in lib/agent-forward.ts.
       # Tests marked integration need network and secrets, so they stay out of the hook.
       - id: pytest
         name: pytest (agent, no network)
         entry: bash -c 'cd agent && uv run --locked pytest -q -m "not integration"'
         language: system
-        files: ^(agent/|lib/(retrieve|plan|content-hash|generation|refusal|chat-request|assistant-signature)\.ts$|evals/planner-cases\.ts$)
+        files: ^(agent/|lib/(retrieve|plan|content-hash|generation|refusal|chat-request|assistant-signature|visitor|query-log|agent-forward)\.ts$|evals/planner-cases\.ts$|db/.*\.sql$)
         pass_filenames: false
 
       # ---- TypeScript: the Next.js app ---------------------------------------------------

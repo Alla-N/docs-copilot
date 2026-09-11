@@ -17,10 +17,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ConfigDict, Field
 
 from copilot_agent.checkpoint import serializer
-from copilot_agent.generation import REFUSAL_MESSAGE
 from copilot_agent.graph import SubQueryRetrieval, build_graph, merge_retrievals
 from copilot_agent.history import MAX_STORED_TURNS
 from copilot_agent.planner import GREETING_MESSAGE, HistoryTurn, TokenUsage
+from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import Candidate, RetrievalResult, RetrievedChunk, union_relevant
 
 pytestmark = pytest.mark.anyio

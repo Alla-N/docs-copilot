@@ -44,7 +44,6 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Overwrite, Send
 
 from copilot_agent.generation import (
-    REFUSAL_MESSAGE,
     FinishReason,
     finish_reason,
     generation_messages,
@@ -62,6 +61,7 @@ from copilot_agent.planner import (
     openai_planner_model,
     plan_query,
 )
+from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import (
     RetrievalMode,
     RetrievalResult,

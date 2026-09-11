@@ -8,7 +8,8 @@
 # its tests pin (test_ts_parity.py reads lib/retrieve.ts and lib/plan.ts, test_content_hash.py
 # mirrors lib/content-hash.ts, the two request-parity tests hash lib/plan.ts,
 # evals/planner-cases.ts, lib/generation.ts, lib/retrieve.ts and lib/refusal.ts, and
-# test_ts_parity.py also reads lib/chat-request.ts and lib/assistant-signature.ts), or this file.
+# test_ts_parity.py also reads lib/chat-request.ts and lib/assistant-signature.ts, and since
+# 2.6 lib/visitor.ts, lib/query-log.ts, lib/agent-forward.ts and db/*.sql), or this file.
 # Same list as the pre-commit pytest hook. The other direction (the real AI SDK client reading
 # the Python golden streams) is a Vitest test, so it runs in eval.yml on every push.
 
@@ -26,6 +27,10 @@ on:
       - "evals/planner-cases.ts"
       - "lib/chat-request.ts"
       - "lib/assistant-signature.ts"
+      - "lib/visitor.ts"
+      - "lib/query-log.ts"
+      - "lib/agent-forward.ts"
+      - "db/*.sql"
       - ".github/workflows/agent.yml"
   pull_request:
     branches: [main]
@@ -39,6 +44,10 @@ on:
       - "evals/planner-cases.ts"
       - "lib/chat-request.ts"
       - "lib/assistant-signature.ts"
+      - "lib/visitor.ts"
+      - "lib/query-log.ts"
+      - "lib/agent-forward.ts"
+      - "db/*.sql"
       - ".github/workflows/agent.yml"
   workflow_dispatch:
 

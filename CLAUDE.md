@@ -13,7 +13,8 @@ expected to hold to that, not just to keep the tests green.
 
 | Path | Owns |
 |---|---|
-| `app/api/chat/route.ts` | The **only** route: rate-limit → parse → plan → retrieve → generate |
+| `app/api/chat/route.ts` | The **only** route: rate-limit → parse → plan → retrieve → generate; with `AGENT_URL` set, rate-limit → parse → forward to `agent/` |
+| `lib/agent-forward.ts` | The forward to the Python agent service: chat id check, `{thread_id, question, origin, visitor}`, byte pipe, 502 on upstream failure |
 | `lib/plan.ts` | Query planner (plan-and-execute) + HyDE hypotheticals; intents search / greeting / off-topic; `DEBUG_PLAN=1` |
 | `lib/corpus.ts` | The 37-page list, shared by ingestion and experiments |
 | `lib/retrieve.ts` | embed → pgvector (top 100) → rerank (top 5) → threshold 0.30; `buildSystemPrompt` |
@@ -32,7 +33,7 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
-| `db/000..005_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view |
+| `db/000..006_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only |
 
 ## Invariants — do not break these
 
@@ -52,7 +53,13 @@ expected to hold to that, not just to keep the tests green.
    start without the key. `tests/test_chat_api.py` guards it.
 3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
-   retrieval inside `evals/` — a copy drifts, and drifts toward passing.
+   retrieval inside `evals/` — a copy drifts, and drifts toward passing. The Python target
+   (`EVAL_TARGET=python`, `evals/agent-target.ts`, step 2.6) goes through the service's own
+   `POST /chat`, as the route forwards it: never give the service a test-only way in for the
+   harness (a case's earlier user turns are replayed as real turns on a fresh thread; a case whose
+   attack is a scripted assistant turn is reported as held by STRUCTURE, after the harness checks
+   that a request carrying history is a 422). Both targets score through the same `scoreRuns` /
+   `verdictOf`.
 4. **Generation answers the planner's *resolved* query, not the raw message** — in the
    route, the harness AND the judge calibration, all through `lib/generation.ts`
    (`generationSettings` + `generationMessages`). Never inline a generation call with its
@@ -90,8 +97,9 @@ expected to hold to that, not just to keep the tests green.
    Since step 2.5 the Python service takes NO history from its caller: `POST /chat` gets a
    thread id and the question (a `history` field is a 422), and the turns come from the thread
    the LangGraph checkpointer keeps. There is no client-supplied assistant text left to forge or
-   replay on that path. Signing stays for the TypeScript route, which still reads client history
-   until 2.6 forwards to Python.
+   replay on that path. Signing stays for the TypeScript route: without `AGENT_URL` it still reads
+   client history, and with it the parse still verifies before anything is forwarded (only the
+   question goes over, invariant 14).
 9. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
    is never an accepted role; caps 20 msgs / 4k chars / 24k total — the total cap trims the
    OLDEST turns (it once dropped the newest and 400'd). Malformed JSON is a 400. Never
@@ -99,7 +107,13 @@ expected to hold to that, not just to keep the tests green.
    mandatory whenever Upstash is configured — the module throws otherwise.
 10. **Logging runs in `after()`**, never a bare `void promise` — serverless freezes the
    function after the response and the insert is lost. Greetings and off-topic refusals are
-   logged too (mode `skipped`).
+   logged too (mode `skipped`). On the forwarded path the agent service writes the row
+   (`agent/.../query_log.py`, step 2.6): the same columns in the same order (pinned), plus
+   `origin` (`web` | `eval`) and `thread_id` (`db/006_origin.sql`), one row per COMPLETED turn,
+   inserted in a tracked background task that never touches the answer and is drained at
+   shutdown. Every view counts `origin = 'web'` only: eval traffic must never be priced into the
+   ceiling or mined as eval cases. `refused` comes from `refusal.is_refusal`, pinned verdict by
+   verdict to `isRefusal` (`agent/tests/golden/refusal-verdicts.json`).
 11. **A refusal on an answerable case is a bug, even when recall says 12/12.** `expectedSource`
     is a PAGE, so any chunk of it satisfies recall — including one carrying none of the answer.
     The harness reports these as `false refusals`; never treat that line as noise, and never
@@ -128,6 +142,16 @@ expected to hold to that, not just to keep the tests green.
    service refuses to start unless they are migrated and locked down. Checkpoint blobs are read
    back through a strict serializer (`checkpoint.serializer`): LangGraph's default imports and
    calls any class a blob names.
+14. **With `AGENT_URL` set, the route is a byte pipe.** (Step 2.6, `lib/agent-forward.ts`.) Rate
+   limit and parse run first, as always; then the route checks useChat's chat id against the
+   service's thread id pattern (pinned; a bad one is a 400 before anything is paid for) and posts
+   `{thread_id, question, origin: "web", visitor}` with the key and `req.signal`. NO history is
+   forwarded: the service reads its own thread. The response is `new Response(upstream.body)` under
+   `UI_MESSAGE_STREAM_HEADERS`: never parse or re-emit the stream here (that would be a second
+   protocol implementation in the path), never copy upstream headers, and never pass upstream text
+   to the client (a failure before the stream is a 502 with the generic message). Unset is the
+   default everywhere: the variable is the switch and unsetting it the rollback.
+   `tests/agent-forward.test.ts` guards all of it, with the real `Chat` client through the route.
 
 ## How to change things here
 
@@ -181,6 +205,7 @@ npm run eval:planner                 # planner-only: intent, sub-query count, mu
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
 DEBUG_PLAN=1 EVAL_RUNS=0 npm run eval # hypotheticals + vector candidates per sub-query
 EVAL_JUDGE=1 npm run eval            # + faithfulness judge per answered case
+EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval   # the same suite against a running agent service over HTTP: every run plans + retrieves again, recall run 1 and every run, measured cost from query_log (origin eval); no judge, no EVAL_RUNS=0; writes evals/results/<stamp>-python.json
 npm run eval:calibrate               # validate the judge against known-labelled answers first (last: 0/12 FA, 0/23 missed, n=35)
 npm run exp:sweep                    # threshold / rerank / HyDE gap numbers for the README (~5 min)
 npm run exp:chunking                 # chunker comparison on the real corpus vs the eval queries
@@ -198,6 +223,7 @@ cd agent && uv run python experiments/chat_latency.py "how do I stream text"   #
 cd agent && UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py   # rewrite the golden /chat streams after changing the stream; then npm test (the contract test reads them)
 cd agent && uv run python -m copilot_agent.checkpoint setup   # create/migrate LangGraph's checkpoint tables + turn RLS on (once per database; `check` only reports)
 npm run exp:history-caps             # freeze what parseChatRequest keeps of a conversation into agent/tests/golden/ (free, no network); rerun after editing lib/chat-request.ts
+npm run exp:refusal-verdicts         # freeze isRefusal's verdicts for the Python port (free, no network); rerun after editing lib/refusal.ts
 cd agent && uv run python experiments/checkpoint_overhead.py   # checkpointer cost per turn (time, rows, bytes) per durability, database only (free)
 cd agent && uv run pytest -m integration tests/test_checkpoint_live.py   # the saver on the real database: round trip, and the Data API roles see no rows (free)
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
@@ -213,7 +239,8 @@ docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars o
   Rerank costs ~$0.002 per call now, one per sub-query — `RATE_DAILY_GLOBAL` was re-derived
   to 200 from an ESTIMATE. Since db/005 every request logs measured tokens + rerank calls;
   re-derive the ceiling from `cost_daily.usd_per_request` once there is traffic, and change
-  prices in `db/005_cost.sql` only (the view recomputes history). The harness refuses to score a cosine-fallback run (exit 3). On a trial key set
+  prices in the `query_cost` view of `db/006_origin.sql` only (every view recomputes history;
+  never re-run `005` after `006`, it would drop the web-only filter). The harness refuses to score a cosine-fallback run (exit 3). On a trial key set
   `RERANK_INTERVAL_MS=6500`. `retrieve()` degrades to cosine ordering on failure with one
   retry, not two — don't remove the fallback or raise the retries (12 s per visitor).
 - CI (`.github/workflows/eval.yml`): planner eval on every push; retrieval-only gate on
@@ -228,6 +255,6 @@ docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars o
 
 ReAct / tool-calling loops belong to Artifact 2, not here. Server-side sessions, the real
 fix for client-supplied history, exist on the Python side since step 2.5 (the checkpointer); the
-TypeScript route keeps reading signed client history until 2.6 forwards to Python.
+route forwards to it with `AGENT_URL` set (2.6), and keeps reading signed client history without it.
 Content-defined chunk boundaries would remove the ~14× re-ingest write amplification;
 deferred until an eval proves retrieval survives it.

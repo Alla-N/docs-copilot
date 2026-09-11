@@ -59,7 +59,7 @@ def test_greeting_matches_typescript() -> None:
 
 
 def test_refusal_matches_typescript() -> None:
-    from copilot_agent.generation import REFUSAL_MESSAGE
+    from copilot_agent.refusal import REFUSAL_MESSAGE
 
     assert ts_string("refusal.ts", "REFUSAL_MESSAGE") == REFUSAL_MESSAGE
 
@@ -78,3 +78,53 @@ def test_signature_version_matches_typescript() -> None:
     from copilot_agent.signing import VERSION
 
     assert ts_string("assistant-signature.ts", "VERSION") == VERSION
+
+
+def ts_regex(file: str, name: str) -> str:
+    """Read a regex literal's source from lib/: const NAME = /source/;"""
+    source = (LIB / file).read_text()
+    match = re.search(rf"const {name} = /(.+?)/;", source)
+    assert match, f"{name} not found in lib/{file}"
+    return match.group(1)
+
+
+@pytest.mark.parametrize("name", ["REFERRER_HOST", "UTM_SOURCE", "COUNTRY_ISO2"])
+def test_visitor_shapes_match_typescript(name: str) -> None:
+    # The route sanitises the visitor with these (lib/visitor.ts) and the service checks them
+    # again before the row is written (query_log.Visitor.sanitised). Python keeps the shape
+    # without ^ and $ and uses re.fullmatch: Python's $ also matches before a trailing newline.
+    from copilot_agent import query_log
+
+    assert ts_regex("visitor.ts", name) == f"^{getattr(query_log, name)}$"
+
+
+def test_the_row_has_the_columns_the_typescript_route_writes() -> None:
+    # One table, two writers: lib/query-log.ts for the TypeScript route, query_log.py for the
+    # service. Same columns in the same order, plus the two db/006 added.
+    from copilot_agent.query_log import COLUMNS
+
+    source = (LIB / "query-log.ts").read_text()
+    insert = source[source.index('.from("query_log").insert({') : source.index("} as never)")]
+    ts_columns = re.findall(r"^\s+([a-z_]+):", insert, re.MULTILINE)
+    assert (*ts_columns, "origin", "thread_id") == COLUMNS
+
+
+def test_every_column_the_service_writes_is_created_by_a_migration() -> None:
+    from copilot_agent.query_log import COLUMNS
+
+    db = LIB.parent / "db"
+    sql = "\n".join(p.read_text() for p in sorted(db.glob("*.sql")))
+    table = sql[sql.index("create table if not exists query_log") :]
+    table = table[: table.index(");")]
+    for column in COLUMNS:
+        created = re.search(rf"^\s+{column}\s", table, re.MULTILINE)
+        added = re.search(rf"add column if not exists {column}\s", sql)
+        assert created or added, f"no migration in db/ creates query_log.{column}"
+
+
+def test_thread_id_pattern_matches_typescript() -> None:
+    # The route checks useChat's chat id with this before forwarding it (lib/agent-forward.ts),
+    # so an id the service would 422 is a 400 there, before anything is paid for.
+    from copilot_agent.api import THREAD_ID_PATTERN
+
+    assert ts_regex("agent-forward.ts", "CHAT_ID_PATTERN") == THREAD_ID_PATTERN

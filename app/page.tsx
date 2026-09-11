@@ -42,7 +42,14 @@ export default function Chat() {
         () => new DefaultChatTransport<ChatMessage>({ api: "/api/chat", headers: landingHeaders }),
         []
     );
-    const { messages, sendMessage, status, error, regenerate, stop } = useChat<ChatMessage>({ transport });
+    // The chat id names the conversation: with AGENT_URL set, the route forwards it as the agent
+    // service's thread id, and the service keeps the history under it (lib/agent-forward.ts). So it
+    // is a bearer capability (whoever has it continues the conversation), and useChat's default,
+    // generateId(), is built on Math.random. A crypto UUID costs one line. The state initializer
+    // runs again in the browser (React does not carry state over from the server render), so every
+    // page load is a new conversation, as it already was.
+    const [chatId] = useState(() => crypto.randomUUID());
+    const { messages, sendMessage, status, error, regenerate, stop } = useChat<ChatMessage>({ id: chatId, transport });
 
     const isBusy = status === "submitted" || status === "streaming";
     const rateLimit = parseRateLimit(error);
