@@ -49,6 +49,21 @@ uv run python evals/planner_eval.py        # compare two runs with two of: npm r
 The golden stores a sha256 of `lib/plan.ts` and `evals/planner-cases.ts`, so editing either
 fails the parity test until the golden is regenerated.
 
+## Generation (step 2.2)
+
+`copilot_agent/generation.py` ports `buildSystemPrompt` (lib/retrieve.ts) and
+`generationSettings` / `generationMessages` (lib/generation.ts). Same technique as the planner:
+
+```
+npm run exp:generation-requests            # from the repo root; rewrites tests/golden/generation-requests.json
+uv run pytest tests/test_generation_request_parity.py
+```
+
+The golden holds six synthetic cases chosen for the prompt's formatting edges and a canned
+Responses API event stream; the test checks the request, the streamed deltas, the text and the
+usage. Scores are printed with `js_to_fixed`: Python's `f"{0.125:.2f}"` is `0.12`, JavaScript's
+`(0.125).toFixed(2)` is `0.13`.
+
 ## Running in Docker (local)
 
 From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):

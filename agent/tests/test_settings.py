@@ -28,6 +28,8 @@ def env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.delenv("RERANK_TOP_N", raising=False)
     monkeypatch.delenv("ENABLE_SEARCH_ENDPOINT", raising=False)
     monkeypatch.delenv("PLANNER_MODEL", raising=False)
+    monkeypatch.delenv("GENERATION_MODEL", raising=False)
+    monkeypatch.delenv("MAX_OUTPUT_TOKENS", raising=False)
     return monkeypatch
 
 
@@ -121,3 +123,15 @@ def test_planner_model_defaults_like_lib_plan_ts_and_reads_planner_model(
     env.setenv("PLANNER_MODEL", "")
     with pytest.raises(ValidationError, match="planner_model"):
         load()
+
+
+def test_generation_settings_default_like_lib_generation_ts(env: pytest.MonkeyPatch) -> None:
+    settings = load()
+    assert (settings.generation_model, settings.max_output_tokens) == ("gpt-4o-mini", 1024)
+    env.setenv("MAX_OUTPUT_TOKENS", "600")
+    assert load().max_output_tokens == 600
+    # lib/generation.ts would turn "0" or "lots" into a broken request; here startup fails.
+    for bad in ("0", "lots"):
+        env.setenv("MAX_OUTPUT_TOKENS", bad)
+        with pytest.raises(ValidationError, match="max_output_tokens"):
+            load()

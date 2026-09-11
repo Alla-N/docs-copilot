@@ -162,6 +162,7 @@ pre-commit run --all-files           # the local commit gate by hand (ruff, pyte
 cd agent && uv run pytest            # Python agent service tests
 npm run exp:planner-requests         # freeze the TS planner's exact requests into agent/tests/golden/ (free, no network); rerun after editing lib/plan.ts or evals/planner-cases.ts
 cd agent && uv run python evals/planner_eval.py   # the planner eval against the Python planner (23 x 5, a few cents)
+npm run exp:generation-requests      # same for the answer step (streamText request + a canned stream); rerun after editing lib/generation.ts, lib/retrieve.ts or lib/refusal.ts
 cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 ```

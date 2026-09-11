@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     # lib/plan.ts reads PLANNER_MODEL with the same default. The planner parity test pins the
     # default: the golden request was recorded with it.
     planner_model: str = Field(default="gpt-4o-mini", min_length=1)
+    # lib/generation.ts: GENERATION_MODEL and MAX_OUTPUT_TOKENS, same defaults. The cap bounds a
+    # runaway answer's cost; a normal grounded answer is 300 to 600 tokens.
+    generation_model: str = Field(default="gpt-4o-mini", min_length=1)
+    max_output_tokens: int = Field(default=1024, ge=1, le=16384)
 
     # POST /search spends embed + rerank credits on every call, and invariant 2 forbids a paid
     # public endpoint. So the route is only REGISTERED when this is true (api.create_app): a
