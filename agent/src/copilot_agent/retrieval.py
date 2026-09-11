@@ -124,6 +124,25 @@ def cosine_fallback(candidates: list[Candidate], top_n: int) -> list[RetrievedCh
     ]
 
 
+def union_relevant(
+    per_query: list[list[RetrievedChunk]], cap: int = retrieval_config.UNION_CAP
+) -> list[RetrievedChunk]:
+    """Merge the sub-queries' chunks the way plannedRetrieve in lib/plan.ts does.
+
+    A chunk can surface for more than one sub-query: it is kept once, with its best score.
+    Then best score first, capped. Equal scores keep first-seen order on both sides: JS sort
+    and Python sorted() are stable (reverse=True included), and a dict, like a JS Map, keeps
+    a key where it first appeared when its value is replaced.
+    """
+    best: dict[tuple[str, str], RetrievedChunk] = {}
+    for chunks in per_query:
+        for chunk in chunks:
+            key = (chunk.source_url, chunk.content)
+            if key not in best or chunk.score > best[key].score:
+                best[key] = chunk
+    return sorted(best.values(), key=lambda chunk: chunk.score, reverse=True)[:cap]
+
+
 def _ms_since(start: float) -> float:
     return round((time.perf_counter() - start) * 1000, 1)
 

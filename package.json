@@ -23,7 +23,8 @@
     "eval:calibrate": "tsx --env-file=.env.local evals/calibrate-judge.ts",
     "exp:refusal": "tsx --env-file=.env.local scripts/experiments/refusal-ab.ts",
     "exp:phrasing": "tsx --env-file=.env.local scripts/experiments/query-phrasing.ts",
-    "exp:sweep": "tsx --env-file=.env.local scripts/experiments/threshold-sweep.ts"
+    "exp:sweep": "tsx --env-file=.env.local scripts/experiments/threshold-sweep.ts",
+    "exp:golden": "tsx --env-file=.env.local scripts/experiments/retrieval-golden.ts"
   },
   "dependencies": {
     "@ai-sdk/cohere": "^4.0.14",

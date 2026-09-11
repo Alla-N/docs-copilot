@@ -1,4 +1,4 @@
-"""Calibrated retrieval numbers, ported from lib/retrieve.ts.
+"""Calibrated retrieval numbers, ported from lib/retrieve.ts (and UNION_CAP from lib/plan.ts).
 
 These are measured, not guessed (CLAUDE.md invariant 6). Move one only with two full
 eval runs behind it, and move it on both sides while the TypeScript retrieval still
@@ -16,3 +16,6 @@ VECTOR_CANDIDATES = 100
 
 # Chunks kept after reranking.
 RERANK_TOP_N = 5
+
+# Chunks the model sees after the sub-queries' results are unioned (plannedRetrieve).
+UNION_CAP = 8

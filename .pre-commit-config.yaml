@@ -30,13 +30,14 @@ repos:
         types: [python]
         files: ^agent/
 
-      # Also runs when lib/retrieve.ts changes: tests/test_ts_parity.py reads it.
+      # Also runs when the TypeScript files the Python tests pin change: test_ts_parity.py
+      # reads lib/retrieve.ts and lib/plan.ts, test_content_hash.py mirrors lib/content-hash.ts.
       # Tests marked integration need network and secrets, so they stay out of the hook.
       - id: pytest
         name: pytest (agent, no network)
         entry: bash -c 'cd agent && uv run --locked pytest -q -m "not integration"'
         language: system
-        files: ^(agent/|lib/retrieve\.ts$)
+        files: ^(agent/|lib/(retrieve|plan|content-hash)\.ts$)
         pass_filenames: false
 
       # ---- TypeScript: the Next.js app ---------------------------------------------------
