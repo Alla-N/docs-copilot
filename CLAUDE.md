@@ -155,6 +155,8 @@ npm run exp:sweep                    # threshold / rerank / HyDE gap numbers for
 npm run exp:chunking                 # chunker comparison on the real corpus vs the eval queries
 npm run ingest / -- --write          # dry run prints the diff; --write applies it
 npx tsc --noEmit                     # typecheck (CI runs this before eval)
+pre-commit run --all-files           # the local commit gate by hand (ruff, pytest, tsc, eslint, vitest); install once: uv tool install pre-commit && pre-commit install
+cd agent && uv run pytest            # Python agent service tests
 ```
 
 ## Environment gotchas

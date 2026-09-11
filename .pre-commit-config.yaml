@@ -1,0 +1,61 @@
+# Local commit gate: fast, free, deterministic checks only.
+#
+# Evals are NOT here. They cost money and are nondeterministic (HyDE), so CI runs them.
+# pre-commit stashes unstaged edits first, so every hook sees exactly what is being
+# committed, not whatever else happens to be in the working tree.
+#
+# Once per clone:   uv tool install pre-commit && pre-commit install
+# By hand:          pre-commit run --all-files
+# Escape hatch:     git commit --no-verify   (CI is still the real gate)
+#
+# All hooks are local and call the project's own tools (uv.lock, package-lock.json), so the
+# versions that run here are the versions CI runs. No second set of pins to keep in sync.
+
+repos:
+  - repo: local
+    hooks:
+      # ---- Python: agent/ -------------------------------------------------------------
+      # --locked fails if pyproject.toml changed without uv.lock being updated to match.
+      - id: ruff-check
+        name: ruff check (agent)
+        entry: uv run --locked --project agent ruff check --fix
+        language: system
+        types: [python]
+        files: ^agent/
+
+      - id: ruff-format
+        name: ruff format (agent)
+        entry: uv run --locked --project agent ruff format
+        language: system
+        types: [python]
+        files: ^agent/
+
+      # Also runs when lib/retrieve.ts changes: tests/test_ts_parity.py reads it.
+      # Tests marked integration need network and secrets, so they stay out of the hook.
+      - id: pytest
+        name: pytest (agent, no network)
+        entry: bash -c 'cd agent && uv run --locked pytest -q -m "not integration"'
+        language: system
+        files: ^(agent/|lib/retrieve\.ts$)
+        pass_filenames: false
+
+      # ---- TypeScript: the Next.js app ---------------------------------------------------
+      - id: tsc
+        name: tsc --noEmit
+        entry: npx tsc --noEmit
+        language: system
+        files: (\.(ts|tsx|mts)$|^tsconfig\.json$|^package(-lock)?\.json$)
+        pass_filenames: false
+
+      - id: eslint
+        name: eslint (staged files)
+        entry: npx eslint --max-warnings=0
+        language: system
+        files: \.(ts|tsx|mts|js|mjs)$
+
+      - id: vitest
+        name: vitest
+        entry: npm test --silent
+        language: system
+        files: (\.(ts|tsx|mts)$|^package(-lock)?\.json$)
+        pass_filenames: false

@@ -43,3 +43,14 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 .idea/
+
+# Files the Claude desktop app drops here when it delivers a file into the chat.
+# Not project artifacts - keep them out of the repo.
+Claude outputs/
+
+# python (agent/ service)
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,43 @@
+[project]
+name = "copilot-agent"
+version = "0.1.0"
+description = "Python agent service for docs-copilot: retrieval now, the LangGraph orchestrator next"
+readme = "README.md"
+authors = [
+    { email = "allasandra1725@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E", "W",  # pycodestyle
+    "F",       # pyflakes: unused imports, undefined names
+    "I",       # import sorting
+    "UP",      # pyupgrade: modern syntax for the target version
+    "B",       # bugbear: likely bugs
+    "SIM",     # simplifications
+    "ASYNC",   # blocking calls inside async functions
+    "RUF",     # ruff-specific
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--import-mode=importlib"]
+markers = [
+    "integration: needs network and secrets (Supabase, OpenAI, Cohere); excluded from the pre-commit hook",
+]
