@@ -8,28 +8,21 @@ rerank). Run it on purpose:
 Step 1e replaces this with the full parity check against the TypeScript retrieve().
 """
 
-import asyncio
-
 import pytest
 
 from copilot_agent.retrieval import RetrievalResult, open_search
 from copilot_agent.settings import get_settings
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
 # From evals/dataset.ts: the stream-text case and its accepted pages.
 QUERY = "how do I stream text"
 STREAM_TEXT_PAGES = ("generating-text", "stream-text")
 
 
-async def _search(query: str) -> RetrievalResult:
+async def test_live_search_finds_the_stream_text_page() -> None:
     async with open_search(get_settings()) as search:
-        return await search(query)
-
-
-def test_live_search_finds_the_stream_text_page() -> None:
-    # asyncio.run for now; step 1d introduces async tests properly.
-    result = asyncio.run(_search(QUERY))
+        result: RetrievalResult = await search(QUERY)
 
     assert result.mode == "reranked", "cosine fallback means the reranker call failed"
     assert len(result.candidates) == 100

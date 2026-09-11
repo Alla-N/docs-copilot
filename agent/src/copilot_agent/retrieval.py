@@ -36,9 +36,11 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 RERANK_MODEL = "rerank-v3.5"
 COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
 
-# lib/retrieve.ts passes maxRetries: 1 to the AI SDK. Mirrored here explicitly: statuses
-# the AI SDK treats as retryable, one retry, after the AI SDK's 2 s initial delay.
-RERANK_RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504})
+# lib/retrieve.ts passes maxRetries: 1 to the AI SDK. Mirrored here explicitly: one retry,
+# after the AI SDK's 2 s initial delay, on what its APICallError marks retryable: 408, 409,
+# 429 and EVERY 5xx (statusCode >= 500 in @ai-sdk/provider). Not mirrored: when the response
+# carries retry-after-ms or retry-after under 60 s, the AI SDK waits that long instead.
+RERANK_RETRYABLE_4XX = frozenset({408, 409, 429})
 RERANK_RETRY_DELAY_S = 2.0
 RERANK_TIMEOUT_S = 15.0
 
@@ -233,13 +235,17 @@ class _CohereRerankResponse(BaseModel):
     results: list[_CohereResult]
 
 
+def _is_retryable(status: int) -> bool:
+    return status in RERANK_RETRYABLE_4XX or status >= 500
+
+
 async def _post_with_one_retry(
     http: httpx.AsyncClient, url: str, *, json: dict[str, object], headers: dict[str, str]
 ) -> httpx.Response:
     """POST; on a network error or a retryable status, wait and try exactly once more."""
     try:
         response = await http.post(url, json=json, headers=headers)
-        if response.status_code not in RERANK_RETRYABLE_STATUS:
+        if not _is_retryable(response.status_code):
             return response
         logger.info("Rerank returned %s; retrying once", response.status_code)
     except httpx.TransportError:
