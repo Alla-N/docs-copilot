@@ -293,6 +293,24 @@ def cohere_reranker(http: httpx.AsyncClient, api_key: str) -> Rerank:
 # ---- wiring ---------------------------------------------------------------------------
 
 
+def connection_kwargs(settings: Settings) -> dict[str, object]:
+    """Keyword arguments for every pooled connection.
+
+    autocommit=True: a search is one read-only SELECT, and needs no transaction around it.
+    psycopg follows the Python DB-API, which opens transactions implicitly: without autocommit,
+    BEGIN goes out as its own round trip before the query, and leaving pool.connection() sends
+    COMMIT, so one search costs three round trips to the Supabase pooler instead of one.
+    LangGraph's Postgres checkpointer (phase 2) requires autocommit=True on its connections too.
+
+    prepare_threshold=None, transaction pooler (port 6543) only: it cannot keep prepared
+    statements between transactions, and psycopg starts preparing after 5 runs of one query.
+    """
+    kwargs: dict[str, object] = {"autocommit": True}
+    if settings.uses_transaction_pooler:
+        kwargs["prepare_threshold"] = None
+    return kwargs
+
+
 class SearchDocs(Protocol):
     async def __call__(self, query: str, embed_text: str | None = None) -> RetrievalResult: ...
 
@@ -304,14 +322,11 @@ async def open_search(settings: Settings) -> AsyncIterator[SearchDocs]:
     async with open_search(get_settings()) as search:
         result = await search("how do I stream text")
     """
-    # The transaction pooler (port 6543) cannot keep prepared statements between
-    # transactions; psycopg would otherwise start preparing after 5 runs of the same query.
-    connect_kwargs = {"prepare_threshold": None} if settings.uses_transaction_pooler else {}
     pool = AsyncConnectionPool(
         settings.database_url.get_secret_value(),
         min_size=POOL_MIN_SIZE,
         max_size=POOL_MAX_SIZE,
-        kwargs=connect_kwargs,
+        kwargs=connection_kwargs(settings),
         open=False,
     )
     # wait=True: fail now, with the real connection error, instead of on the first query
