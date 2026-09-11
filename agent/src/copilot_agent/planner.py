@@ -34,6 +34,13 @@ logger = logging.getLogger(__name__)
 
 Intent = Literal["search", "greeting", "off-topic"]
 
+# lib/plan.ts, verbatim (tests/test_ts_parity.py reads it from there): the canned reply to a
+# message that is only a greeting or a "what can you do". A cold refusal there looks broken.
+GREETING_MESSAGE = (
+    "Hi! I answer questions about the Vercel AI SDK documentation \u2014 things like streaming "
+    "text, tool calling, embeddings, or migrating to v7. What would you like to know?"
+)
+
 # lib/plan.ts: PLANNER_MAX_OUTPUT_TOKENS, the "at most 4 queries" slice, history.slice(-4).
 PLANNER_MAX_OUTPUT_TOKENS = 512
 MAX_SUB_QUERIES = 4
@@ -216,6 +223,12 @@ def openai_planner_model(settings: Settings, **client_options: Any) -> ChatOpenA
         max_tokens=PLANNER_MAX_OUTPUT_TOKENS,
         max_retries=PLANNER_MAX_RETRIES,
         use_responses_api=True,
+        # Set explicitly, not left at the default False. LangChain streams any call made while a
+        # streaming callback handler is attached, and LangGraph's "messages" stream mode attaches
+        # one to every model call inside the graph. An unset False loses to that; an explicit one
+        # wins. Without it the planner request goes out with "stream": true inside the graph
+        # (found by test_graph_wired.py), no longer the request the TypeScript planner sends.
+        streaming=False,
         api_key=settings.openai_api_key,
         **client_options,
     )

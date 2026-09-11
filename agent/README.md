@@ -64,6 +64,28 @@ Responses API event stream; the test checks the request, the streamed deltas, th
 usage. Scores are printed with `js_to_fixed`: Python's `f"{0.125:.2f}"` is `0.12`, JavaScript's
 `(0.125).toFixed(2)` is `0.13`.
 
+## The chat graph (step 2.3)
+
+`copilot_agent/graph.py` is the pipeline as a LangGraph graph:
+
+```
+START -> plan --route--> canned -> END                      greeting, off-topic
+                    \--> retrieve x N -> merge -> generate -> END
+```
+
+One `Send` per sub-query runs the retrievals in parallel; a reducer collects them in plan order.
+The graph emits LangGraph stream events (`updates` per node, `messages` for the answer tokens);
+nothing in it knows about HTTP. Try it end to end, and measure what the framework costs:
+
+```
+uv run python -m copilot_agent.chat_cli "how do I stream text"   # real services, about a cent
+uv run python experiments/graph_overhead.py                       # instant fakes, free
+```
+
+The planner model sets `streaming=False` explicitly and is tagged `nostream` in the graph: inside
+a graph that streams `messages`, LangChain would otherwise send the planner request with
+`"stream": true` and LangGraph would put its JSON in the answer stream.
+
 ## Running in Docker (local)
 
 From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):

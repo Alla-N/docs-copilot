@@ -42,3 +42,23 @@ def ts_default(file: str, name: str) -> float:
 )
 def test_matches_typescript(file: str, name: str, python_value: float) -> None:
     assert python_value == ts_default(file, name)
+
+
+def ts_string(file: str, name: str) -> str:
+    """Read a string constant from lib/: one literal, or several joined with +."""
+    source = (LIB / file).read_text()
+    match = re.search(rf"const {name} =\s*((?:\"(?:[^\"\\]|\\.)*\"\s*\+?\s*)+);", source)
+    assert match, f"{name} not found in lib/{file}"
+    return "".join(re.findall(r"\"((?:[^\"\\]|\\.)*)\"", match.group(1)))
+
+
+def test_greeting_matches_typescript() -> None:
+    from copilot_agent.planner import GREETING_MESSAGE
+
+    assert ts_string("plan.ts", "GREETING_MESSAGE") == GREETING_MESSAGE
+
+
+def test_refusal_matches_typescript() -> None:
+    from copilot_agent.generation import REFUSAL_MESSAGE
+
+    assert ts_string("refusal.ts", "REFUSAL_MESSAGE") == REFUSAL_MESSAGE
