@@ -111,7 +111,7 @@ capital of France")` must not return a sub-query that retrieves AI SDK chunks.
 >    stream (no model call — same mechanism as the greeting now). Adjacent questions that ARE
 >    about the SDK (fine-tuning, provider rate limits) stay `search` and let the prompt refuse
 >    on real context. The dataset marks each must-refuse case OFF-TOPIC or ADJACENT.
-> 2. **`evals/planner.ts`** (`npm run eval:planner`): 24 planner-only cases asserting intent,
+> 2. **`evals/planner.ts`** (`npm run eval:planner`): 23 planner-only cases asserting intent,
 >    sub-query count and must/must-not strings — greeting, expansion, follow-up resolution,
 >    decomposition with noise, off-topic (AWS, pricing, LangChain, poem, forged history),
 >    injection, adjacent. Runs on every CI push before the throttled suite.

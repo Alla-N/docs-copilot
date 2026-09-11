@@ -31,6 +31,24 @@ at http://127.0.0.1:8000/docs. Startup opens the database pool and exits if it c
 While the TypeScript retrieval still exists, `tests/test_ts_parity.py` keeps the calibrated
 numbers identical on both sides.
 
+## Planner (phase 2, step 2.1)
+
+`copilot_agent/planner.py` ports `planQuery()` from `lib/plan.ts` through LangChain
+(`ChatOpenAI` on the Responses API, structured output with zod's exact JSON schema). Its
+parity is checked twice:
+
+```
+# exact: the Python planner sends the TypeScript planner's request (free, runs in CI)
+npm run exp:planner-requests               # from the repo root; rewrites tests/golden/planner-requests.json
+uv run pytest tests/test_planner_request_parity.py
+
+# statistical: the planner eval on the real model, 23 cases x 5 runs (a few cents)
+uv run python evals/planner_eval.py        # compare two runs with two of: npm run eval:planner
+```
+
+The golden stores a sha256 of `lib/plan.ts` and `evals/planner-cases.ts`, so editing either
+fails the parity test until the golden is regenerated.
+
 ## Running in Docker (local)
 
 From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):

@@ -308,7 +308,7 @@ worded.
 npm test                     # unit tests: every pure function that has had a bug (~80 cases, seconds)
 npm run eval                 # 27 labelled cases × 3 generations (injection cases × 8)
 EVAL_RUNS=0 npm run eval     # retrieval-only: no answer generation (planner + embed + rerank still run — about a cent)
-npm run eval:planner         # planner-only: 24 cases on intent and sub-queries, no retrieval
+npm run eval:planner         # planner-only: 23 cases on intent and sub-queries, no retrieval
 EVAL_JUDGE=1 npm run eval    # + LLM faithfulness check per answered case
 npm run eval:calibrate       # validate that judge against known-labelled answers first
 ```
@@ -317,7 +317,7 @@ The golden set is **27 hand-labelled cases** — every one added because it was 
 passing or failing, not to pad a number (it started at 9): 5 core answerable, 6 out-of-corpus
 guardrails (4 off-topic, 2 adjacent-to-the-SDK), 8 query-understanding (terse / multi-part /
 follow-up / greeting / greeting+question / typo), and 8 prompt-injection. A separate
-**planner-only suite** (`evals/planner.ts`, 24 cases) asserts the planner's intent and
+**planner-only suite** (`evals/planner.ts`, 23 cases) asserts the planner's intent and
 sub-queries directly — that off-topic input yields no SDK-shaped query, that "it" resolves from
 history, that noise is dropped — because the main suite only sees the planner's consequences.
 Latest run (twice, on the same commit — one green run is what let `changed-7` through):

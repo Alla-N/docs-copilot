@@ -27,6 +27,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.delenv("VECTOR_CANDIDATES", raising=False)
     monkeypatch.delenv("RERANK_TOP_N", raising=False)
     monkeypatch.delenv("ENABLE_SEARCH_ENDPOINT", raising=False)
+    monkeypatch.delenv("PLANNER_MODEL", raising=False)
     return monkeypatch
 
 
@@ -108,4 +109,15 @@ def test_search_endpoint_flag_typo_fails_startup(env: pytest.MonkeyPatch) -> Non
     # A typo must stop the service, not silently read as off (or on).
     env.setenv("ENABLE_SEARCH_ENDPOINT", "ture")
     with pytest.raises(ValidationError, match="enable_search_endpoint"):
+        load()
+
+
+def test_planner_model_defaults_like_lib_plan_ts_and_reads_planner_model(
+    env: pytest.MonkeyPatch,
+) -> None:
+    assert load().planner_model == "gpt-4o-mini"
+    env.setenv("PLANNER_MODEL", "gpt-4.1-mini")
+    assert load().planner_model == "gpt-4.1-mini"
+    env.setenv("PLANNER_MODEL", "")
+    with pytest.raises(ValidationError, match="planner_model"):
         load()

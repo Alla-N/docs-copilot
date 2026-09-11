@@ -28,7 +28,7 @@ expected to hold to that, not just to keep the tests green.
 | `tests/` | Vitest: the pure functions plus the chat route's stream framing (`chat-stream.test.ts`, planner/log/model mocked); `npm test`, first CI step |
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
 | `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
-| `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval |
+| `evals/planner.ts` · `planner-cases.ts` | Planner-only eval: intent + sub-query assertions, no retrieval; the 23 cases live in `planner-cases.ts` |
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
@@ -160,6 +160,8 @@ npm run ingest / -- --write          # dry run prints the diff; --write applies 
 npx tsc --noEmit                     # typecheck (CI runs this before eval)
 pre-commit run --all-files           # the local commit gate by hand (ruff, pytest, tsc, eslint, vitest); install once: uv tool install pre-commit && pre-commit install
 cd agent && uv run pytest            # Python agent service tests
+npm run exp:planner-requests         # freeze the TS planner's exact requests into agent/tests/golden/ (free, no network); rerun after editing lib/plan.ts or evals/planner-cases.ts
+cd agent && uv run python evals/planner_eval.py   # the planner eval against the Python planner (23 x 5, a few cents)
 cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 ```

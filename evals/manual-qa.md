@@ -1,7 +1,7 @@
 # docs-copilot — manual QA question bank
 
 Type these into the running app and eyeball the answers. The eval suite already
-proves 27 automated cases (plus 24 planner-only ones); this is for the *feel* of it — fresh topics and the
+proves 27 automated cases (plus 23 planner-only ones); this is for the *feel* of it — fresh topics and the
 tricky shapes where you want to read the actual reply. Each group notes what
 "good" looks like so you can tell a real problem from a nitpick.
 

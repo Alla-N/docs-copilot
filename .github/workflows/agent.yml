@@ -6,7 +6,8 @@
 #
 # Runs only when something the Python side depends on changes: agent/, the TypeScript files
 # its tests pin (test_ts_parity.py reads lib/retrieve.ts and lib/plan.ts, test_content_hash.py
-# mirrors lib/content-hash.ts), or this file. Same list as the pre-commit pytest hook.
+# mirrors lib/content-hash.ts, test_planner_request_parity.py hashes lib/plan.ts and
+# evals/planner-cases.ts), or this file. Same list as the pre-commit pytest hook.
 
 name: agent
 
@@ -17,6 +18,7 @@ on:
       - "lib/retrieve.ts"
       - "lib/plan.ts"
       - "lib/content-hash.ts"
+      - "evals/planner-cases.ts"
       - ".github/workflows/agent.yml"
   pull_request:
     branches: [main]
@@ -25,6 +27,7 @@ on:
       - "lib/retrieve.ts"
       - "lib/plan.ts"
       - "lib/content-hash.ts"
+      - "evals/planner-cases.ts"
       - ".github/workflows/agent.yml"
   workflow_dispatch:
 
