@@ -13,10 +13,15 @@ the same settings as the service. For each request it prints the moments the cli
 Request 1 pays for cold connections (OpenAI, Cohere, the pooler); the medians are over the
 rest, and are what the warm service in production looks like. chat_cli.py measures the same
 pipeline cold, in a fresh process each time, which is the number to compare with.
+
+Every request is a new conversation (its own thread id), so the numbers stay comparable with
+the ones measured before the checkpointer: no history grows between requests. The threads stay
+in the checkpoint tables (a few KiB each).
 """
 
 import argparse
 import json
+import secrets
 import statistics
 import time
 
@@ -32,7 +37,8 @@ def one_request(client: httpx.Client, url: str, question: str) -> dict[str, floa
     def mark(name: str) -> None:
         marks.setdefault(name, (time.perf_counter() - started) * 1000)
 
-    with client.stream("POST", f"{url}/chat", json={"question": question}) as response:
+    body = {"thread_id": "latency-" + secrets.token_hex(8), "question": question}
+    with client.stream("POST", f"{url}/chat", json=body) as response:
         response.raise_for_status()
         mark("headers")
         for line in response.iter_lines():

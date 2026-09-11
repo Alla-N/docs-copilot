@@ -93,7 +93,7 @@ async def direct(model: GenericFakeChatModel) -> str:
 async def main() -> None:
     model = fresh_model()
     graph = build_graph(planner=PLANNER, search=search, model=model)
-    state = {"question": "q", "history": []}
+    state = {"question": "q"}
 
     async def invoke() -> str:
         return (await graph.ainvoke(state))["answer"]

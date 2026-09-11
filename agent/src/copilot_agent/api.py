@@ -7,10 +7,14 @@
 Settings are read then, not at import time (the same rule as get_settings()), so a test can
 import this module without any secrets set.
 
-The Next.js route stays the public front door: it rate-limits, parses the useChat request and
-verifies the signed history (invariants 8 and 9), then (step 2.6) forwards {question, history}
-here and passes the stream back. So /chat trusts its caller's parsing but not its identity:
-every paid route needs the shared AGENT_API_KEY.
+The Next.js route stays the public front door: it rate-limits and parses the useChat request
+(invariant 9), then (step 2.6) forwards {thread_id, question} here and passes the stream back.
+So /chat trusts its caller's parsing but not its identity: every paid route needs the shared
+AGENT_API_KEY.
+
+History does not come in the request at all (step 2.5): the thread id names a conversation the
+checkpointer keeps, and the turns before the question are read from there (graph.py,
+history.py). A request carrying a `history` field is a 422.
 """
 
 import asyncio
@@ -22,11 +26,14 @@ from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.sse import EventSourceResponse, ServerSentEvent
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.types import Durability
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, StringConstraints
 
 from copilot_agent import ui_stream
+from copilot_agent.checkpoint import open_checkpointer
 from copilot_agent.graph import ChatGraph, openai_chat_graph
-from copilot_agent.planner import HistoryTurn
+from copilot_agent.history import MAX_CHARS_PER_MESSAGE
 from copilot_agent.retrieval import RetrievalMode, RetrievedChunk, SearchDocs, open_search
 from copilot_agent.settings import Settings, get_settings
 from copilot_agent.signing import sign_assistant_text
@@ -34,18 +41,16 @@ from copilot_agent.signing import sign_assistant_text
 # The shape of open_search(): given settings, an async context manager yielding a search.
 # create_app() takes one so tests can hand it a fake that opens nothing and costs nothing.
 OpenSearch = Callable[[Settings], AbstractAsyncContextManager[SearchDocs]]
-# The shape of openai_chat_graph(): the graph around a search. Tests pass fake models.
-BuildGraph = Callable[[Settings, SearchDocs], ChatGraph]
+# The shape of open_checkpointer(): given settings, an async context manager yielding a saver.
+OpenCheckpointer = Callable[[Settings], AbstractAsyncContextManager[BaseCheckpointSaver]]
+# The shape of openai_chat_graph(): the graph around a search and a saver. Tests pass fakes.
+BuildGraph = Callable[[Settings, SearchDocs, BaseCheckpointSaver], ChatGraph]
 
-# lib/chat-request.ts caps (invariant 9); tests/test_ts_parity.py pins them. The route truncates
-# to these and sends at most MAX_MESSAGES turns including the question, so what it forwards
-# always fits. (TypeScript counts UTF-16 units, Python code points, and a code point is never
-# more units than one, so the Python count is never the larger.) /search rejects instead of
+# The caps of lib/chat-request.ts (invariant 9) live in history.py since the history moved
+# server-side. The route cuts the question to MAX_CHARS_PER_MESSAGE, so what it forwards always
+# fits. (TypeScript counts UTF-16 units, Python code points, and a code point is never more
+# units than one, so the Python count is never the larger.) /search rejects instead of
 # truncating, so what you sent is what ran.
-MAX_MESSAGES = 20
-MAX_CHARS_PER_MESSAGE = 4000
-MAX_TOTAL_CHARS = 24000
-MAX_TEXT_CHARS = MAX_CHARS_PER_MESSAGE
 
 
 def _not_blank(value: str) -> str:
@@ -93,33 +98,29 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
 
 
-class ChatTurn(BaseModel):
-    """One earlier turn, as the Next.js route hands it over: text only, already verified."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    role: Literal["user", "assistant"]
-    text: Text
+# The conversation's key. The Next.js route forwards useChat's chat id (2.6): 16 characters of
+# the AI SDK's alphabet by default, random per chat. It is the only thing that ties a request to
+# a conversation, so it is a bearer capability: whoever has it continues that conversation. The
+# format check keeps it a plain key everywhere it goes (logs, SQL parameters, Langfuse) and
+# rules out short ones anybody could hit by accident; it cannot tell a random id from a chosen
+# one, and a client that picks a guessable id only shares its own conversation.
+THREAD_ID_PATTERN = r"^[A-Za-z0-9_-]{16,64}$"
+ThreadId = Annotated[str, StringConstraints(pattern=THREAD_ID_PATTERN)]
 
 
 class ChatRequest(BaseModel):
-    """What the Next.js route forwards: the question and the turns before it.
+    """What the Next.js route forwards: the conversation's thread id and the new question.
 
-    Not the useChat body. Parsing that (parts, signatures, caps) stays in TypeScript, in front
-    of the rate limiter's decision; this model only refuses what the route would never send.
+    Not the useChat body. Parsing that stays in TypeScript, in front of the rate limiter's
+    decision. No history: the turns before the question are the thread's (history.py), and with
+    extra="forbid" a request that tries to supply them is a 422, so there is no assistant text
+    a client could forge or replay from another conversation.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    thread_id: ThreadId
     question: Text
-    history: list[ChatTurn] = Field(default_factory=list, max_length=MAX_MESSAGES - 1)
-
-    @model_validator(mode="after")
-    def _total_within_cap(self) -> "ChatRequest":
-        total = len(self.question) + sum(len(turn.text) for turn in self.history)
-        if total > MAX_TOTAL_CHARS:
-            raise ValueError(f"question and history exceed {MAX_TOTAL_CHARS} characters")
-        return self
 
 
 # ---- dependencies -------------------------------------------------------------------------
@@ -142,8 +143,13 @@ def get_signer(request: Request) -> Callable[[str], str]:
     return request.app.state.sign
 
 
+def get_durability(request: Request) -> Durability:
+    return request.app.state.durability
+
+
 Graph = Annotated[ChatGraph, Depends(get_graph)]
 Signer = Annotated[Callable[[str], str], Depends(get_signer)]
+DurabilityMode = Annotated[Durability, Depends(get_durability)]
 
 
 def require_key(key: SecretStr) -> Callable[..., None]:
@@ -244,7 +250,9 @@ def ui_message_stream_headers(response: Response) -> None:
     response_class=EventSourceResponse,
     dependencies=[Depends(ui_message_stream_headers)],
 )
-async def chat(body: ChatRequest, graph: Graph, sign: Signer) -> AsyncIterator[ServerSentEvent]:
+async def chat(
+    body: ChatRequest, graph: Graph, sign: Signer, durability: DurabilityMode
+) -> AsyncIterator[ServerSentEvent]:
     """Run the chat graph on one question and stream the answer as the AI SDK's UI message
     stream, so useChat can read it (ui_stream.py has the protocol and the chunk order).
 
@@ -256,15 +264,14 @@ async def chat(body: ChatRequest, graph: Graph, sign: Signer) -> AsyncIterator[S
     A closed tab cancels the run: uvicorn reports ASGI spec 2.3, so Starlette watches for
     http.disconnect next to the body and cancels it, FastAPI cancels this generator, and
     in_own_task turns that into one cancel of the graph run, wherever it is (the planner, the
-    searches, the model's stream).
+    searches, the model's stream). A cancelled turn is not recorded in the thread.
     """
     parts = graph.astream(
-        {
-            "question": body.question,
-            "history": [HistoryTurn(turn.role, turn.text) for turn in body.history],
-        },
+        {"question": body.question},
+        {"configurable": {"thread_id": body.thread_id}},
         stream_mode=["updates", "messages"],
         version="v2",
+        durability=durability,
     )
     parts = in_own_task(parts)
     chunks = ui_stream.ui_message_chunks(parts, message_id=ui_stream.new_message_id(), sign=sign)
@@ -310,6 +317,7 @@ def create_app(
     settings: Settings | None = None,
     *,
     search_factory: OpenSearch = open_search,
+    checkpointer_factory: OpenCheckpointer = open_checkpointer,
     graph_factory: BuildGraph = openai_chat_graph,
 ) -> FastAPI:
     if settings is None:
@@ -322,15 +330,20 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        # Runs once around the whole life of the server: open the pool and clients before
-        # the first request, close them after the last. If opening fails, the server exits.
-        async with search_factory(settings) as search_docs:
+        # Runs once around the whole life of the server: open the pools and clients before
+        # the first request, close them after the last. If opening fails, the server exits,
+        # and that includes a checkpoint database that is not set up (checkpoint.py).
+        async with (
+            search_factory(settings) as search_docs,
+            checkpointer_factory(settings) as checkpointer,
+        ):
             app.state.search = search_docs
-            app.state.graph = graph_factory(settings, search_docs)
+            app.state.graph = graph_factory(settings, search_docs, checkpointer)
             yield
 
     app = FastAPI(title="docs-copilot agent", lifespan=lifespan)
     app.state.sign = partial(sign_assistant_text, secret=signing_secret.get_secret_value())
+    app.state.durability = settings.checkpoint_durability
     paid = [Depends(require_key(api_key))]
     app.include_router(router)
     app.include_router(chat_router, dependencies=paid)

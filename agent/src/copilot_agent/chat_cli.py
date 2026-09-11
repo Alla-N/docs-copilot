@@ -1,8 +1,11 @@
 """Run the whole Python pipeline on one question, streaming, against the real services.
 
     uv run python -m copilot_agent.chat_cli "how do I stream text"
-    uv run python -m copilot_agent.chat_cli "and how do I configure it?" \
-        --history user "how do I stream text" --history assistant "Use streamText (Source 1)."
+    uv run python -m copilot_agent.chat_cli "and how do I configure it?" --thread <id it printed>
+
+Each run is one turn of a conversation kept in Postgres by the checkpointer (checkpoint.py; the
+tables must be set up). Without --thread it starts a new conversation and prints its id; pass
+that id to continue it, the way the chat UI's follow-ups do.
 
 Prints each graph step as it finishes (the plan, every retrieval, the merged sources), streams
 the answer's tokens as they arrive, then the timings: time to the first token as the CALLER sees
@@ -15,11 +18,12 @@ and the answer (about a cent). Local only, like search_cli: nothing here is a se
 import argparse
 import asyncio
 import logging
+import secrets
 import time
 from typing import Any
 
+from copilot_agent.checkpoint import open_checkpointer
 from copilot_agent.graph import openai_chat_graph
-from copilot_agent.planner import HistoryTurn
 from copilot_agent.retrieval import open_search
 from copilot_agent.settings import get_settings
 
@@ -31,9 +35,8 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
         print(f"{at} plan: {plan.intent}  {[q.query for q in plan.queries]}")
     elif node == "retrieve":
         for r in update["retrievals"]:
-            stages = "  ".join(f"{k} {v:.0f}" for k, v in r.result.timings_ms.items())
-            kept = len(r.result.relevant)
-            print(f"{at} retrieve: {r.result.mode}, {kept} kept  ({stages})  {r.query}")
+            stages = "  ".join(f"{k} {v:.0f}" for k, v in r.timings_ms.items())
+            print(f"{at} retrieve: {r.mode}, {len(r.relevant)} kept  ({stages})  {r.query}")
     elif node == "merge":
         print(f"{at} merge: {update['mode']}, {update['rerank_calls']} rerank calls")
         for chunk in update["relevant"]:
@@ -42,16 +45,21 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
         print(f"{at} canned reply, mode {update['mode']}:\n\n{update['answer']}")
 
 
-async def run(question: str, history: list[HistoryTurn]) -> None:
+async def run(question: str, thread_id: str) -> None:
     settings = get_settings()
-    async with open_search(settings) as search:
-        graph = openai_chat_graph(settings, search)
+    async with open_search(settings) as search, open_checkpointer(settings) as saver:
+        graph = openai_chat_graph(settings, search, saver)
+        config = {"configurable": {"thread_id": thread_id}}
+        before = (await graph.aget_state(config)).values.get("turns", [])
+        print(f"thread {thread_id}: {len(before)} earlier messages")
         started = time.perf_counter()
         first_token: float | None = None
         async for part in graph.astream(
-            {"question": question, "history": history},
+            {"question": question},
+            config,
             stream_mode=["updates", "messages"],
             version="v2",
+            durability=settings.checkpoint_durability,
         ):
             if part["type"] == "messages":
                 message, metadata = part["data"]
@@ -80,17 +88,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("question")
     parser.add_argument(
-        "--history",
-        nargs=2,
-        action="append",
-        default=[],
-        metavar=("ROLE", "TEXT"),
-        help="an earlier turn (user or assistant); repeat for more",
+        "--thread", help="continue this conversation (the id an earlier run printed)"
     )
     args = parser.parse_args()
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
-    history = [HistoryTurn(role, text) for role, text in args.history]
-    asyncio.run(run(args.question, history))
+    asyncio.run(run(args.question, args.thread or "cli-" + secrets.token_hex(8)))
 
 
 if __name__ == "__main__":

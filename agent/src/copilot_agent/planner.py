@@ -194,6 +194,12 @@ class Plan:
     # What the planner call cost, for the query log. NO_USAGE on the fallback, as in TypeScript.
     usage: TokenUsage
 
+    def __post_init__(self) -> None:
+        # A tuple, however the Plan was built. The checkpointer stores state as msgpack, which has
+        # no tuple type, and rebuilds a Plan by calling it with the stored fields: without this a
+        # Plan read back from a thread carries a list (tests/test_checkpoint.py found it).
+        object.__setattr__(self, "queries", tuple(self.queries))
+
 
 @dataclass(frozen=True)
 class HistoryTurn:
@@ -276,7 +282,7 @@ _JS_WHITESPACE = (
 )
 
 
-def _js_trim(text: str) -> str:
+def js_trim(text: str) -> str:
     return text.strip(_JS_WHITESPACE)
 
 
@@ -318,7 +324,7 @@ async def plan_query(
         return Plan(intent="off-topic", queries=(), usage=usage)
 
     queries = tuple(
-        SubQuery(query=_js_trim(q.query), hypothetical=_js_trim(q.hypothetical))
+        SubQuery(query=js_trim(q.query), hypothetical=js_trim(q.hypothetical))
         for q in output.queries
     )
     queries = tuple(q for q in queries if q.query)[:MAX_SUB_QUERIES]

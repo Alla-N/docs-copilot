@@ -32,6 +32,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.delenv("MAX_OUTPUT_TOKENS", raising=False)
     monkeypatch.delenv("AGENT_API_KEY", raising=False)
     monkeypatch.delenv("ASSISTANT_SIGNING_SECRET", raising=False)
+    monkeypatch.delenv("CHECKPOINT_DURABILITY", raising=False)
     return monkeypatch
 
 
@@ -165,3 +166,14 @@ def test_a_short_agent_key_fails_startup_without_echoing_it(
     with pytest.raises(ValidationError, match="at least 32") as error:
         load()
     assert short not in str(error.value)
+
+
+def test_checkpoints_are_saved_once_per_run_by_default(env: pytest.MonkeyPatch) -> None:
+    # The measured choice (settings.py): one save per turn instead of one per step.
+    assert load().checkpoint_durability == "exit"
+
+
+def test_durability_is_one_of_langgraphs_three(env: pytest.MonkeyPatch) -> None:
+    env.setenv("CHECKPOINT_DURABILITY", "sometimes")
+    with pytest.raises(ValidationError):
+        load()

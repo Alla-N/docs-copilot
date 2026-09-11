@@ -20,7 +20,8 @@ import pytest
 from fastapi import FastAPI
 
 from copilot_agent import api
-from copilot_agent.api import MAX_TEXT_CHARS, create_app
+from copilot_agent.api import create_app
+from copilot_agent.history import MAX_CHARS_PER_MESSAGE as MAX_TEXT_CHARS
 from copilot_agent.retrieval import RetrievalResult, RetrievedChunk
 from copilot_agent.settings import Settings
 
@@ -51,9 +52,15 @@ def make_settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **(values | overrides))
 
 
-def no_graph(settings: Settings, search: Any) -> Any:
+def no_graph(settings: Settings, search: Any, checkpointer: Any) -> Any:
     """The graph factory for these tests: /chat is tested in test_chat_api.py."""
     return None
+
+
+@asynccontextmanager
+async def no_checkpointer(settings: Settings) -> AsyncIterator[None]:
+    """The checkpointer factory for these tests: nothing here reads a thread."""
+    yield None
 
 
 class FakeSearch:
@@ -134,7 +141,10 @@ def factory(fake: FakeSearch) -> FakeFactory:
 async def client(factory: FakeFactory) -> AsyncIterator[httpx.AsyncClient]:
     """A client for an app WITH /search enabled, lifespan running."""
     app = create_app(
-        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+        make_settings(enable_search_endpoint=True),
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
     )
     async with serve(app) as client:
         client.headers.update(AUTH)
@@ -153,7 +163,12 @@ async def test_health_is_ok_and_calls_nothing(client: httpx.AsyncClient, fake: F
 
 async def test_lifespan_opens_search_once_and_closes_it(factory: FakeFactory) -> None:
     settings = make_settings()
-    app = create_app(settings, search_factory=factory, graph_factory=no_graph)
+    app = create_app(
+        settings,
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
+    )
     assert factory.events == []  # building the app opens nothing; startup does
 
     async with serve(app) as client:
@@ -170,10 +185,31 @@ async def test_startup_fails_when_search_cannot_open(factory: FakeFactory) -> No
     # The real open_search() raises here when the pool cannot connect (pool.open(wait=True)).
     # The error must stop startup, so the service never answers /health without a database.
     factory.fail_on_open = OSError("connection refused")
-    app = create_app(make_settings(), search_factory=factory, graph_factory=no_graph)
+    app = create_app(
+        make_settings(),
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
+    )
     with pytest.raises(OSError, match="connection refused"):
         async with serve(app):
             pass
+
+
+async def test_startup_fails_when_the_checkpoint_database_is_not_ready(
+    factory: FakeFactory,
+) -> None:
+    # The real open_checkpointer() raises when the tables are missing, behind the saver's
+    # migrations, or have Row Level Security off (checkpoint.readiness_problems).
+    savers = FakeFactory(None)  # type: ignore[arg-type]
+    savers.fail_on_open = RuntimeError("checkpoint database not ready: tables missing")
+    app = create_app(
+        make_settings(), search_factory=factory, checkpointer_factory=savers, graph_factory=no_graph
+    )
+    with pytest.raises(RuntimeError, match="not ready"):
+        async with serve(app):
+            pass
+    assert factory.events == ["open", "close"]  # what opened before it is closed again
 
 
 def test_create_app_without_arguments_reads_settings_then(
@@ -181,7 +217,9 @@ def test_create_app_without_arguments_reads_settings_then(
 ) -> None:
     # `uvicorn --factory copilot_agent.api:create_app` calls create_app() with no arguments.
     monkeypatch.setattr(api, "get_settings", lambda: make_settings(enable_search_endpoint=True))
-    app = create_app(search_factory=factory, graph_factory=no_graph)
+    app = create_app(
+        search_factory=factory, graph_factory=no_graph, checkpointer_factory=no_checkpointer
+    )
     assert "/search" in app.openapi()["paths"]
 
 
@@ -191,7 +229,12 @@ def test_create_app_without_arguments_reads_settings_then(
 async def test_search_route_does_not_exist_unless_enabled(
     factory: FakeFactory, fake: FakeSearch
 ) -> None:
-    app = create_app(make_settings(), search_factory=factory, graph_factory=no_graph)
+    app = create_app(
+        make_settings(),
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
+    )
     async with serve(app) as client:
         response = await client.post("/search", json={"query": "how do I stream text"})
     assert response.status_code == 404
@@ -212,7 +255,10 @@ async def test_search_needs_the_agent_key_too(
     factory: FakeFactory, fake: FakeSearch, headers: dict[str, str]
 ) -> None:
     app = create_app(
-        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+        make_settings(enable_search_endpoint=True),
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
     )
     async with serve(app) as client:
         response = await client.post("/search", json={"query": "q"}, headers=headers)
@@ -309,7 +355,10 @@ async def test_unexpected_error_is_a_bare_500(factory: FakeFactory, fake: FakeSe
     # anything, an upstream message quoting a key included. uvicorn logs the traceback.
     fake.error = RuntimeError("upstream said: sk-leaked-key")
     app = create_app(
-        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+        make_settings(enable_search_endpoint=True),
+        search_factory=factory,
+        graph_factory=no_graph,
+        checkpointer_factory=no_checkpointer,
     )
     async with serve(app, raise_app_exceptions=False) as client:
         response = await client.post("/search", json={"query": "q"}, headers=AUTH)

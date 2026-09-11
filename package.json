@@ -26,7 +26,8 @@
     "exp:sweep": "tsx --env-file=.env.local scripts/experiments/threshold-sweep.ts",
     "exp:golden": "tsx --env-file=.env.local scripts/experiments/retrieval-golden.ts",
     "exp:planner-requests": "tsx --env-file=.env.local scripts/experiments/planner-requests.ts",
-    "exp:generation-requests": "tsx --env-file=.env.local scripts/experiments/generation-requests.ts"
+    "exp:generation-requests": "tsx --env-file=.env.local scripts/experiments/generation-requests.ts",
+    "exp:history-caps": "tsx --env-file=.env.local scripts/experiments/history-caps.ts"
   },
   "dependencies": {
     "@ai-sdk/cohere": "^4.0.14",

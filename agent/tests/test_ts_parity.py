@@ -66,11 +66,12 @@ def test_refusal_matches_typescript() -> None:
 
 @pytest.mark.parametrize("name", ["MAX_MESSAGES", "MAX_CHARS_PER_MESSAGE", "MAX_TOTAL_CHARS"])
 def test_chat_caps_match_typescript(name: str) -> None:
-    # POST /chat refuses what lib/chat-request.ts would never forward (invariant 9). A cap
-    # raised on the TypeScript side only would turn long conversations into 422s.
-    from copilot_agent import api
+    # The thread's history is capped as lib/chat-request.ts caps a request (invariant 9), and
+    # POST /chat refuses a question the route would never forward. A cap changed on one side
+    # only would change what the model reads, or turn long questions into 422s.
+    from copilot_agent import history
 
-    assert getattr(api, name) == ts_default("chat-request.ts", name)
+    assert getattr(history, name) == ts_default("chat-request.ts", name)
 
 
 def test_signature_version_matches_typescript() -> None:

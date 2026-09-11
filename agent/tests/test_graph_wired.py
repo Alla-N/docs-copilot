@@ -82,7 +82,7 @@ async def test_only_the_answer_streams_and_the_state_is_complete() -> None:
         streamed: list[tuple[str, str]] = []
         final: dict[str, Any] = {}
         async for part in graph.astream(
-            {"question": "how do I stream text", "history": []},
+            {"question": "how do I stream text"},
             stream_mode=["messages", "values"],
             version="v2",
         ):
@@ -135,6 +135,6 @@ async def test_an_answer_cut_off_by_the_token_cap_finishes_with_length() -> None
             search=search,
             model=openai_generation_model(settings, http_async_client=client),
         )
-        final = await graph.ainvoke({"question": "how do I stream text", "history": []})
+        final = await graph.ainvoke({"question": "how do I stream text"})
     assert final["answer"] == ANSWER
     assert final["generation"].finish_reason == "length"

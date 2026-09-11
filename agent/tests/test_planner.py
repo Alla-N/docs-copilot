@@ -23,7 +23,7 @@ from copilot_agent.planner import (
     PlanOutput,
     SubQuery,
     TokenUsage,
-    _js_trim,
+    js_trim,
     plan_query,
     planner_messages,
 )
@@ -199,7 +199,7 @@ async def test_cancellation_is_not_a_failure() -> None:
     ],
 )
 def test_trim_matches_javascript(raw: str, trimmed: str) -> None:
-    assert _js_trim(raw) == trimmed
+    assert js_trim(raw) == trimmed
 
 
 def test_the_validation_model_matches_the_wire_schema() -> None:

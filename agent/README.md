@@ -27,7 +27,8 @@ curl http://127.0.0.1:8000/health         # {"status":"ok"}; liveness, calls not
 
 KEY=$(grep '^AGENT_API_KEY=' ../.env.local | cut -d= -f2)
 curl -N http://127.0.0.1:8000/chat -H "authorization: Bearer $KEY" \
-  -H 'content-type: application/json' -d '{"question": "how do I stream text"}'
+  -H 'content-type: application/json' \
+  -d '{"thread_id": "curl-thread-00001", "question": "how do I stream text"}'
 
 # POST /search exists only with ENABLE_SEARCH_ENDPOINT set: it spends embed + rerank credits.
 ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload
@@ -36,7 +37,8 @@ curl -s http://127.0.0.1:8000/search -H "authorization: Bearer $KEY" \
 ```
 
 Add `"embed_text": "..."` to embed a HyDE hypothetical instead of the query. Interactive docs
-at http://127.0.0.1:8000/docs. Startup opens the database pool and exits if it cannot connect.
+at http://127.0.0.1:8000/docs. Startup opens the database pools and exits if it cannot connect,
+or if the checkpoint tables are not set up (see Conversation state below).
 
 While the TypeScript retrieval still exists, `tests/test_ts_parity.py` keeps the calibrated
 numbers identical on both sides.
@@ -98,10 +100,10 @@ a graph that streams `messages`, LangChain would otherwise send the planner requ
 
 ## POST /chat (step 2.4)
 
-Body: `{"question": "...", "history": [{"role": "user" | "assistant", "text": "..."}]}`, what the
-Next.js route will forward in step 2.6 after it has rate-limited, parsed and verified the
-request (the caps of `lib/chat-request.ts` apply, pinned by `tests/test_ts_parity.py`). The
-response is the AI SDK's UI message stream, so `useChat` can read it unchanged:
+Body: `{"thread_id": "...", "question": "..."}`, what the Next.js route will forward in step 2.6
+after it has rate-limited and parsed the request. Since step 2.5 there is no `history` field (it
+is a 422): the turns before the question come from the thread (next section). The response is
+the AI SDK's UI message stream, so `useChat` can read it unchanged:
 
 ```
 data: {"type":"start","messageId":"..."}
@@ -129,6 +131,63 @@ data: [DONE]
   them to the real `Chat` client and compares the message with the TypeScript route's for the
   same scenario. After changing the stream: `UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py`,
   then `npm test`, and commit the goldens.
+
+## Conversation state (step 2.5)
+
+The graph is compiled with LangGraph's `AsyncPostgresSaver` on the same Supabase database, and
+each conversation is a thread: `thread_id` in the request, `{"configurable": {"thread_id": ...}}`
+in the run's config. The history the planner and the model read comes from the thread, never
+from the caller, so there is no client-supplied assistant text to forge or replay.
+
+```
+uv run python -m copilot_agent.checkpoint setup    # once per database: tables, migrations, RLS on
+uv run python -m copilot_agent.checkpoint check    # what the service checks at startup
+uv run python -m copilot_agent.chat_cli "how do I stream text"                    # prints a thread id
+uv run python -m copilot_agent.chat_cli "and how do I configure it?" --thread <id>
+```
+
+- **A turn is recorded only when it completes.** The last node (`canned` or `generate`) appends
+  the question and the answer together; a failed or cancelled turn (Stop, a closed tab) leaves
+  the thread unchanged. TypeScript keeps a stopped turn's question in the client's history
+  (it drops only the unsigned partial answer), so that turn is a named difference.
+- **Per-turn state is reset each turn** (`graph.turn_reset`). A checkpointed thread starts from
+  the state the last turn left: the append reducer on `retrievals` otherwise merged turn 1's
+  chunks into turn 2's answer.
+- **The caps of `lib/chat-request.ts` apply to the stored turns** (`history.py`). The golden
+  `tests/golden/history-caps.json` is written by the real `parseChatRequest`
+  (`npm run exp:history-caps`) and `tests/test_history.py` compares. The thread stores only the
+  last 19 messages, the most a request can read.
+- **The tables are created from a terminal, never at startup**, with Row Level Security on:
+  the saver creates them in `public`, which the Supabase Data API serves to the anon key. The
+  service refuses to start if they are missing, behind the saver's migrations, or unlocked.
+- **Strict serializer** (`checkpoint.serializer`): only LangGraph's safe types and the classes
+  `ChatState` is made of are rebuilt from a blob. A class it does not allow comes back as raw
+  data and one that fails to rebuild as `None`, silently: changing `HistoryTurn` changes how
+  existing threads load.
+- **`CHECKPOINT_DURABILITY`** (`sync`, `async`, `exit`) sets when LangGraph saves; the turns come
+  out the same in all three. Default `exit`: a run is never resumed halfway, so saving after
+  every step bought nothing. Measured with `experiments/checkpoint_overhead.py` (Supabase, 24
+  turns per mode, 2 repeats), per turn:
+
+  | durability | rows | stored | first token (vs none) | whole run (vs none) |
+  |---|---|---|---|---|
+  | sync | 33 | 25.3 KiB | +1.04 to 1.14 s | +1.3 to 1.4 s |
+  | async | 33 | 25.3 KiB | +90 to 130 ms | +1.2 s |
+  | exit | 7 | 9.3 KiB | +90 ms | +220 to 240 ms |
+
+  The first token pays for reading the thread; with `exit` the one save comes after the answer's
+  `finish` chunk and before `[DONE]`.
+- **Stored retrievals are slim.** The first measurement stored 216 KiB per turn (76 KiB after
+  compression), 213 of it the 100 candidate texts per sub-query, which nothing after the reranker
+  reads, and every next turn read them back before its first token. `SubQueryRetrieval` now
+  keeps the kept chunks, the mode, whether a rerank call went out, and the timings.
+- **The replay gap is closed on this path.** Signing (invariant 8) proved an assistant turn was
+  written by this server, not that it belongs to this conversation, so a signed answer could be
+  replayed as history elsewhere. With history read from the thread, no assistant text comes from
+  the client at all. What it creates instead: the thread id is a bearer capability (whoever has
+  it continues the conversation).
+- **Known gap:** two requests on one thread at the same moment both start from the same
+  checkpoint and one turn is lost (pinned by a test). useChat never does this.
 
 ## Running in Docker (local)
 

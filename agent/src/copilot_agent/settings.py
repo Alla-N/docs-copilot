@@ -11,6 +11,7 @@ file is simply skipped and the environment provides everything.
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, field_validator
@@ -66,6 +67,18 @@ class Settings(BaseSettings):
     # ASSISTANT_SIGNING_SECRET: the SAME secret the Next.js route verifies history with
     # (lib/assistant-signature.ts). Python signs the answers it generates (signing.py).
     assistant_signing_secret: SecretStr | None = None
+
+    # When LangGraph saves a /chat run's checkpoints (step 2.5): "sync" after every step, before
+    # the next starts; "async" after every step, while the next runs (LangGraph's default);
+    # "exit" once, when the run ends (a failed or cancelled one included). The thread's turns come
+    # out the same in all three (tests/test_graph.py runs the failure and cancel cases on each).
+    # "exit", because a run is never resumed halfway (a new question discards an unfinished one),
+    # so the per-step saves buy nothing. Measured on Supabase (experiments/checkpoint_overhead.py,
+    # 2026-09-11, 24 turns per mode, 2 repeats): per turn, exit wrote 7 rows and 9.3 KiB stored,
+    # sync and async 33 rows and 25.3 KiB; before the first token exit added about 90 ms (reading
+    # the thread), async 90 to 130 ms, sync about 1.1 s; to the end of the run exit added about
+    # 230 ms, async about 1.2 s (its saves queue behind one lock in the saver).
+    checkpoint_durability: Literal["sync", "async", "exit"] = "exit"
 
     # POST /search spends embed + rerank credits on every call, and invariant 2 forbids a paid
     # public endpoint. So the route is only REGISTERED when this is true (api.create_app): a

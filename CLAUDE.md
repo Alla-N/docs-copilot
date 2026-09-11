@@ -87,6 +87,11 @@ expected to hold to that, not just to keep the tests green.
    startup); verifying stays in TypeScript, in front of it. The eval suite cannot see this
    layer (the harness builds its own history and never crosses the route), so
    `tests/chat-request.test.ts` and `tests/assistant-signature.test.ts` are the only guard.
+   Since step 2.5 the Python service takes NO history from its caller: `POST /chat` gets a
+   thread id and the question (a `history` field is a 422), and the turns come from the thread
+   the LangGraph checkpointer keeps. There is no client-supplied assistant text left to forge or
+   replay on that path. Signing stays for the TypeScript route, which still reads client history
+   until 2.6 forwards to Python.
 9. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
    is never an accepted role; caps 20 msgs / 4k chars / 24k total — the total cap trims the
    OLDEST turns (it once dropped the newest and 400'd). Malformed JSON is a 400. Never
@@ -109,6 +114,20 @@ expected to hold to that, not just to keep the tests green.
     (its status is already 200; an early `start` would leave an empty bubble), and
     `tests/python-stream-contract.test.ts` checks the real client builds the same message from
     the Python bytes as from this route, for six scenarios.
+13. **Conversation state lives in the thread, one COMPLETE turn at a time.** (Python service,
+   step 2.5.) Only the last node of a turn (`canned` or `generate`) writes `turns`, question and
+   answer together, so a failed or cancelled turn (Stop, a closed tab) leaves the thread as it
+   was. A checkpointed thread starts each turn from the state the last one left, so every
+   per-turn key a turn may not overwrite is reset by the plan node (`graph.turn_reset`):
+   without it the append reducer on `retrievals` grounded turn 2 on turn 1's chunks and showed
+   them as its sources (reproduced, now `tests/test_graph.py`). The history the planner and the
+   model read is capped exactly as `lib/chat-request.ts` caps a request (`history.py`, pinned to
+   the real `parseChatRequest` by a golden file). The checkpoint tables are created by
+   `python -m copilot_agent.checkpoint setup` from a terminal, never at startup, with Row Level
+   Security on (the saver puts them in `public`, which the Supabase Data API exposes), and the
+   service refuses to start unless they are migrated and locked down. Checkpoint blobs are read
+   back through a strict serializer (`checkpoint.serializer`): LangGraph's default imports and
+   calls any class a blob names.
 
 ## How to change things here
 
@@ -171,12 +190,16 @@ pre-commit run --all-files           # the local commit gate by hand (ruff, pyte
 cd agent && uv run pytest            # Python agent service tests
 npm run exp:planner-requests         # freeze the TS planner's exact requests into agent/tests/golden/ (free, no network); rerun after editing lib/plan.ts or evals/planner-cases.ts
 cd agent && uv run python evals/planner_eval.py   # the planner eval against the Python planner (23 x 5, a few cents)
-cd agent && uv run python -m copilot_agent.chat_cli "how do I stream text"   # the whole Python pipeline on one question, streamed (about a cent)
+cd agent && uv run python -m copilot_agent.chat_cli "how do I stream text"   # the whole Python pipeline on one question, streamed (about a cent); prints a thread id, pass --thread <id> to ask a follow-up
 cd agent && uv run python experiments/graph_overhead.py   # LangGraph overhead vs plain async code, instant fakes (free)
 npm run exp:generation-requests      # same for the answer step (streamText request + a canned stream); rerun after editing lib/generation.ts, lib/retrieve.ts or lib/refusal.ts
 cd agent && uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000 (needs AGENT_API_KEY + ASSISTANT_SIGNING_SECRET; add ENABLE_SEARCH_ENDPOINT=1 for /search)
 cd agent && uv run python experiments/chat_latency.py "how do I stream text"   # warm /chat timings against a running service: headers, start, first token, total (about a cent per run)
 cd agent && UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py   # rewrite the golden /chat streams after changing the stream; then npm test (the contract test reads them)
+cd agent && uv run python -m copilot_agent.checkpoint setup   # create/migrate LangGraph's checkpoint tables + turn RLS on (once per database; `check` only reports)
+npm run exp:history-caps             # freeze what parseChatRequest keeps of a conversation into agent/tests/golden/ (free, no network); rerun after editing lib/chat-request.ts
+cd agent && uv run python experiments/checkpoint_overhead.py   # checkpointer cost per turn (time, rows, bytes) per durability, database only (free)
+cd agent && uv run pytest -m integration tests/test_checkpoint_live.py   # the saver on the real database: round trip, and the Data API roles see no rows (free)
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 ```
 
@@ -203,7 +226,8 @@ docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars o
 
 ## Out of scope — decided, not forgotten
 
-ReAct / tool-calling loops belong to Artifact 2, not here. Server-side sessions (forged
-assistant *text* is still client-supplied) is the real fix for history, deferred.
+ReAct / tool-calling loops belong to Artifact 2, not here. Server-side sessions, the real
+fix for client-supplied history, exist on the Python side since step 2.5 (the checkpointer); the
+TypeScript route keeps reading signed client history until 2.6 forwards to Python.
 Content-defined chunk boundaries would remove the ~14× re-ingest write amplification;
 deferred until an eval proves retrieval survives it.
