@@ -1,0 +1,20 @@
+data: {"type":"start","messageId":"PyGoldenMessage1"}
+
+data: {"type":"data-retrieval","data":{"mode":"reranked","intent":"search"}}
+
+data: {"type":"start-step"}
+
+data: {"type":"text-start","id":"answer"}
+
+data: {"type":"text-delta","id":"answer","delta":"I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help."}
+
+data: {"type":"text-end","id":"answer"}
+
+data: {"type":"finish-step"}
+
+data: {"type":"data-signature","data":{"sig":"v1.Azrvy3SUSaNWCYlUTMyd5m0Nh-w58Cwrv-nDH9FoeRM"}}
+
+data: {"type":"finish","finishReason":"stop"}
+
+data: [DONE]
+

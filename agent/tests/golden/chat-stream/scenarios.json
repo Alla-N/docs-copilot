@@ -1,0 +1,106 @@
+{
+  "about": "Written by agent/tests/test_chat_api.py (UPDATE_GOLDEN=1). Read by tests/python-stream-contract.test.ts. Do not edit by hand.",
+  "signingSecret": "test-signing-secret",
+  "messageId": "PyGoldenMessage1",
+  "scenarios": [
+    {
+      "id": "answered",
+      "question": "how do I stream text and pick a model?",
+      "intent": "search",
+      "subQueries": [
+        "How do I stream text?",
+        "How do I choose a model?"
+      ],
+      "relevant": [
+        {
+          "content": "Chunk 1 of the docs.",
+          "title": "Page 1",
+          "source_url": "https://ai-sdk.dev/docs/page-1",
+          "score": 0.79
+        },
+        {
+          "content": "Chunk 2 of the docs.",
+          "title": "Page 2",
+          "source_url": "https://ai-sdk.dev/docs/page-2",
+          "score": 0.76
+        },
+        {
+          "content": "Chunk 3 of the docs.",
+          "title": "Page 1",
+          "source_url": "https://ai-sdk.dev/docs/page-1",
+          "score": 0.71
+        }
+      ],
+      "deltas": [
+        "Use `streamText` (Source 1).",
+        "\n\n",
+        "Quotes \"like this\", a \\ backslash, {braces}, `code`, café — ✓   🚀",
+        " Pick a model (Source 2)."
+      ],
+      "failure": "none"
+    },
+    {
+      "id": "greeting",
+      "question": "hi",
+      "intent": "greeting",
+      "subQueries": [],
+      "relevant": [],
+      "deltas": [],
+      "failure": "none"
+    },
+    {
+      "id": "off-topic",
+      "question": "how do I deploy to AWS?",
+      "intent": "off-topic",
+      "subQueries": [],
+      "relevant": [],
+      "deltas": [],
+      "failure": "none"
+    },
+    {
+      "id": "no-context",
+      "question": "what is the airspeed of a swallow in the SDK?",
+      "intent": "search",
+      "subQueries": [
+        "What is the airspeed of a swallow in the SDK?"
+      ],
+      "relevant": [],
+      "deltas": [
+        "I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help."
+      ],
+      "failure": "none"
+    },
+    {
+      "id": "error-mid-answer",
+      "question": "how do I stream text?",
+      "intent": "search",
+      "subQueries": [
+        "How do I stream text?"
+      ],
+      "relevant": [
+        {
+          "content": "Chunk 1 of the docs.",
+          "title": "Page 1",
+          "source_url": "https://ai-sdk.dev/docs/page-1",
+          "score": 0.76
+        }
+      ],
+      "deltas": [
+        "Use ",
+        "streamText"
+      ],
+      "failure": "model"
+    },
+    {
+      "id": "retrieval-fails",
+      "question": "how do I stream text?",
+      "intent": "search",
+      "subQueries": [
+        "How do I stream text?"
+      ],
+      "relevant": [],
+      "deltas": [],
+      "failure": "retrieval"
+    }
+  ]
+}

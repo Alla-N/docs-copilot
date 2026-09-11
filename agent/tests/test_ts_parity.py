@@ -62,3 +62,18 @@ def test_refusal_matches_typescript() -> None:
     from copilot_agent.generation import REFUSAL_MESSAGE
 
     assert ts_string("refusal.ts", "REFUSAL_MESSAGE") == REFUSAL_MESSAGE
+
+
+@pytest.mark.parametrize("name", ["MAX_MESSAGES", "MAX_CHARS_PER_MESSAGE", "MAX_TOTAL_CHARS"])
+def test_chat_caps_match_typescript(name: str) -> None:
+    # POST /chat refuses what lib/chat-request.ts would never forward (invariant 9). A cap
+    # raised on the TypeScript side only would turn long conversations into 422s.
+    from copilot_agent import api
+
+    assert getattr(api, name) == ts_default("chat-request.ts", name)
+
+
+def test_signature_version_matches_typescript() -> None:
+    from copilot_agent.signing import VERSION
+
+    assert ts_string("assistant-signature.ts", "VERSION") == VERSION

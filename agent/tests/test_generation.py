@@ -9,6 +9,7 @@ from copilot_agent.generation import (
     NO_CONTEXT,
     REFUSAL_MESSAGE,
     build_system_prompt,
+    finish_reason,
     generation_messages,
     js_to_fixed,
     openai_generation_model,
@@ -99,3 +100,24 @@ def test_model_settings_follow_settings() -> None:
     model = openai_generation_model(settings(generation_model="gpt-4.1-mini", max_output_tokens=77))
     assert (model.model_name, model.max_tokens) == ("gpt-4.1-mini", 77)
     assert (model.temperature, model.streaming, model.use_responses_api) == (0, True, True)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        pytest.param({"status": "completed"}, "stop", id="completed"),
+        pytest.param({}, "stop", id="no-metadata"),
+        pytest.param({"incomplete_details": None}, "stop", id="null-details"),
+        pytest.param(
+            {"status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}},
+            "length",
+            id="max-output-tokens",
+        ),
+        pytest.param(
+            {"incomplete_details": {"reason": "content_filter"}}, "content-filter", id="filter"
+        ),
+        pytest.param({"incomplete_details": {"reason": "something_new"}}, "other", id="unknown"),
+    ],
+)
+def test_finish_reason_maps_like_ai_sdk_openai(metadata: dict, expected: str) -> None:
+    assert finish_reason(metadata) == expected

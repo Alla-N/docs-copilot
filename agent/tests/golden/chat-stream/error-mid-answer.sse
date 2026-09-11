@@ -1,0 +1,18 @@
+data: {"type":"start","messageId":"PyGoldenMessage1"}
+
+data: {"type":"data-retrieval","data":{"mode":"reranked","intent":"search"}}
+
+data: {"type":"data-sources","data":[{"id":1,"title":"Page 1","url":"https://ai-sdk.dev/docs/page-1","score":0.76,"chunks":[1]}]}
+
+data: {"type":"start-step"}
+
+data: {"type":"text-start","id":"answer"}
+
+data: {"type":"text-delta","id":"answer","delta":"Use "}
+
+data: {"type":"text-delta","id":"answer","delta":"streamText"}
+
+data: {"type":"error","errorText":"Stream failed"}
+
+data: [DONE]
+

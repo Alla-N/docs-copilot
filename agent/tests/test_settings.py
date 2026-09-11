@@ -30,6 +30,8 @@ def env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.delenv("PLANNER_MODEL", raising=False)
     monkeypatch.delenv("GENERATION_MODEL", raising=False)
     monkeypatch.delenv("MAX_OUTPUT_TOKENS", raising=False)
+    monkeypatch.delenv("AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("ASSISTANT_SIGNING_SECRET", raising=False)
     return monkeypatch
 
 
@@ -135,3 +137,31 @@ def test_generation_settings_default_like_lib_generation_ts(env: pytest.MonkeyPa
         env.setenv("MAX_OUTPUT_TOKENS", bad)
         with pytest.raises(ValidationError, match="max_output_tokens"):
             load()
+
+
+def test_service_secrets_are_optional_here(env: pytest.MonkeyPatch) -> None:
+    # The CLIs run without them; api.create_app refuses to start without them
+    # (test_chat_api.py::test_the_service_does_not_start_without_its_secrets).
+    settings = load()
+    assert settings.agent_api_key is None
+    assert settings.assistant_signing_secret is None
+
+
+def test_service_secrets_load_as_secrets(env: pytest.MonkeyPatch) -> None:
+    env.setenv("AGENT_API_KEY", "a" * 32)
+    env.setenv("ASSISTANT_SIGNING_SECRET", "shared-with-next")
+    settings = load()
+    assert settings.agent_api_key is not None
+    assert settings.agent_api_key.get_secret_value() == "a" * 32
+    assert settings.assistant_signing_secret is not None
+    assert "shared-with-next" not in repr(settings)
+
+
+@pytest.mark.parametrize("short", ["changeme", "a" * 31])
+def test_a_short_agent_key_fails_startup_without_echoing_it(
+    env: pytest.MonkeyPatch, short: str
+) -> None:
+    env.setenv("AGENT_API_KEY", short)
+    with pytest.raises(ValidationError, match="at least 32") as error:
+        load()
+    assert short not in str(error.value)

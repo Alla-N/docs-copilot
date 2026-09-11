@@ -61,13 +61,17 @@ def default_models(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(name, raising=False)
 
 
-async def test_only_the_answer_streams_and_the_state_is_complete() -> None:
-    settings = Settings(
+def make_settings() -> Settings:
+    return Settings(
         _env_file=None,
         openai_api_key="sk-test-not-real",
         cohere_api_key="co-test-not-real",
         database_url="postgresql://u:p@aws-0-eu-west-1.pooler.supabase.com:5432/postgres",
     )
+
+
+async def test_only_the_answer_streams_and_the_state_is_complete() -> None:
+    settings = make_settings()
     openai = FakeOpenAI()
     async with httpx2.AsyncClient(transport=httpx2.MockTransport(openai)) as client:
         graph = build_graph(
@@ -96,3 +100,41 @@ async def test_only_the_answer_streams_and_the_state_is_complete() -> None:
     assert final["answer"] == ANSWER
     assert final["generation"].usage == TokenUsage(input_tokens=1234, output_tokens=56)
     assert final["generation"].ttft_ms is not None
+    assert final["generation"].finish_reason == "stop"
+
+
+# The golden stream's last event, rewritten the way OpenAI ends a response that hit
+# max_output_tokens: event response.incomplete, status incomplete, and the reason.
+INCOMPLETE_STREAM = (
+    STREAM.replace("event: response.completed", "event: response.incomplete")
+    .replace('"type":"response.completed"', '"type":"response.incomplete"')
+    .replace(
+        '"object":"response","created_at":1789137600,"status":"completed"',
+        '"object":"response","created_at":1789137600,"status":"incomplete",'
+        '"incomplete_details":{"reason":"max_output_tokens"}',
+    )
+)
+
+
+async def test_an_answer_cut_off_by_the_token_cap_finishes_with_length() -> None:
+    # Where LangChain puts incomplete_details is read in its source (langchain_openai 1.6.2);
+    # this runs the real parser on the event OpenAI sends, so a move there shows up here.
+    assert INCOMPLETE_STREAM.count("max_output_tokens") == 1
+    settings = make_settings()
+
+    def reply(request: httpx2.Request) -> httpx2.Response:
+        if "text" in json.loads(request.content):
+            return httpx2.Response(200, json=PLANNER_REPLY)
+        return httpx2.Response(
+            200, content=INCOMPLETE_STREAM.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    async with httpx2.AsyncClient(transport=httpx2.MockTransport(reply)) as client:
+        graph = build_graph(
+            planner=build_planner(openai_planner_model(settings, http_async_client=client)),
+            search=search,
+            model=openai_generation_model(settings, http_async_client=client),
+        )
+        final = await graph.ainvoke({"question": "how do I stream text", "history": []})
+    assert final["answer"] == ANSWER
+    assert final["generation"].finish_reason == "length"

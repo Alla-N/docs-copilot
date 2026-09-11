@@ -1,32 +1,64 @@
-"""The agent service's HTTP surface. Phase 1: GET /health and a local-only POST /search.
+"""The agent service's HTTP surface: GET /health, POST /chat, and a local-only POST /search.
 
     cd agent
-    ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload
+    uv run uvicorn --factory copilot_agent.api:create_app --reload
 
 --factory: uvicorn calls create_app() at startup instead of importing a module-level `app`.
 Settings are read then, not at import time (the same rule as get_settings()), so a test can
 import this module without any secrets set.
 
-Phase 2 adds POST /chat here. The Next.js route stays the public front door either way.
+The Next.js route stays the public front door: it rate-limits, parses the useChat request and
+verifies the signed history (invariants 8 and 9), then (step 2.6) forwards {question, history}
+here and passes the stream back. So /chat trusts its caller's parsing but not its identity:
+every paid route needs the shared AGENT_API_KEY.
 """
 
+import asyncio
+import hmac
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
-from typing import Annotated, Literal
+from functools import partial
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Depends, FastAPI, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from copilot_agent import ui_stream
+from copilot_agent.graph import ChatGraph, openai_chat_graph
+from copilot_agent.planner import HistoryTurn
 from copilot_agent.retrieval import RetrievalMode, RetrievedChunk, SearchDocs, open_search
 from copilot_agent.settings import Settings, get_settings
+from copilot_agent.signing import sign_assistant_text
 
 # The shape of open_search(): given settings, an async context manager yielding a search.
 # create_app() takes one so tests can hand it a fake that opens nothing and costs nothing.
 OpenSearch = Callable[[Settings], AbstractAsyncContextManager[SearchDocs]]
+# The shape of openai_chat_graph(): the graph around a search. Tests pass fake models.
+BuildGraph = Callable[[Settings, SearchDocs], ChatGraph]
 
-# The chat route's per-message cap (MAX_CHARS_PER_MESSAGE in lib/chat-request.ts, invariant 9).
-# The route truncates; this debug endpoint rejects instead, so what you sent is what ran.
-MAX_TEXT_CHARS = 4000
+# lib/chat-request.ts caps (invariant 9); tests/test_ts_parity.py pins them. The route truncates
+# to these and sends at most MAX_MESSAGES turns including the question, so what it forwards
+# always fits. (TypeScript counts UTF-16 units, Python code points, and a code point is never
+# more units than one, so the Python count is never the larger.) /search rejects instead of
+# truncating, so what you sent is what ran.
+MAX_MESSAGES = 20
+MAX_CHARS_PER_MESSAGE = 4000
+MAX_TOTAL_CHARS = 24000
+MAX_TEXT_CHARS = MAX_CHARS_PER_MESSAGE
+
+
+def _not_blank(value: str) -> str:
+    # Empty or whitespace-only. Rejected, not stripped: the reranker must see exactly the text
+    # that was sent. (No min_length=1 as well: this check covers it, and a mutation run showed a
+    # second check for the same thing is one no test can pin.)
+    if not value.strip():
+        raise ValueError("must not be blank")
+    return value
+
+
+# A text field of any request here: within the per-message cap, and not blank.
+Text = Annotated[str, Field(max_length=MAX_CHARS_PER_MESSAGE), AfterValidator(_not_blank)]
 
 
 # ---- request and response models ----------------------------------------------------------
@@ -37,18 +69,8 @@ class SearchRequest(BaseModel):
     # spelling) would otherwise run a plain search while you believe HyDE text was used.
     model_config = ConfigDict(extra="forbid")
 
-    query: str = Field(max_length=MAX_TEXT_CHARS)
-    embed_text: str | None = Field(default=None, max_length=MAX_TEXT_CHARS)
-
-    @field_validator("query", "embed_text")
-    @classmethod
-    def _not_blank(cls, value: str | None) -> str | None:
-        # Empty or whitespace-only. Rejected, not stripped: the reranker must see exactly the
-        # text that was sent. (No min_length=1 as well: this check covers it, and a mutation
-        # run showed a second check for the same thing is one no test can pin.)
-        if value is not None and not value.strip():
-            raise ValueError("must not be blank")
-        return value
+    query: Text
+    embed_text: Text | None = None
 
 
 class CandidateOut(BaseModel):
@@ -71,6 +93,35 @@ class HealthResponse(BaseModel):
     status: Literal["ok"]
 
 
+class ChatTurn(BaseModel):
+    """One earlier turn, as the Next.js route hands it over: text only, already verified."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    text: Text
+
+
+class ChatRequest(BaseModel):
+    """What the Next.js route forwards: the question and the turns before it.
+
+    Not the useChat body. Parsing that (parts, signatures, caps) stays in TypeScript, in front
+    of the rate limiter's decision; this model only refuses what the route would never send.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: Text
+    history: list[ChatTurn] = Field(default_factory=list, max_length=MAX_MESSAGES - 1)
+
+    @model_validator(mode="after")
+    def _total_within_cap(self) -> "ChatRequest":
+        total = len(self.question) + sum(len(turn.text) for turn in self.history)
+        if total > MAX_TOTAL_CHARS:
+            raise ValueError(f"question and history exceed {MAX_TOTAL_CHARS} characters")
+        return self
+
+
 # ---- dependencies -------------------------------------------------------------------------
 
 
@@ -81,6 +132,37 @@ def get_search(request: Request) -> SearchDocs:
 
 
 Search = Annotated[SearchDocs, Depends(get_search)]
+
+
+def get_graph(request: Request) -> ChatGraph:
+    return request.app.state.graph
+
+
+def get_signer(request: Request) -> Callable[[str], str]:
+    return request.app.state.sign
+
+
+Graph = Annotated[ChatGraph, Depends(get_graph)]
+Signer = Annotated[Callable[[str], str], Depends(get_signer)]
+
+
+def require_key(key: SecretStr) -> Callable[..., None]:
+    """A dependency that lets a request through only with "Authorization: Bearer <key>".
+
+    Compared in constant time, like verifyAssistantText. It runs before the body is VALIDATED
+    and before any paid work, but after FastAPI has read and JSON-decoded the body: malformed
+    JSON is a 422 even without a key. That leaks only that the route exists.
+    """
+    expected = key.get_secret_value().encode()
+
+    def check(authorization: Annotated[str | None, Header()] = None) -> None:
+        scheme, _, token = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not hmac.compare_digest(token.encode(), expected):
+            raise HTTPException(
+                status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Bearer"}
+            )
+
+    return check
 
 
 # ---- routes -------------------------------------------------------------------------------
@@ -98,6 +180,97 @@ async def health() -> HealthResponse:
     wait=True, so a service that cannot reach the database never starts serving at all.
     """
     return HealthResponse(status="ok")
+
+
+chat_router = APIRouter()
+
+# Strong references to graph runs still unwinding after their stream ended. asyncio keeps only
+# weak references to tasks, and a pending task nobody references can be garbage collected.
+_unwinding: set[asyncio.Task[None]] = set()
+
+
+async def in_own_task(parts: AsyncIterator[Any]) -> AsyncIterator[Any]:
+    """Iterate `parts` (a graph run) in a separate asyncio task, and cancel that task ONCE when
+    the consumer stops early.
+
+    Why: FastAPI runs an SSE endpoint's generator in an anyio task group, and a disconnect
+    cancels it through an anyio cancel scope. anyio cancellation is level-triggered: every await
+    inside a cancelled scope raises CancelledError again. LangGraph unwinds a cancelled run by
+    creating a task that cancels the running nodes and awaiting it (AsyncPregelLoop.__aexit__);
+    inside the cancelled scope that await is cancelled at once, which cancels the unwinding task
+    before it starts, and the nodes are never told. Found by the disconnect tests in
+    tests/test_chat_api.py: after a disconnect the search kept running. A canary test there pins
+    the mechanism, so it shows when LangGraph handles this itself.
+
+    In its own task the run sees one plain task.cancel(), which is what LangGraph handles.
+    """
+    queue: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue(maxsize=1)
+
+    async def pump() -> None:
+        try:
+            async for part in parts:
+                await queue.put((True, part))
+            await queue.put((False, None))
+        except Exception as exc:  # handed to the consumer, which raises it
+            await queue.put((False, exc))
+
+    task = asyncio.create_task(pump())
+    _unwinding.add(task)
+    task.add_done_callback(_unwinding.discard)
+    try:
+        while True:
+            is_part, value = await queue.get()
+            if is_part:
+                yield value
+            elif isinstance(value, BaseException):
+                raise value
+            else:
+                return
+    finally:
+        # Not awaited: inside a cancelled scope the await would be cancelled too. The run
+        # unwinds in its own task, and _unwinding keeps it alive until it has.
+        task.cancel()
+
+
+def ui_message_stream_headers(response: Response) -> None:
+    """Add the AI SDK's stream header. A dependency, because it has to run BEFORE the endpoint:
+    the body of a generator endpoint only starts once the response (headers included) has been
+    built, so a header set there is silently dropped. The header test caught exactly that."""
+    response.headers.update(ui_stream.UI_MESSAGE_STREAM_HEADERS)
+
+
+@chat_router.post(
+    "/chat",
+    response_class=EventSourceResponse,
+    dependencies=[Depends(ui_message_stream_headers)],
+)
+async def chat(body: ChatRequest, graph: Graph, sign: Signer) -> AsyncIterator[ServerSentEvent]:
+    """Run the chat graph on one question and stream the answer as the AI SDK's UI message
+    stream, so useChat can read it (ui_stream.py has the protocol and the chunk order).
+
+    EventSourceResponse (FastAPI's own SSE support) runs this generator in a producer task,
+    inserts a ": ping" comment after 15 s of silence (the AI SDK's parser skips comments), and
+    sets the no-cache and no-buffering headers. The status is 200 from the first byte on, so a
+    failure after that travels as an error chunk (ui_stream.ui_message_chunks).
+
+    A closed tab cancels the run: uvicorn reports ASGI spec 2.3, so Starlette watches for
+    http.disconnect next to the body and cancels it, FastAPI cancels this generator, and
+    in_own_task turns that into one cancel of the graph run, wherever it is (the planner, the
+    searches, the model's stream).
+    """
+    parts = graph.astream(
+        {
+            "question": body.question,
+            "history": [HistoryTurn(turn.role, turn.text) for turn in body.history],
+        },
+        stream_mode=["updates", "messages"],
+        version="v2",
+    )
+    parts = in_own_task(parts)
+    chunks = ui_stream.ui_message_chunks(parts, message_id=ui_stream.new_message_id(), sign=sign)
+    async for chunk in chunks:
+        yield ServerSentEvent(raw_data=ui_stream.encode(chunk))
+    yield ServerSentEvent(raw_data=ui_stream.DONE)
 
 
 search_router = APIRouter()
@@ -125,11 +298,27 @@ async def search(body: SearchRequest, search_docs: Search) -> SearchResponse:
 # ---- the app ------------------------------------------------------------------------------
 
 
+def _required(value: SecretStr | None, name: str) -> SecretStr:
+    if value is None:
+        raise RuntimeError(
+            f"{name} is not set. The service will not start without it: see agent/README.md."
+        )
+    return value
+
+
 def create_app(
-    settings: Settings | None = None, *, search_factory: OpenSearch = open_search
+    settings: Settings | None = None,
+    *,
+    search_factory: OpenSearch = open_search,
+    graph_factory: BuildGraph = openai_chat_graph,
 ) -> FastAPI:
     if settings is None:
         settings = get_settings()
+    # Fail at startup, like the TypeScript signing module in a deployment: without the key a
+    # paid route would be open, and without the secret every answer would be unsigned, so the
+    # next request would silently drop it from the history.
+    api_key = _required(settings.agent_api_key, "AGENT_API_KEY")
+    signing_secret = _required(settings.assistant_signing_secret, "ASSISTANT_SIGNING_SECRET")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -137,11 +326,16 @@ def create_app(
         # the first request, close them after the last. If opening fails, the server exits.
         async with search_factory(settings) as search_docs:
             app.state.search = search_docs
+            app.state.graph = graph_factory(settings, search_docs)
             yield
 
     app = FastAPI(title="docs-copilot agent", lifespan=lifespan)
+    app.state.sign = partial(sign_assistant_text, secret=signing_secret.get_secret_value())
+    paid = [Depends(require_key(api_key))]
     app.include_router(router)
+    app.include_router(chat_router, dependencies=paid)
     # Invariant 2: a paid route is registered only when asked for. No flag, no route (404).
+    # And, like /chat, it needs the key.
     if settings.enable_search_endpoint:
-        app.include_router(search_router)
+        app.include_router(search_router, dependencies=paid)
     return app

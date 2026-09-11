@@ -1,7 +1,8 @@
 # agent/ - docs-copilot Python agent service
 
-The Python half of docs-copilot v2. Phase 1 ports retrieval (`search_docs`) from
-`lib/retrieve.ts`; later phases add the LangGraph orchestrator behind `POST /chat`.
+The Python half of docs-copilot v2: retrieval (`search_docs`, ported from `lib/retrieve.ts`),
+the planner and answer generation through LangChain, the pipeline as a LangGraph graph, and
+`POST /chat`, which streams the answer in the AI SDK's UI message stream protocol.
 
 Managed with [uv](https://docs.astral.sh/uv/). Python 3.13 (`.python-version`).
 
@@ -15,14 +16,23 @@ uv run ruff format .      # format
 
 ## Running the service (local)
 
+The service reads two secrets besides the API keys, and refuses to start without either:
+`AGENT_API_KEY` (every paid route wants `Authorization: Bearer <key>`; at least 32 characters,
+`openssl rand -hex 32`) and `ASSISTANT_SIGNING_SECRET` (the Next.js app's, so the history it
+verifies accepts the answers Python signs). Put both in the repo-root `.env.local`.
+
 ```
 uv run uvicorn --factory copilot_agent.api:create_app --reload
 curl http://127.0.0.1:8000/health         # {"status":"ok"}; liveness, calls nothing
 
+KEY=$(grep '^AGENT_API_KEY=' ../.env.local | cut -d= -f2)
+curl -N http://127.0.0.1:8000/chat -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"question": "how do I stream text"}'
+
 # POST /search exists only with ENABLE_SEARCH_ENDPOINT set: it spends embed + rerank credits.
 ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload
-curl -s http://127.0.0.1:8000/search -H 'content-type: application/json' \
-  -d '{"query": "how do I stream text"}'
+curl -s http://127.0.0.1:8000/search -H "authorization: Bearer $KEY" \
+  -H 'content-type: application/json' -d '{"query": "how do I stream text"}'
 ```
 
 Add `"embed_text": "..."` to embed a HyDE hypothetical instead of the query. Interactive docs
@@ -86,6 +96,40 @@ The planner model sets `streaming=False` explicitly and is tagged `nostream` in 
 a graph that streams `messages`, LangChain would otherwise send the planner request with
 `"stream": true` and LangGraph would put its JSON in the answer stream.
 
+## POST /chat (step 2.4)
+
+Body: `{"question": "...", "history": [{"role": "user" | "assistant", "text": "..."}]}`, what the
+Next.js route will forward in step 2.6 after it has rate-limited, parsed and verified the
+request (the caps of `lib/chat-request.ts` apply, pinned by `tests/test_ts_parity.py`). The
+response is the AI SDK's UI message stream, so `useChat` can read it unchanged:
+
+```
+data: {"type":"start","messageId":"..."}
+data: {"type":"data-retrieval","data":{"mode":"reranked","intent":"search"}}
+data: {"type":"data-sources","data":[...one pill per page...]}
+data: {"type":"start-step"}  ...text-start, text-delta x N, text-end, finish-step...
+data: {"type":"data-signature","data":{"sig":"v1...."}}
+data: {"type":"finish","finishReason":"stop"}
+data: [DONE]
+```
+
+- `copilot_agent/ui_stream.py` is the protocol and the adapter from graph events; the chunks
+  are plain dicts, because the client's schema is strict (an extra key or a `null` kills the
+  whole stream).
+- `start` waits for the first data part: a failure during planning or retrieval then sends one
+  error chunk and no message, where an early `start` would leave an empty bubble.
+- A closed tab cancels the run. The graph runs in its own asyncio task (`api.in_own_task`):
+  FastAPI cancels an SSE generator through an anyio cancel scope, and inside one LangGraph's
+  unwinding is cut short and the running node is never cancelled (pinned by a canary test).
+- `uv run python experiments/chat_latency.py "how do I stream text"` times sequential requests
+  against a running service (headers, `start`, first token, `[DONE]`); request 1 is cold, the
+  medians are over the rest.
+- `tests/test_chat_api.py` writes the exact bytes of six scenarios to
+  `tests/golden/chat-stream/`; `tests/python-stream-contract.test.ts` (Vitest, repo root) feeds
+  them to the real `Chat` client and compares the message with the TypeScript route's for the
+  same scenario. After changing the stream: `UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py`,
+  then `npm test`, and commit the goldens.
+
 ## Running in Docker (local)
 
 From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):
@@ -94,7 +138,7 @@ From the repo root (the build context is `agent/`, so `.env.local` is never sent
 docker build -t copilot-agent agent
 
 docker run --rm --name copilot-agent -p 127.0.0.1:8000:8000 \
-  --env-file <(grep -E '^(OPENAI_API_KEY|COHERE_API_KEY|DATABASE_URL)=' .env.local) \
+  --env-file <(grep -E '^(OPENAI_API_KEY|COHERE_API_KEY|DATABASE_URL|AGENT_API_KEY|ASSISTANT_SIGNING_SECRET)=' .env.local) \
   copilot-agent
 curl http://127.0.0.1:8000/health          # {"status":"ok"}
 docker stop copilot-agent                  # SIGTERM: the lifespan closes the pool
@@ -103,11 +147,12 @@ docker stop copilot-agent                  # SIGTERM: the lifespan closes the po
 Add `-e ENABLE_SEARCH_ENDPOINT=1` before the image name to get `POST /search`.
 
 - **No secrets in the image.** They arrive as environment variables at `docker run`, and only
-  the three the service reads. Not `--env-file .env.local`: that would also hand the
-  container the Upstash token and the signing secret, and Docker's env-file is not dotenv, so
+  the five the service reads. Not `--env-file .env.local`: that would also hand the
+  container the Upstash token and the IP salt, and Docker's env-file is not dotenv, so
   a quoted value keeps its quotes.
 - **`-p 127.0.0.1:8000:8000`, not `-p 8000:8000`.** The short form publishes on every
-  interface of the Mac, and `/search` spends credits. Inside the container uvicorn binds
+  interface of the Mac, and `/chat` and `/search` spend credits (the key guards them, the
+  loopback bind keeps them off the network as well). Inside the container uvicorn binds
   `0.0.0.0` on purpose: Docker's port forward does not reach the container's own loopback.
 - **Runs as uid 999, not root**, and cannot modify its own virtualenv.
 - **A dead database fails startup** after psycopg's 10 s pool timeout, and the container exits.

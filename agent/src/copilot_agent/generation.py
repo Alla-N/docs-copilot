@@ -15,8 +15,9 @@ model.ainvoke() streams under the hood, and LangGraph's "messages" stream mode (
 forwards those tokens to the client from inside a graph node.
 """
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from decimal import ROUND_HALF_UP, Decimal
+from typing import Any, Literal
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -144,3 +145,27 @@ def openai_generation_model(settings: Settings, **client_options: object) -> Cha
         api_key=settings.openai_api_key,
         **client_options,
     )
+
+
+# The AI SDK's unified finish reasons that a Responses API answer without tools can end with.
+# The UI message stream's `finish` chunk carries one (uiMessageChunkSchema lists the values).
+FinishReason = Literal["stop", "length", "content-filter", "other"]
+
+
+def finish_reason(response_metadata: Mapping[str, Any]) -> FinishReason:
+    """Why the answer ended, mapped the way @ai-sdk/openai 4.0.7 maps it.
+
+    mapOpenAIResponseFinishReason reads the response's incomplete_details.reason: none means the
+    response completed ("stop"), max_output_tokens means the MAX_OUTPUT_TOKENS cap cut the answer
+    off ("length"), content_filter is "content-filter", anything else "other". LangChain keeps
+    incomplete_details in the final chunk's response_metadata, and only when it is set.
+    """
+    details = response_metadata.get("incomplete_details")
+    reason = details.get("reason") if isinstance(details, Mapping) else None
+    if reason is None:
+        return "stop"
+    if reason == "max_output_tokens":
+        return "length"
+    if reason == "content_filter":
+        return "content-filter"
+    return "other"

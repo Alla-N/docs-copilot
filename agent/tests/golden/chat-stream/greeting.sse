@@ -1,0 +1,16 @@
+data: {"type":"start","messageId":"PyGoldenMessage1"}
+
+data: {"type":"data-retrieval","data":{"mode":"skipped","intent":"greeting"}}
+
+data: {"type":"text-start","id":"canned"}
+
+data: {"type":"text-delta","id":"canned","delta":"Hi! I answer questions about the Vercel AI SDK documentation — things like streaming text, tool calling, embeddings, or migrating to v7. What would you like to know?"}
+
+data: {"type":"text-end","id":"canned"}
+
+data: {"type":"data-signature","data":{"sig":"v1.XFfE-fIG0M98CdjM4udPVH610uCrwpoieTwnUKnbros"}}
+
+data: {"type":"finish"}
+
+data: [DONE]
+

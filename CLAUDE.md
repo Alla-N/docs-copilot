@@ -25,7 +25,7 @@ expected to hold to that, not just to keep the tests green.
 | `lib/rate-limit.ts` | Upstash sliding windows; fails OPEN when unconfigured (local dev) |
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
-| `tests/` | Vitest: the pure functions plus the chat route's stream framing (`chat-stream.test.ts`, planner/log/model mocked); `npm test`, first CI step |
+| `tests/` | Vitest: the pure functions plus the chat route's stream framing (`chat-stream.test.ts`, planner/log/model mocked) and the Python stream contract (`python-stream-contract.test.ts`); `npm test`, first CI step |
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
 | `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
 | `evals/planner.ts` · `planner-cases.ts` | Planner-only eval: intent + sub-query assertions, no retrieval; the 23 cases live in `planner-cases.ts` |
@@ -47,6 +47,9 @@ expected to hold to that, not just to keep the tests green.
    The Python service (`agent/`) too: its `POST /search` spends embed + rerank credits, so
    `create_app` registers it only when `ENABLE_SEARCH_ENDPOINT` is set, which no deployment
    sets. `GET /health` is liveness only and calls nothing. `tests/test_api.py` guards both.
+   Its `POST /chat` is the product route, so it exists, but every paid route requires
+   `Authorization: Bearer $AGENT_API_KEY` (constant-time compare), and `create_app` refuses to
+   start without the key. `tests/test_chat_api.py` guards it.
 3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
    retrieval inside `evals/` — a copy drifts, and drifts toward passing.
@@ -79,7 +82,9 @@ expected to hold to that, not just to keep the tests green.
    assistant turn whose text does not match its signature, BEFORE the caps are applied —
    verification runs on the text as streamed, which is what was signed. Never accept an
    unsigned assistant turn "just for dev": `ASSISTANT_SIGNING_SECRET` falls back to a constant
-   locally and the module throws in a deployment without it. The eval suite cannot see this
+   locally and the module throws in a deployment without it. The Python service signs the
+   answers IT generates with the same scheme and secret (`agent/.../signing.py`, required at
+   startup); verifying stays in TypeScript, in front of it. The eval suite cannot see this
    layer (the harness builds its own history and never crosses the route), so
    `tests/chat-request.test.ts` and `tests/assistant-signature.test.ts` are the only guard.
 9. **Requests are parsed-then-constructed.** Only `role` + text parts are read; `system`
@@ -99,7 +104,11 @@ expected to hold to that, not just to keep the tests green.
     pushes the message under a provisional id, and a later `start` (the merged generation
     stream sends one unless `sendStart: false`) renames it and pushes it a SECOND time —
     which is exactly the duplicate empty bubble Day 15 shipped. `tests/chat-stream.test.ts`
-    asserts it on both the answered and the canned path.
+    asserts it on both the answered and the canned path. The Python stream (`ui_stream.py`)
+    holds `start` back until its first data part, so a failure before it opens no message
+    (its status is already 200; an early `start` would leave an empty bubble), and
+    `tests/python-stream-contract.test.ts` checks the real client builds the same message from
+    the Python bytes as from this route, for six scenarios.
 
 ## How to change things here
 
@@ -165,7 +174,9 @@ cd agent && uv run python evals/planner_eval.py   # the planner eval against the
 cd agent && uv run python -m copilot_agent.chat_cli "how do I stream text"   # the whole Python pipeline on one question, streamed (about a cent)
 cd agent && uv run python experiments/graph_overhead.py   # LangGraph overhead vs plain async code, instant fakes (free)
 npm run exp:generation-requests      # same for the answer step (streamText request + a canned stream); rerun after editing lib/generation.ts, lib/retrieve.ts or lib/refusal.ts
-cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000
+cd agent && uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000 (needs AGENT_API_KEY + ASSISTANT_SIGNING_SECRET; add ENABLE_SEARCH_ENDPOINT=1 for /search)
+cd agent && uv run python experiments/chat_latency.py "how do I stream text"   # warm /chat timings against a running service: headers, start, first token, total (about a cent per run)
+cd agent && UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py   # rewrite the golden /chat streams after changing the stream; then npm test (the contract test reads them)
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 ```
 

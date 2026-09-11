@@ -18,9 +18,8 @@ import logging
 import time
 from typing import Any
 
-from copilot_agent.generation import openai_generation_model
-from copilot_agent.graph import build_graph
-from copilot_agent.planner import HistoryTurn, build_planner, openai_planner_model
+from copilot_agent.graph import openai_chat_graph
+from copilot_agent.planner import HistoryTurn
 from copilot_agent.retrieval import open_search
 from copilot_agent.settings import get_settings
 
@@ -46,11 +45,7 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
 async def run(question: str, history: list[HistoryTurn]) -> None:
     settings = get_settings()
     async with open_search(settings) as search:
-        graph = build_graph(
-            planner=build_planner(openai_planner_model(settings)),
-            search=search,
-            model=openai_generation_model(settings),
-        )
+        graph = openai_chat_graph(settings, search)
         started = time.perf_counter()
         first_token: float | None = None
         async for part in graph.astream(

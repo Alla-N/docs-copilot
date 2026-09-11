@@ -25,6 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 # so psycopg must be told not to create them (prepare_threshold=None).
 TRANSACTION_POOLER_PORT = 6543
 
+MIN_AGENT_API_KEY_LENGTH = 32
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -55,6 +57,16 @@ class Settings(BaseSettings):
     generation_model: str = Field(default="gpt-4o-mini", min_length=1)
     max_output_tokens: int = Field(default=1024, ge=1, le=16384)
 
+    # The HTTP service's two secrets. Optional HERE so the CLIs (search_cli, chat_cli) run
+    # without them; api.create_app refuses to start when either is missing, so a server cannot.
+    #
+    # AGENT_API_KEY: the shared key the Next.js route sends as "Authorization: Bearer <key>".
+    # POST /chat spends credits on every call (invariant 2), so it never answers without it.
+    agent_api_key: SecretStr | None = None
+    # ASSISTANT_SIGNING_SECRET: the SAME secret the Next.js route verifies history with
+    # (lib/assistant-signature.ts). Python signs the answers it generates (signing.py).
+    assistant_signing_secret: SecretStr | None = None
+
     # POST /search spends embed + rerank credits on every call, and invariant 2 forbids a paid
     # public endpoint. So the route is only REGISTERED when this is true (api.create_app): a
     # deployment that never sets it has no /search at all (404), rather than a /search behind
@@ -72,6 +84,18 @@ class Settings(BaseSettings):
             raise ValueError(
                 "is Supabase's direct host, which is IPv6-only and fails from Docker and AWS. "
                 "Use the Session pooler string: host ends in pooler.supabase.com, port 5432."
+            )
+        return value
+
+    @field_validator("agent_api_key")
+    @classmethod
+    def _key_long_enough_to_be_random(cls, value: SecretStr | None) -> SecretStr | None:
+        # Not a strength test, a typo test: "changeme" or a half-pasted value fails here, at
+        # startup, instead of guarding a paid endpoint. openssl rand -hex 32 gives 64 characters.
+        if value is not None and len(value.get_secret_value()) < MIN_AGENT_API_KEY_LENGTH:
+            raise ValueError(
+                f"must be at least {MIN_AGENT_API_KEY_LENGTH} characters "
+                "(generate one with: openssl rand -hex 32)"
             )
         return value
 

@@ -1,0 +1,16 @@
+data: {"type":"start","messageId":"PyGoldenMessage1"}
+
+data: {"type":"data-retrieval","data":{"mode":"skipped","intent":"off-topic"}}
+
+data: {"type":"text-start","id":"canned"}
+
+data: {"type":"text-delta","id":"canned","delta":"I don't have information about that in the documentation. I can help with AI SDK docs. Ask me about those and I'll help."}
+
+data: {"type":"text-end","id":"canned"}
+
+data: {"type":"data-signature","data":{"sig":"v1.Azrvy3SUSaNWCYlUTMyd5m0Nh-w58Cwrv-nDH9FoeRM"}}
+
+data: {"type":"finish"}
+
+data: [DONE]
+

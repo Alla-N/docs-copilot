@@ -13,7 +13,8 @@ then the canned reply or the grounded streamText call), with the same behaviour:
 
 The graph knows nothing about HTTP or the AI SDK. It emits LangGraph stream events: "updates"
 when a node finishes (the plan, each retrieval, the merged sources, the canned or generated
-answer) and "messages" for the answer's tokens. Step 2.4 turns those into the UI message stream.
+answer) and "messages" for the answer's tokens. ui_stream.py turns those into the AI SDK's UI
+message stream for POST /chat (api.py).
 
 Dependencies come in through build_graph() and are captured by the node functions (a closure):
 the planner, the search function and the chat model are built once at startup and shared by
@@ -33,7 +34,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import Send
 
-from copilot_agent.generation import REFUSAL_MESSAGE, generation_messages
+from copilot_agent.generation import (
+    REFUSAL_MESSAGE,
+    FinishReason,
+    finish_reason,
+    generation_messages,
+    openai_generation_model,
+)
 from copilot_agent.planner import (
     GREETING_MESSAGE,
     NO_USAGE,
@@ -41,6 +48,8 @@ from copilot_agent.planner import (
     Plan,
     Planner,
     TokenUsage,
+    build_planner,
+    openai_planner_model,
     plan_query,
 )
 from copilot_agent.retrieval import (
@@ -50,6 +59,7 @@ from copilot_agent.retrieval import (
     SearchDocs,
     union_relevant,
 )
+from copilot_agent.settings import Settings
 
 
 @dataclass(frozen=True)
@@ -73,12 +83,13 @@ class GenerationMetrics:
 
     ttft_ms is measured from the call to the first token with text, generation_ms to the end of
     the stream. TypeScript takes both from the AI SDK's step.performance; this is the same idea
-    measured here, not the same timer.
+    measured here, not the same timer. finish_reason goes into the stream's `finish` chunk.
     """
 
     usage: TokenUsage
     ttft_ms: float | None
     generation_ms: float
+    finish_reason: FinishReason
 
 
 class ChatInput(TypedDict):
@@ -96,6 +107,10 @@ class ChatState(ChatInput, total=False):
     rerank_calls: int
     answer: str
     generation: GenerationMetrics
+
+
+# The compiled graph: state ChatState, no runtime context yet, input ChatInput.
+ChatGraph = CompiledStateGraph[ChatState, None, ChatInput, ChatState]
 
 
 class RetrieveTask(TypedDict):
@@ -133,9 +148,7 @@ def merge_retrievals(retrievals: list[SubQueryRetrieval]) -> dict[str, object]:
     }
 
 
-def build_graph(
-    *, planner: Planner, search: SearchDocs, model: BaseChatModel
-) -> CompiledStateGraph[ChatState, None, ChatInput, ChatState]:
+def build_graph(*, planner: Planner, search: SearchDocs, model: BaseChatModel) -> ChatGraph:
     """Wire the nodes around the given services and compile the graph.
 
     The planner is tagged "nostream". LangGraph's "messages" mode reports every chat model
@@ -190,6 +203,7 @@ def build_graph(
                 ),
                 ttft_ms=None if first_token is None else (first_token - started) * 1000,
                 generation_ms=(finished - started) * 1000,
+                finish_reason=finish_reason(answer.response_metadata if answer else {}),
             ),
         }
 
@@ -206,3 +220,15 @@ def build_graph(
     builder.add_edge("generate", END)
     builder.add_edge("canned", END)
     return builder.compile()
+
+
+def openai_chat_graph(settings: Settings, search: SearchDocs) -> ChatGraph:
+    """The production graph: the OpenAI planner and answer model around the given search.
+
+    Built once at startup (the API's lifespan, chat_cli) and shared by every run.
+    """
+    return build_graph(
+        planner=build_planner(openai_planner_model(settings)),
+        search=search,
+        model=openai_generation_model(settings),
+    )

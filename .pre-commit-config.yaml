@@ -33,13 +33,15 @@ repos:
       # Also runs when the TypeScript files the Python tests pin change: test_ts_parity.py
       # reads lib/retrieve.ts and lib/plan.ts, test_content_hash.py mirrors lib/content-hash.ts,
       # test_planner_request_parity.py checks the sha256 of lib/plan.ts and evals/planner-cases.ts,
-      # test_generation_request_parity.py that of lib/generation.ts, lib/retrieve.ts, lib/refusal.ts.
+      # test_generation_request_parity.py that of lib/generation.ts, lib/retrieve.ts, lib/refusal.ts,
+      # and test_ts_parity.py reads the caps in lib/chat-request.ts and the signature version in
+      # lib/assistant-signature.ts.
       # Tests marked integration need network and secrets, so they stay out of the hook.
       - id: pytest
         name: pytest (agent, no network)
         entry: bash -c 'cd agent && uv run --locked pytest -q -m "not integration"'
         language: system
-        files: ^(agent/|lib/(retrieve|plan|content-hash|generation|refusal)\.ts$|evals/planner-cases\.ts$)
+        files: ^(agent/|lib/(retrieve|plan|content-hash|generation|refusal|chat-request|assistant-signature)\.ts$|evals/planner-cases\.ts$)
         pass_filenames: false
 
       # ---- TypeScript: the Next.js app ---------------------------------------------------
@@ -56,9 +58,11 @@ repos:
         language: system
         files: \.(ts|tsx|mts|js|mjs)$
 
+      # Also runs when the Python side rewrites its golden streams: the contract test
+      # (tests/python-stream-contract.test.ts) is what reads them.
       - id: vitest
         name: vitest
         entry: npm test --silent
         language: system
-        files: (\.(ts|tsx|mts)$|^package(-lock)?\.json$)
+        files: (\.(ts|tsx|mts)$|^package(-lock)?\.json$|^agent/tests/golden/chat-stream/)
         pass_filenames: false

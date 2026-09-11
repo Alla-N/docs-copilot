@@ -1,0 +1,28 @@
+data: {"type":"start","messageId":"PyGoldenMessage1"}
+
+data: {"type":"data-retrieval","data":{"mode":"reranked","intent":"search"}}
+
+data: {"type":"data-sources","data":[{"id":1,"title":"Page 1","url":"https://ai-sdk.dev/docs/page-1","score":0.79,"chunks":[1,3]},{"id":2,"title":"Page 2","url":"https://ai-sdk.dev/docs/page-2","score":0.76,"chunks":[2]}]}
+
+data: {"type":"start-step"}
+
+data: {"type":"text-start","id":"answer"}
+
+data: {"type":"text-delta","id":"answer","delta":"Use `streamText` (Source 1)."}
+
+data: {"type":"text-delta","id":"answer","delta":"\n\n"}
+
+data: {"type":"text-delta","id":"answer","delta":"Quotes \"like this\", a \\ backslash, {braces}, `code`, café — ✓   🚀"}
+
+data: {"type":"text-delta","id":"answer","delta":" Pick a model (Source 2)."}
+
+data: {"type":"text-end","id":"answer"}
+
+data: {"type":"finish-step"}
+
+data: {"type":"data-signature","data":{"sig":"v1.GvEKMt1CxdSgYC1kfkc6UajDFpqnODm1fu-Aoc9auI4"}}
+
+data: {"type":"finish","finishReason":"stop"}
+
+data: [DONE]
+

@@ -7,8 +7,8 @@ the same context manager uvicorn runs at startup and shutdown.
 
 Not Starlette's TestClient: it runs the app in a background thread with its own event loop,
 and Starlette 1.6 warns when it runs on httpx (it now wants httpx2). These tests stay on the
-anyio plugin like the rest of the suite, which is also how the phase 2 SSE tests will read
-a streamed response.
+anyio plugin like the rest of the suite. POST /chat has its own file, test_chat_api.py, which
+also runs a real uvicorn: ASGITransport buffers a whole response, so it cannot show streaming.
 """
 
 from collections.abc import AsyncIterator
@@ -36,14 +36,24 @@ def _no_flag_from_the_shell(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("ENABLE_SEARCH_ENDPOINT", raising=False)
 
 
+AGENT_KEY = "k" * 64
+AUTH = {"authorization": f"Bearer {AGENT_KEY}"}
+
+
 def make_settings(**overrides: Any) -> Settings:
-    return Settings(
-        _env_file=None,
-        openai_api_key="sk-test-not-real",
-        cohere_api_key="co-test-not-real",
-        database_url=POOLER_URL,
-        **overrides,
-    )
+    values: dict[str, Any] = {
+        "openai_api_key": "sk-test-not-real",
+        "cohere_api_key": "co-test-not-real",
+        "database_url": POOLER_URL,
+        "agent_api_key": AGENT_KEY,
+        "assistant_signing_secret": "test-signing-secret",
+    }
+    return Settings(_env_file=None, **(values | overrides))
+
+
+def no_graph(settings: Settings, search: Any) -> Any:
+    """The graph factory for these tests: /chat is tested in test_chat_api.py."""
+    return None
 
 
 class FakeSearch:
@@ -123,8 +133,11 @@ def factory(fake: FakeSearch) -> FakeFactory:
 @pytest.fixture
 async def client(factory: FakeFactory) -> AsyncIterator[httpx.AsyncClient]:
     """A client for an app WITH /search enabled, lifespan running."""
-    app = create_app(make_settings(enable_search_endpoint=True), search_factory=factory)
+    app = create_app(
+        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+    )
     async with serve(app) as client:
+        client.headers.update(AUTH)
         yield client
 
 
@@ -140,7 +153,7 @@ async def test_health_is_ok_and_calls_nothing(client: httpx.AsyncClient, fake: F
 
 async def test_lifespan_opens_search_once_and_closes_it(factory: FakeFactory) -> None:
     settings = make_settings()
-    app = create_app(settings, search_factory=factory)
+    app = create_app(settings, search_factory=factory, graph_factory=no_graph)
     assert factory.events == []  # building the app opens nothing; startup does
 
     async with serve(app) as client:
@@ -157,7 +170,7 @@ async def test_startup_fails_when_search_cannot_open(factory: FakeFactory) -> No
     # The real open_search() raises here when the pool cannot connect (pool.open(wait=True)).
     # The error must stop startup, so the service never answers /health without a database.
     factory.fail_on_open = OSError("connection refused")
-    app = create_app(make_settings(), search_factory=factory)
+    app = create_app(make_settings(), search_factory=factory, graph_factory=no_graph)
     with pytest.raises(OSError, match="connection refused"):
         async with serve(app):
             pass
@@ -168,7 +181,7 @@ def test_create_app_without_arguments_reads_settings_then(
 ) -> None:
     # `uvicorn --factory copilot_agent.api:create_app` calls create_app() with no arguments.
     monkeypatch.setattr(api, "get_settings", lambda: make_settings(enable_search_endpoint=True))
-    app = create_app(search_factory=factory)
+    app = create_app(search_factory=factory, graph_factory=no_graph)
     assert "/search" in app.openapi()["paths"]
 
 
@@ -178,12 +191,33 @@ def test_create_app_without_arguments_reads_settings_then(
 async def test_search_route_does_not_exist_unless_enabled(
     factory: FakeFactory, fake: FakeSearch
 ) -> None:
-    app = create_app(make_settings(), search_factory=factory)
+    app = create_app(make_settings(), search_factory=factory, graph_factory=no_graph)
     async with serve(app) as client:
         response = await client.post("/search", json={"query": "how do I stream text"})
     assert response.status_code == 404
     assert fake.calls == []
-    assert set(app.openapi()["paths"]) == {"/health"}
+    assert set(app.openapi()["paths"]) == {"/health", "/chat"}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        pytest.param({}, id="no-header"),
+        pytest.param({"authorization": "Bearer wrong"}, id="wrong-key"),
+        pytest.param({"authorization": AGENT_KEY}, id="no-scheme"),
+        pytest.param({"authorization": f"Basic {AGENT_KEY}"}, id="other-scheme"),
+    ],
+)
+async def test_search_needs_the_agent_key_too(
+    factory: FakeFactory, fake: FakeSearch, headers: dict[str, str]
+) -> None:
+    app = create_app(
+        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+    )
+    async with serve(app) as client:
+        response = await client.post("/search", json={"query": "q"}, headers=headers)
+    assert response.status_code == 401
+    assert fake.calls == []
 
 
 async def test_search_is_post_only(client: httpx.AsyncClient, fake: FakeSearch) -> None:
@@ -274,8 +308,10 @@ async def test_unexpected_error_is_a_bare_500(factory: FakeFactory, fake: FakeSe
     # Invariant 9's rule on this side: the error text never reaches the client. It can carry
     # anything, an upstream message quoting a key included. uvicorn logs the traceback.
     fake.error = RuntimeError("upstream said: sk-leaked-key")
-    app = create_app(make_settings(enable_search_endpoint=True), search_factory=factory)
+    app = create_app(
+        make_settings(enable_search_endpoint=True), search_factory=factory, graph_factory=no_graph
+    )
     async with serve(app, raise_app_exceptions=False) as client:
-        response = await client.post("/search", json={"query": "q"})
+        response = await client.post("/search", json={"query": "q"}, headers=AUTH)
     assert response.status_code == 500
     assert response.text == "Internal Server Error"
