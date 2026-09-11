@@ -8,10 +8,12 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "fastapi>=0.141.1",
     "httpx>=0.28.1",
     "openai>=3.13.0",
     "psycopg[binary,pool]>=3.3.5",
     "pydantic-settings>=2.15.0",
+    "uvicorn>=0.52.4",
 ]
 
 [build-system]

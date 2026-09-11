@@ -26,6 +26,7 @@ def env(monkeypatch: pytest.MonkeyPatch) -> pytest.MonkeyPatch:
     monkeypatch.setenv("DATABASE_URL", POOLER_URL)
     monkeypatch.delenv("VECTOR_CANDIDATES", raising=False)
     monkeypatch.delenv("RERANK_TOP_N", raising=False)
+    monkeypatch.delenv("ENABLE_SEARCH_ENDPOINT", raising=False)
     return monkeypatch
 
 
@@ -89,4 +90,22 @@ def test_env_overrides_retrieval_depth_like_the_typescript_side(env: pytest.Monk
 def test_rejects_nonsense_retrieval_depth(env: pytest.MonkeyPatch, bad: str) -> None:
     env.setenv("VECTOR_CANDIDATES", bad)
     with pytest.raises(ValidationError, match="vector_candidates"):
+        load()
+
+
+def test_search_endpoint_is_off_by_default(env: pytest.MonkeyPatch) -> None:
+    # Off unless asked for: the paid debug route must not appear in a deployment by omission.
+    assert load().enable_search_endpoint is False
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("1", True), ("true", True), ("0", False)])
+def test_search_endpoint_flag_parses(env: pytest.MonkeyPatch, raw: str, expected: bool) -> None:
+    env.setenv("ENABLE_SEARCH_ENDPOINT", raw)
+    assert load().enable_search_endpoint is expected
+
+
+def test_search_endpoint_flag_typo_fails_startup(env: pytest.MonkeyPatch) -> None:
+    # A typo must stop the service, not silently read as off (or on).
+    env.setenv("ENABLE_SEARCH_ENDPOINT", "ture")
+    with pytest.raises(ValidationError, match="enable_search_endpoint"):
         load()

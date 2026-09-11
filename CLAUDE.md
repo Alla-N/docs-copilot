@@ -44,6 +44,9 @@ expected to hold to that, not just to keep the tests green.
    spend the owner's API credits.
    Analytics follows the same rule: page views beacon to Vercel, and question attribution
    rides on the existing rate-limited chat write — there is no `/api/track`.
+   The Python service (`agent/`) too: its `POST /search` spends embed + rerank credits, so
+   `create_app` registers it only when `ENABLE_SEARCH_ENDPOINT` is set, which no deployment
+   sets. `GET /health` is liveness only and calls nothing. `tests/test_api.py` guards both.
 3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
    retrieval inside `evals/` — a copy drifts, and drifts toward passing.
@@ -157,6 +160,7 @@ npm run ingest / -- --write          # dry run prints the diff; --write applies 
 npx tsc --noEmit                     # typecheck (CI runs this before eval)
 pre-commit run --all-files           # the local commit gate by hand (ruff, pytest, tsc, eslint, vitest); install once: uv tool install pre-commit && pre-commit install
 cd agent && uv run pytest            # Python agent service tests
+cd agent && ENABLE_SEARCH_ENDPOINT=1 uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000
 ```
 
 ## Environment gotchas

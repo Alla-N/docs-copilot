@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     vector_candidates: int = Field(default=retrieval_config.VECTOR_CANDIDATES, ge=1, le=1000)
     rerank_top_n: int = Field(default=retrieval_config.RERANK_TOP_N, ge=1, le=100)
 
+    # POST /search spends embed + rerank credits on every call, and invariant 2 forbids a paid
+    # public endpoint. So the route is only REGISTERED when this is true (api.create_app): a
+    # deployment that never sets it has no /search at all (404), rather than a /search behind
+    # a runtime check someone can get wrong. Local debugging only.
+    enable_search_endpoint: bool = False
+
     @field_validator("database_url")
     @classmethod
     def _must_be_a_supabase_pooler_url(cls, value: SecretStr) -> SecretStr:
