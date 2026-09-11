@@ -684,10 +684,15 @@ async function main() {
         let commit = "unknown";
         // Uncommitted changes in the tree: the result then did NOT run on `commit` alone. The first
         // Python-target run (2.6) recorded a commit it had not run on, because nothing said so.
+        // Result files are left out: the previous run's own file, not yet committed, made the next
+        // run report changes it did not have (the second 2.6 run, corrected by hand in its file).
         let dirty: boolean | null = null;
         try {
             commit = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim();
-            dirty = execSync("git --no-optional-locks status --porcelain", { stdio: ["ignore", "pipe", "ignore"] }).toString().trim() !== "";
+            dirty = execSync("git --no-optional-locks status --porcelain", { stdio: ["ignore", "pipe", "ignore"] })
+                .toString()
+                .split("\n")
+                .some((line) => line.trim() !== "" && !line.slice(3).startsWith("evals/results/"));
         } catch { /* not a git checkout */ }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const record = {

@@ -263,6 +263,28 @@ printed rather than hidden:
 - **No judge** (the stream carries pages, not chunk texts; Langfuse in 2.7) and no `EVAL_RUNS=0`
   (the service always answers).
 
+First two runs, 2026-09-11, commit `c536cab`, service and harness on the same Mac, against the TS
+baseline (`evals/results/2026-09-08T14-35-14.json`, in-process):
+
+| | TS baseline | Python run 1 | Python run 2 |
+|---|---|---|---|
+| recall, run 1 of each case | 12/12 | 11/12 | 12/12 |
+| recall, every run | (one retrieval per case) | 11/12 | 11/12 |
+| coverage / guardrails / injection | 12/12 · 6/6 · 8/8 | 12/12 · 6/6 · 8/8 | 12/12 · 6/6 · 8/8 |
+| false refusals | 0 | 0 | 0 |
+| retrieval latency, median / worst, n=27 | 2755 / 6540 ms | 2559 / 4564 ms | 3549 / 6575 ms |
+| answered path: sources / first token / done, n=58 | | 2913 / 3673 / 5251 ms | 3758 / 4488 / 6151 ms |
+| canned reply done, n=63 | | 1232 ms | 1495 ms |
+| cost per request, measured | (estimate ~€0.004) | $0.00264 answered (n=69), $0.00017 canned (n=87) | same to the cent |
+
+- `followup` is the one case whose page came and went (1/3 and 2/3 runs), always answered. Each run
+  answers the replayed first question afresh, so the planner resolves "it" against a different
+  answer each time; the trace (2.7) is where to see which query it wrote on a miss.
+- The two runs differ by about 1 s in every latency line, the same code on the same machine: at
+  n=27 the TS and Python retrieval medians are within that noise, not a measured difference.
+- Rerank is most of an answered request's cost: one $0.002 call per sub-query, against roughly
+  $0.0005 of tokens (planner about 1300 in, answer about 1650 in and 150 out, as chat_cli printed).
+
 ## Running in Docker (local)
 
 From the repo root (the build context is `agent/`, so `.env.local` is never sent to Docker):
