@@ -13,6 +13,10 @@ it (planner + retrieval + model), the model's own time to first token, and the t
 
 Costs what one chat request costs: a planner call, one embedding and one rerank per sub-query,
 and the answer (about a cent). Local only, like search_cli: nothing here is a server.
+
+With the Langfuse keys set (step 2.7) each run is a trace, in the same session as the rest of the
+thread and tagged `cli`, and the run prints its trace id. This is the shortest way to look at a
+run: no server, no route, one command.
 """
 
 import argparse
@@ -26,6 +30,7 @@ from copilot_agent.checkpoint import open_checkpointer
 from copilot_agent.graph import openai_chat_graph
 from copilot_agent.retrieval import open_search
 from copilot_agent.settings import get_settings
+from copilot_agent.tracing import open_tracing
 
 
 def show_update(node: str, update: dict[str, Any], started: float) -> None:
@@ -47,9 +52,19 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
 
 async def run(question: str, thread_id: str) -> None:
     settings = get_settings()
-    async with open_search(settings) as search, open_checkpointer(settings) as saver:
+    async with (
+        open_tracing(settings) as tracing,
+        open_search(settings) as search,
+        open_checkpointer(settings) as saver,
+    ):
         graph = openai_chat_graph(settings, search, saver)
-        config = {"configurable": {"thread_id": thread_id}}
+        trace_id = tracing.new_trace_id()
+        if trace_id:
+            print(f"trace {trace_id}")
+        config: dict[str, Any] = {
+            "configurable": {"thread_id": thread_id},
+            **tracing.run_config(trace_id=trace_id, session_id=thread_id, tags=["cli"]),
+        }
         before = (await graph.aget_state(config)).values.get("turns", [])
         print(f"thread {thread_id}: {len(before)} earlier messages")
         started = time.perf_counter()
@@ -81,6 +96,10 @@ async def run(question: str, thread_id: str) -> None:
                         print(f"total                 {total:.0f} ms")
                         print(f"answer tokens         {metrics.usage}")
                     else:
+                        # The same grounding span POST /chat writes (tracing.record_context):
+                        # without it a CLI trace shows the tree but not what the model was shown.
+                        if node == "merge":
+                            tracing.record_context(trace_id, update["relevant"])
                         show_update(node, update, started)
 
 

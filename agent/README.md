@@ -222,6 +222,8 @@ two from `db/006_origin.sql`:
   nor mined as eval cases), and the harness reads its own eval rows back through the new
   `query_cost` view for a measured cost per request. The prices moved into `query_cost`.
 - `thread_id`: the conversation; many rows per thread.
+- `trace_id` (`db/007_trace_id.sql`, step 2.7): this turn's Langfuse trace, or null when tracing
+  is off.
 
 One row per COMPLETED turn, the rule the thread follows: written when the last node reports, never
 for a failed or cancelled turn. `refused` comes from `refusal.is_refusal`, a port of `isRefusal`
@@ -232,7 +234,52 @@ without the row (it holds the question), and shutdown waits up to 5 s for insert
 visitor field in the wrong shape loses the field, not the answer. The log has its own
 one-connection pool: at most six connections per process (search 4, checkpoints 1, log 1).
 
-Run `db/006_origin.sql` in the Supabase SQL editor once; the service refuses to start without it.
+Run `db/006_origin.sql` and `db/007_trace_id.sql` in the Supabase SQL editor once; the service
+refuses to start without either.
+
+## Tracing (step 2.7)
+
+Set both keys and every `/chat` turn is a trace in Langfuse; set neither and nothing is built,
+nothing is exported, and the run config is the one step 2.6 sent.
+
+```
+LANGFUSE_PUBLIC_KEY=pk-lf-...      # .env.local, next to ASSISTANT_SIGNING_SECRET
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_BASE_URL=https://cloud.langfuse.com     # follows the region
+LANGFUSE_ENVIRONMENT=development                 # which deployment a trace came from
+```
+
+What ends up in a trace (`copilot_agent/tracing.py`):
+
+- the LangChain callback handler turns one graph run into the tree: a span per node, a
+  generation per model call with its model, tokens, cost and time to first token;
+- the **trace id is made here**, before the run starts, and goes on the `query_log` row, so any
+  logged turn can be opened;
+- the **session is the thread id**, so a conversation reads turn by turn, and the **origin is a
+  tag** (`web`, `eval`, `cli`);
+- a failure the graph never raised (signing, encoding) becomes one ERROR span: the response is a
+  200 that ends with an error chunk, so this is the only place outside this process's log where
+  a paid, failed turn is visible at all;
+- a `context` span carries the merged chunks the prompt was built from, texts included. The
+  stream carries pages only, so this is what the faithfulness judge reads back on this target,
+  and the first thing to look at when an answer is wrong. An answered turn that kept nothing
+  records an empty list, which is itself the finding.
+
+Two rules. **No Langfuse context manager in the request path**: the response is an async
+generator a disconnect closes from another task, and a contextvars token reset on the wrong task
+raises, which is the bug step 2.4 spent a day on; the handler gets
+`trace_context={"trace_id": ...}` instead, and nothing has to be unwound. **The mask is given
+the real secret values**, not a pattern that guesses at them, so an attribute quoting one (a
+provider error, a connection string in an exception) is exported without it.
+
+Tracing may never fail a request: with the keys wrong the exporter complains on its own thread
+and the answer is unaffected. Shutdown flushes last, after the query log has drained.
+
+To see one trace without running the server:
+
+```
+uv run python -m copilot_agent.chat_cli "how do I stream text"
+```
 
 ## The eval suite against the service (step 2.6)
 

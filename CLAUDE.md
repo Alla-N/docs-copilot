@@ -33,7 +33,7 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
-| `db/000..006_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only |
+| `db/000..007_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` |
 
 ## Invariants — do not break these
 
@@ -113,7 +113,8 @@ expected to hold to that, not just to keep the tests green.
    inserted in a tracked background task that never touches the answer and is drained at
    shutdown. Every view counts `origin = 'web'` only: eval traffic must never be priced into the
    ceiling or mined as eval cases. `refused` comes from `refusal.is_refusal`, pinned verdict by
-   verdict to `isRefusal` (`agent/tests/golden/refusal-verdicts.json`).
+   verdict to `isRefusal` (`agent/tests/golden/refusal-verdicts.json`). Since step 2.7 the row
+   also carries `trace_id` (`db/007_trace_id.sql`): the way from what a turn cost to what it did.
 11. **A refusal on an answerable case is a bug, even when recall says 12/12.** `expectedSource`
     is a PAGE, so any chunk of it satisfies recall — including one carrying none of the answer.
     The harness reports these as `false refusals`; never treat that line as noise, and never
@@ -152,6 +153,16 @@ expected to hold to that, not just to keep the tests green.
    to the client (a failure before the stream is a 502 with the generic message). Unset is the
    default everywhere: the variable is the switch and unsetting it the rollback.
    `tests/agent-forward.test.ts` guards all of it, with the real `Chat` client through the route.
+15. **Tracing is off unless both Langfuse keys are set, and it can never fail a request.**
+   (Step 2.7, `agent/src/copilot_agent/tracing.py`.) With the keys, every `/chat` turn is one
+   trace: the trace id is made BEFORE the run starts so the `query_log` row can carry it, the
+   Langfuse session is the thread id, and the origin (`web` | `eval` | `cli`) is a tag. Without
+   them no client is built and the run config is the 2.6 one, field for field. Never open a
+   Langfuse context manager in the request path: the response is an async generator that a
+   disconnect closes from another task, and a contextvars token reset on the wrong task raises
+   (the 2.4 lesson); pass `trace_context={"trace_id": ...}` to the callback handler instead.
+   Everything exported passes the mask, which is handed this process's real secret VALUES rather
+   than a guess at their shape, so any attribute quoting one leaves without it.
 
 ## How to change things here
 

@@ -160,6 +160,7 @@ async def ui_message_chunks(
     *,
     message_id: str,
     sign: Callable[[str], str],
+    on_error: Callable[[BaseException], None] | None = None,
 ) -> AsyncIterator[Chunk]:
     """Turn one graph run into UI message chunks.
 
@@ -167,10 +168,15 @@ async def ui_message_chunks(
     signs an answer's text (signing.sign_assistant_text with the secret bound).
 
     An Exception from the graph becomes one error chunk and ends the stream; it is logged here,
-    and never sent. Cancellation is not an Exception (CancelledError is a BaseException): when
-    the client disconnects it passes straight through and cancels the run. aclosing() makes
-    closing this generator close the graph's stream too, instead of leaving it to the garbage
-    collector.
+    and never sent. `on_error` is told about it first (step 2.7: the trace records the failure,
+    which nothing outside this process can otherwise see, since the response is a 200 that ends
+    with an error chunk). Like the query log, it may not fail the answer: it is called inside a
+    try, because the caller reading the chunk matters more than the record of why it is there.
+
+    Cancellation is not an Exception (CancelledError is a BaseException): when the client
+    disconnects it passes straight through and cancels the run, and `on_error` is NOT called, so
+    a closed tab never looks like a failure in the trace. aclosing() makes closing this generator
+    close the graph's stream too, instead of leaving it to the garbage collector.
     """
     intent: str | None = None
     streamed: list[str] = []
@@ -223,6 +229,11 @@ async def ui_message_chunks(
                         # Sign what the client received, joined, as the route signs result.text.
                         yield data("signature", {"sig": sign("".join(streamed))})
                         yield finish(update["generation"].finish_reason)
-        except Exception:
+        except Exception as exc:
             logger.exception("chat stream failed")
+            if on_error is not None:
+                try:
+                    on_error(exc)
+                except Exception:
+                    logger.exception("chat stream failure could not be recorded")
             yield error(STREAM_FAILED)

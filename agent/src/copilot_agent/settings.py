@@ -86,6 +86,33 @@ class Settings(BaseSettings):
     # a runtime check someone can get wrong. Local debugging only.
     enable_search_endpoint: bool = False
 
+    # Langfuse (step 2.7). Tracing is on only when BOTH keys are set: no keys, no traces, and the
+    # service answers exactly as it did in 2.6 (tracing.py). The public key is not a secret, it
+    # names the project and travels with every export; the secret key signs the export.
+    langfuse_public_key: str | None = None
+    langfuse_secret_key: SecretStr | None = None
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+    # Langfuse's own environment dimension: which deployment a trace came from, so the AWS
+    # service (phase 2b), CI and this laptop do not share one dashboard. Langfuse's rule, not
+    # ours: lowercase alphanumerics with hyphens and underscores, not starting with "langfuse".
+    # (The prefix check is a validator, not part of the pattern: pydantic compiles `pattern` with
+    # Rust's regex crate, which has no lookahead.)
+    langfuse_environment: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9_-]*$")
+
+    @field_validator("langfuse_base_url")
+    @classmethod
+    def _must_be_an_http_url(cls, value: str) -> str:
+        if urlsplit(value).scheme not in {"http", "https"}:
+            raise ValueError("must be an http:// or https:// URL, e.g. https://cloud.langfuse.com")
+        return value
+
+    @field_validator("langfuse_environment")
+    @classmethod
+    def _not_a_reserved_environment(cls, value: str) -> str:
+        if value.startswith("langfuse"):
+            raise ValueError('must not start with "langfuse": Langfuse reserves that prefix')
+        return value
+
     @field_validator("database_url")
     @classmethod
     def _must_be_a_supabase_pooler_url(cls, value: SecretStr) -> SecretStr:
@@ -115,6 +142,24 @@ class Settings(BaseSettings):
     @property
     def uses_transaction_pooler(self) -> bool:
         return urlsplit(self.database_url.get_secret_value()).port == TRANSACTION_POOLER_PORT
+
+    def secret_values(self) -> list[str]:
+        """Every secret this process holds, in the clear, for the tracing mask (tracing.py).
+
+        The mask does not guess what a secret looks like; it is handed the values, so a span
+        attribute that quotes one is exported without it. The only caller is open_tracing, and
+        the values stay inside the mask's closure: nothing here is logged or returned anywhere
+        else, which is the whole reason the fields are SecretStr in the first place.
+        """
+        held = (
+            self.openai_api_key,
+            self.cohere_api_key,
+            self.database_url,
+            self.agent_api_key,
+            self.assistant_signing_secret,
+            self.langfuse_secret_key,
+        )
+        return [secret.get_secret_value() for secret in held if secret is not None]
 
 
 @lru_cache

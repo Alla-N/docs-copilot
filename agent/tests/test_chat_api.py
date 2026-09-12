@@ -524,6 +524,8 @@ async def test_an_answered_turn_writes_the_row_the_typescript_route_would() -> N
         "gen_output_tokens": 60,
         "origin": "web",
         "thread_id": THREAD,
+        # The rig's settings carry no Langfuse keys, so this turn was not traced (step 2.7).
+        "trace_id": None,
     }
     assert all(isinstance(ms, int) and ms >= 0 for ms in timings.values())
     assert timings["ttft_ms"] <= timings["generation_ms"]

@@ -18,6 +18,11 @@ pipe now, cannot see the tokens, rerank calls and timings the row records.
 History does not come in the request at all (step 2.5): the thread id names a conversation the
 checkpointer keeps, and the turns before the question are read from there (graph.py,
 history.py). A request carrying a `history` field is a 422.
+
+Every turn is also one Langfuse trace when the keys are set (step 2.7, tracing.py): its id is
+made here, before the run starts, so the query_log row can carry it, and the run's config takes
+the callback handler and the session (the thread id) into the graph. With no keys nothing is
+traced and nothing changes.
 """
 
 import asyncio
@@ -41,6 +46,7 @@ from copilot_agent.query_log import Origin, QueryLog, Turn, Visitor, observe, op
 from copilot_agent.retrieval import RetrievalMode, RetrievedChunk, SearchDocs, open_search
 from copilot_agent.settings import Settings, get_settings
 from copilot_agent.signing import sign_assistant_text
+from copilot_agent.tracing import Tracing, open_tracing
 
 # The shape of open_search(): given settings, an async context manager yielding a search.
 # create_app() takes one so tests can hand it a fake that opens nothing and costs nothing.
@@ -51,6 +57,8 @@ OpenCheckpointer = Callable[[Settings], AbstractAsyncContextManager[BaseCheckpoi
 BuildGraph = Callable[[Settings, SearchDocs, BaseCheckpointSaver], ChatGraph]
 # The shape of open_query_log(): given settings, an async context manager yielding the log.
 OpenQueryLog = Callable[[Settings], AbstractAsyncContextManager[QueryLog]]
+# The shape of open_tracing(): given settings, an async context manager yielding the tracing.
+OpenTracing = Callable[[Settings], AbstractAsyncContextManager[Tracing]]
 
 # The caps of lib/chat-request.ts (invariant 9) live in history.py since the history moved
 # server-side. The route cuts the question to MAX_CHARS_PER_MESSAGE, so what it forwards always
@@ -182,10 +190,15 @@ def get_query_log(request: Request) -> QueryLog:
     return request.app.state.query_log
 
 
+def get_tracing(request: Request) -> Tracing:
+    return request.app.state.tracing
+
+
 Graph = Annotated[ChatGraph, Depends(get_graph)]
 Signer = Annotated[Callable[[str], str], Depends(get_signer)]
 DurabilityMode = Annotated[Durability, Depends(get_durability)]
 Log = Annotated[QueryLog, Depends(get_query_log)]
+Trace = Annotated[Tracing, Depends(get_tracing)]
 
 
 def require_key(key: SecretStr) -> Callable[..., None]:
@@ -281,13 +294,30 @@ def ui_message_stream_headers(response: Response) -> None:
     response.headers.update(ui_stream.UI_MESSAGE_STREAM_HEADERS)
 
 
+def chat_run_config(body: ChatRequest, tracing: Tracing, trace_id: str | None) -> dict[str, Any]:
+    """The run's config: the thread the checkpointer continues, and the trace the run writes.
+
+    Both are per request, which is why they are here and not in the graph built at startup. With
+    tracing off the second half is an empty dict and the config is exactly the 2.6 one.
+    """
+    return {
+        "configurable": {"thread_id": body.thread_id},
+        **tracing.run_config(trace_id=trace_id, session_id=body.thread_id, tags=[body.origin]),
+    }
+
+
 @chat_router.post(
     "/chat",
     response_class=EventSourceResponse,
     dependencies=[Depends(ui_message_stream_headers)],
 )
 async def chat(
-    body: ChatRequest, graph: Graph, sign: Signer, durability: DurabilityMode, log: Log
+    body: ChatRequest,
+    graph: Graph,
+    sign: Signer,
+    durability: DurabilityMode,
+    log: Log,
+    tracing: Trace,
 ) -> AsyncIterator[ServerSentEvent]:
     """Run the chat graph on one question and stream the answer as the AI SDK's UI message
     stream, so useChat can read it (ui_stream.py has the protocol and the chunk order).
@@ -306,22 +336,39 @@ async def chat(
     by, inside the run's own task, so the row does not depend on the client reading to the end).
     """
     visitor = body.visitor or VisitorIn()
+    trace_id = tracing.new_trace_id()
     turn = Turn(
         question=body.question,
         thread_id=body.thread_id,
         origin=body.origin,
+        trace_id=trace_id,
         visitor=Visitor.sanitised(**visitor.model_dump()),
     )
     parts = graph.astream(
         {"question": body.question},
-        {"configurable": {"thread_id": body.thread_id}},
+        chat_run_config(body, tracing, trace_id),
         stream_mode=["updates", "messages"],
         version="v2",
         durability=durability,
     )
-    parts = observe(parts, turn, on_complete=lambda done: log.write(done.row()))
+
+    def completed(done: Turn) -> None:
+        log.write(done.row())
+        # A canned turn retrieved nothing; an answered one records what the prompt was built
+        # from, empty list included (observe() keeps a failure here off the answer).
+        if done.mode != "skipped":
+            tracing.record_context(trace_id, done.relevant)
+
+    parts = observe(parts, turn, on_complete=completed)
     parts = in_own_task(parts)
-    chunks = ui_stream.ui_message_chunks(parts, message_id=ui_stream.new_message_id(), sign=sign)
+    chunks = ui_stream.ui_message_chunks(
+        parts,
+        message_id=ui_stream.new_message_id(),
+        sign=sign,
+        # A failure after the graph is done (signing, encoding) is invisible to everything
+        # outside this process: the response is a 200 that ends with an error chunk.
+        on_error=partial(tracing.record_error, trace_id),
+    )
     async for chunk in chunks:
         yield ServerSentEvent(raw_data=ui_stream.encode(chunk))
     yield ServerSentEvent(raw_data=ui_stream.DONE)
@@ -367,6 +414,7 @@ def create_app(
     checkpointer_factory: OpenCheckpointer = open_checkpointer,
     graph_factory: BuildGraph = openai_chat_graph,
     query_log_factory: OpenQueryLog = open_query_log,
+    tracing_factory: OpenTracing = open_tracing,
 ) -> FastAPI:
     if settings is None:
         settings = get_settings()
@@ -382,12 +430,15 @@ def create_app(
         # the first request, close them after the last. If opening fails, the server exits,
         # and that includes a checkpoint database that is not set up (checkpoint.py) and a
         # query_log table without the columns this service writes (query_log.py). Closing runs in
-        # reverse, so the query log waits for its last inserts before anything else closes.
+        # reverse, so the query log waits for its last inserts before anything else closes, and
+        # tracing, opened first, flushes last: the spans of those last turns still leave.
         async with (
+            tracing_factory(settings) as tracing,
             search_factory(settings) as search_docs,
             checkpointer_factory(settings) as checkpointer,
             query_log_factory(settings) as query_log,
         ):
+            app.state.tracing = tracing
             app.state.search = search_docs
             app.state.graph = graph_factory(settings, search_docs, checkpointer)
             app.state.query_log = query_log

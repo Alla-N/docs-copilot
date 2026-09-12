@@ -14,7 +14,9 @@
  *     planner's HyDE variance reaches coverage.
  *   - The stream carries pages, not chunk texts: `data-sources` gives each page's url, best score
  *     and chunk numbers. Enough for recall, the chunk count and the top score; not enough for the
- *     faithfulness judge, which reads the chunks (it waits for Langfuse, step 2.7).
+ *     faithfulness judge, which reads the chunks. Since step 2.7 it gets them from the trace:
+ *     each answered turn writes a `context` observation with the merged chunks, the row carries
+ *     its `trace_id`, and evals/langfuse-api.ts reads them back after the run.
  *
  * History: the service takes none from its caller (a `history` field is a 422), so a case's
  * earlier user turns are sent as real turns on a fresh thread, and the service's own replies
@@ -164,6 +166,37 @@ export const chunkCount = (pages: AgentPage[]) => pages.reduce((n, p) => n + p.c
 
 /** The best score among the pages (each page carries its best chunk's score). */
 export const topScore = (pages: AgentPage[]) => (pages.length ? Math.max(...pages.map((p) => p.score)) : null);
+
+/**
+ * The Langfuse trace id of each thread's LAST turn, from the rows the service wrote
+ * (`trace_id`, db/007_trace_id.sql). Null when tracing was off, and then simply absent here.
+ *
+ * The last turn, because a case with history replays its earlier user turns on the same thread
+ * and each of those is a row of its own: the one the judge wants is the case's own query. Rows
+ * arrive in the background like the cost rows, so this waits for them the same way.
+ */
+export async function traceIdsOfThreads(threadIds: string[], waitMs = 20_000): Promise<Map<string, string>> {
+    const supabase = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_KEY"));
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        const found = new Map<string, string>();
+        for (let i = 0; i < threadIds.length; i += 100) {
+            const { data, error } = await supabase
+                .from("query_cost")
+                .select("thread_id, trace_id, created_at")
+                .eq("origin", "eval")
+                .in("thread_id", threadIds.slice(i, i + 100))
+                .order("created_at", { ascending: true });
+            if (error) throw new Error(`reading query_cost failed: ${error.message}`);
+            // Ascending, so the last row of a thread is the one left in the map.
+            for (const row of (data ?? []) as { thread_id: string | null; trace_id: string | null }[]) {
+                if (row.thread_id && row.trace_id) found.set(row.thread_id, row.trace_id);
+            }
+        }
+        if (found.size >= threadIds.length || Date.now() > deadline) return found;
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+}
 
 export type RunCost = {
     /** Rows found for the run's threads, and how many completed turns were expected. */

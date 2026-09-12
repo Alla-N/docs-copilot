@@ -18,8 +18,9 @@
  * functions the route calls). EVAL_TARGET=python sends every question to the Python agent
  * service over HTTP, as the route forwards it (evals/agent-target.ts, step 2.6): same cases, same
  * criteria, same verdicts, and the differences that come with a service are reported, not hidden
- * (every run retrieves again; history is replayed as real turns; the judge needs chunk texts the
- * stream does not carry; cost is MEASURED from the service's query_log rows).
+ * (every run retrieves again; history is replayed as real turns; the judge reads the chunk texts
+ * back from the trace, since the stream carries pages only; cost is MEASURED from the service's
+ * own query_log rows).
  *
  *   EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval
  *
@@ -54,10 +55,12 @@ import {
     historyFieldStatus,
     pagesAsChunks,
     topScore as pagesTopScore,
+    traceIdsOfThreads,
     type AgentReply,
     type AgentTarget,
     type RunCost,
 } from "./agent-target";
+import { contextsByTrace, langfuseApi } from "./langfuse-api";
 
 const RUNS = Number(process.env.EVAL_RUNS ?? 3);
 
@@ -326,6 +329,8 @@ const agentThreads: string[] = [];
 let agentTurns = 0;
 /** Identifies this run's threads in query_log: a timestamp plus a little randomness. */
 const RUN_STAMP = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + Math.random().toString(16).slice(2, 6);
+// When the run started, minus a minute of clock skew: the window the judge asks Langfuse for.
+const RUN_STARTED = new Date(Date.now() - 60_000);
 
 /**
  * One case against the service. Each run is a fresh thread: the case's earlier user turns are
@@ -412,6 +417,65 @@ async function runCaseOnAgent(target: AgentTarget, c: EvalCase, index: number): 
     };
 }
 
+/**
+ * Faithfulness on the Python target, judged AFTER the run from the traces (step 2.7).
+ *
+ * On the TypeScript target the chunks are in hand while the case runs, so the judge is called
+ * there. Over HTTP the harness never sees a chunk text: the stream carries pages. So run 1 of
+ * every case that answered is looked up in two hops - thread id to trace id on the query_log row
+ * (db/007_trace_id.sql), trace id to the `context` observation the service wrote - and judged
+ * with the chunks the prompt was actually built from.
+ *
+ * One judgement per case, run 1, exactly as on the other target: generation varies between runs,
+ * but not usually in whether it stayed inside its sources, and this keeps the cost linear.
+ *
+ * A case whose trace never arrives is REPORTED, never judged as an answer with no sources: an
+ * observability gap must not become a faithfulness failure.
+ */
+async function judgeAgentRuns(results: Result[], active: EvalCase[]): Promise<void> {
+    const byId = new Map(results.map((r) => [r.id, r]));
+    const threads = new Map<string, EvalCase>();
+    active.forEach((c, i) => {
+        const r = byId.get(c.id);
+        // Same gate as the TS path: a refusal has no claims to be unfaithful about, and a
+        // greeting or off-topic reply retrieved nothing, so it has no `context` span either.
+        if (!r || r.intent !== "search" || r.answered === 0 || isRefusal(r.sample)) return;
+        threads.set(evalThreadId(RUN_STAMP, i, 0), c);
+    });
+    if (!threads.size) return;
+
+    const traces = await traceIdsOfThreads([...threads.keys()]);
+    const judged = new Map<string, EvalCase>();
+    for (const [threadId, c] of threads) {
+        const traceId = traces.get(threadId);
+        if (traceId) judged.set(traceId, c);
+    }
+    if (!judged.size) {
+        console.log("\nfaithfulness skipped: the run's rows carry no trace id — were the service's Langfuse keys set?");
+        return;
+    }
+
+    const contexts = await contextsByTrace(langfuseApi(), RUN_STARTED, new Set(judged.keys()));
+    let missing = 0;
+    for (const [traceId, c] of judged) {
+        const chunks = contexts.get(traceId);
+        if (!chunks) {
+            missing++;
+            continue;
+        }
+        const r = byId.get(c.id)!;
+        const v = await judgeFaithfulness(c.query, chunks, r.sample);
+        r.faithful = v.supported ? "yes" : "NO";
+        if (!v.supported) {
+            console.log(`  UNFAITHFUL ${c.id}: ${v.reasoning}`);
+            for (const claim of v.unsupportedClaims) console.log(`      unsupported: ${claim}`);
+        }
+    }
+    if (missing) {
+        console.log(`\nfaithfulness: ${missing}/${judged.size} traces had no context observation in time — not judged, and not counted`);
+    }
+}
+
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 const ms = (xs: number[]) => (xs.length ? `${median(xs).toFixed(0)}ms` : "—");
 
@@ -432,10 +496,10 @@ async function main() {
     let target: AgentTarget | null = null;
     let historyRefused: number | null = null;
     if (TARGET === "python") {
-        // The service always answers, so there is no retrieval-only mode to be had over HTTP; and
-        // the judge reads chunk texts, which the stream does not carry (pages only).
-        if (RUNS === 0 || JUDGE) {
-            console.log("EVAL_TARGET=python runs the full suite only: no EVAL_RUNS=0 (the service always answers), no EVAL_JUDGE=1 (the stream carries pages, not chunk texts; step 2.7).");
+        // The service always answers, so there is no retrieval-only mode to be had over HTTP.
+        // (EVAL_JUDGE=1 works here since step 2.7: the chunk texts come back from the trace.)
+        if (RUNS === 0) {
+            console.log("EVAL_TARGET=python runs the full suite only: no EVAL_RUNS=0, the service always answers.");
             process.exit(2);
         }
         target = agentTarget();
@@ -484,6 +548,8 @@ async function main() {
                 console.log(`         ↳ run ${r.odd.i + 1} (the odd one): ${r.odd.text.replace(/\s+/g, " ").slice(0, 1200)}`);
         }
     }
+
+    if (target && JUDGE) await judgeAgentRuns(results, active);
 
     console.log();
     console.table(

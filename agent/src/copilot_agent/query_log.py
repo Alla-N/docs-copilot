@@ -8,7 +8,9 @@ service can, and does, with the same columns and the same meaning, plus two (db/
   - origin: "web" for the Next.js route, "eval" for the eval harness. Every view over the table
     counts web rows only, so an eval run neither looks like traffic nor mines itself as eval
     cases, and the harness reads its own rows back for a MEASURED cost per request.
-  - thread_id: the conversation. One thread, many rows; the same key Langfuse sessions will use.
+  - thread_id: the conversation. One thread, many rows; the key Langfuse sessions use (2.7).
+  - trace_id: this turn's Langfuse trace (db/007_trace_id.sql), made before the run starts
+    (tracing.py) so the row can carry it. Null when tracing is off, which is the default.
 
 One row per COMPLETED turn, the same rule the thread follows (invariant 13): the row is handed
 to the writer when the graph's last node (canned or generate) reports, and a turn that fails or
@@ -67,6 +69,7 @@ COLUMNS = (
     "generation_ms",
     "origin",
     "thread_id",
+    "trace_id",
 )
 
 INSERT_SQL = (
@@ -74,7 +77,7 @@ INSERT_SQL = (
     f"values ({', '.join(f'%({c})s' for c in COLUMNS)})"
 )
 
-SETUP_HINT = "run db/006_origin.sql in the Supabase SQL editor"
+SETUP_HINT = "run db/006_origin.sql and db/007_trace_id.sql in the Supabase SQL editor"
 
 # How long shutdown waits for inserts still running. One insert is one round trip (~70 ms on the
 # pooler, measured in step 1e); ECS gives a stopping task 30 s in all.
@@ -147,6 +150,8 @@ class Turn:
     question: str
     thread_id: str
     origin: Origin
+    # None when tracing is off: the row still says everything it said in 2.6, minus the way in.
+    trace_id: str | None = None
     visitor: Visitor = NO_VISITOR
     started: float = field(default_factory=time.perf_counter)
     planner_usage: TokenUsage = NO_USAGE
@@ -211,6 +216,7 @@ class Turn:
             "generation_ms": js_round(generation.generation_ms) if generation else None,
             "origin": self.origin,
             "thread_id": self.thread_id,
+            "trace_id": self.trace_id,
         }
 
 
@@ -284,7 +290,7 @@ def postgres_insert(pool: AsyncConnectionPool) -> Insert:
 def readiness_problems(columns: set[str], row_security: bool | None) -> list[str]:
     """Why the service must not start on this database; empty when it may."""
     if row_security is None:
-        return [f"the query_log table does not exist; run db/002 to db/006 ({SETUP_HINT})"]
+        return [f"the query_log table does not exist; run db/002 to db/007 ({SETUP_HINT})"]
     problems = []
     missing = [c for c in COLUMNS if c not in columns]
     if missing:
