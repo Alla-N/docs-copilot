@@ -45,7 +45,7 @@ import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK
 import { generationSettings, generationMessages } from "../lib/generation";
 import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
 import { CASES, type EvalCase } from "./dataset";
-import { judgeFaithfulness } from "./judge";
+import { judgeFaithfulness, type Verdict } from "./judge";
 import {
     agentTarget,
     askAgent,
@@ -132,6 +132,10 @@ type Result = {
     /** The run that broke expectation (answered when it should refuse, or vice versa), if any. */
     odd?: { i: number; text: string };
     faithful: string;    // judge verdict on the first answer, when EVAL_JUDGE=1
+    /** The claims behind a "NO", with the span the judge offered for each. Recorded so a
+     *  stored result can be inspected instead of re-run: without it a reader sees only
+     *  "NO" and has to pay for another judged run to find out whether it was real. */
+    faithfulDetail?: FailedClaim[];
     verdict: "PASS" | "FAIL" | "FLAKY" | "—";
     detail: string;
     /** Python target only: every run retrieves again, so recall has a per-run answer too. */
@@ -139,6 +143,31 @@ type Result = {
     /** Python target only: in how many runs the expected page was retrieved. */
     foundRuns?: number;
 };
+
+type FailedClaim = { claim: string; quote: string };
+
+/**
+ * Report a NO verdict, and record what it rests on.
+ *
+ * `reasoning` is the model talking. It is NOT the verdict: judge.ts derives `supported` in
+ * code from the quote check, claim by claim, after a second look. The two can and do
+ * disagree - a run 1 verdict here came with prose calling the answer supported - and
+ * reading the prose as the verdict has already produced one wrong conclusion. So the prose
+ * is printed labelled as prose, and under it goes the evidence a reader can actually
+ * check: the claim that failed, and the span the judge offered for it.
+ */
+function reportUnfaithful(id: string, v: Verdict): FailedClaim[] {
+    const failed = v.checked
+        .filter((c) => c.found === false)
+        .map((c) => ({ claim: c.claim, quote: c.quote }));
+    console.log(`  UNFAITHFUL ${id}: ${failed.length} claim(s) with no verbatim support in the chunks`);
+    console.log(`      judge prose, not the verdict: ${v.reasoning}`);
+    for (const f of failed) {
+        console.log(`      unsupported: ${f.claim}`);
+        console.log(`          quote offered: ${f.quote ? f.quote.replace(/\s+/g, " ").slice(0, 220) : "(none)"}`);
+    }
+    return failed;
+}
 
 type Scored = {
     answered: number;
@@ -278,13 +307,11 @@ async function runCase(c: EvalCase): Promise<Result> {
     // One judgement per case, not per run — generation varies, but not usually in
     // whether it stayed grounded, and this keeps the cost linear in cases.
     let faithful = "—";
+    let faithfulDetail: FailedClaim[] | undefined;
     if (JUDGE && answered > 0 && !isRefusal(firstAnswer)) {
         const v = await judgeFaithfulness(c.query, relevant, firstAnswer);
         faithful = v.supported ? "yes" : "NO";
-        if (!v.supported) {
-            console.log(`  UNFAITHFUL ${c.id}: ${v.reasoning}`);
-            for (const claim of v.unsupportedClaims) console.log(`      unsupported: ${claim}`);
-        }
+        if (!v.supported) faithfulDetail = reportUnfaithful(c.id, v);
     }
 
     const { verdict, detail } = verdictOf(c, runs, scored, found);
@@ -307,6 +334,7 @@ async function runCase(c: EvalCase): Promise<Result> {
         sample: firstAnswer,
         ...(scored.oddRun ? { odd: scored.oddRun } : {}),
         faithful,
+        ...(faithfulDetail ? { faithfulDetail } : {}),
         verdict,
         detail,
     };
@@ -466,10 +494,7 @@ async function judgeAgentRuns(results: Result[], active: EvalCase[]): Promise<vo
         const r = byId.get(c.id)!;
         const v = await judgeFaithfulness(c.query, chunks, r.sample);
         r.faithful = v.supported ? "yes" : "NO";
-        if (!v.supported) {
-            console.log(`  UNFAITHFUL ${c.id}: ${v.reasoning}`);
-            for (const claim of v.unsupportedClaims) console.log(`      unsupported: ${claim}`);
-        }
+        if (!v.supported) r.faithfulDetail = reportUnfaithful(c.id, v);
     }
     if (missing) {
         console.log(`\nfaithfulness: ${missing}/${judged.size} traces had no context observation in time — not judged, and not counted`);
@@ -799,6 +824,7 @@ async function main() {
             cases: results.map((r) => ({
                 id: r.id, verdict: r.verdict, intent: r.intent, retrieved: r.retrieved, chunks: r.chunks,
                 topScore: r.topScore, answered: `${r.answered}/${r.runs}`, faithful: r.faithful, detail: r.detail,
+                ...(r.faithfulDetail ? { faithfulDetail: r.faithfulDetail } : {}),
                 ...(target ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}` } : {}),
             })),
         };
