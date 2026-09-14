@@ -35,6 +35,22 @@
  * passes 2/3 is FLAKY, not passing. Adversarial cases run more times (an attack that works
  * 1-in-8 is a working attack). A parked, known-failing case is marked `expectFail`: it runs
  * and reports but does not fail the suite, and is flagged if it ever starts passing.
+ *
+ * A case can also fail to RUN at all: a gateway timeout from the database, a dropped
+ * connection, a provider outage. That is not a verdict about the pipeline, so it is not
+ * scored as one. The case is recorded as ERROR with its message, the run CONTINUES, errored
+ * cases are excluded from every headline denominator (exactly as expectFail cases are), and
+ * the whole run is then reported INCOMPLETE and exits 4 — a run that could not run every
+ * case is never a baseline. Before this, one such error threw out of the loop and discarded
+ * the other 26 cases: eval #34, 2026-09-14, `Retrieval failed: Gateway Timeout` on case 2 of
+ * 27, exit 1 and no report. A red run now says which KIND of red it was.
+ *
+ *   EVAL_FAULT=<id,...>          make those cases throw a simulated gateway timeout, without
+ *                                spending anything, to exercise the ERROR path on purpose.
+ *
+ * Exit codes: 0 green; 1 a real failure (a failing case, an unfaithful answer, a parked case
+ * that now passes, a retrieval regression); 2 bad configuration; 3 the reranker was
+ * unavailable, so the run measured a different pipeline; 4 at least one case could not run.
  */
 import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -86,6 +102,11 @@ const ADVERSARIAL_RUNS = Number(process.env.EVAL_ADVERSARIAL_RUNS ?? 8);
 /** EVAL_ONLY=id1,id2 runs just those cases — for investigating a failure without paying
  *  for the whole suite. Metrics then report over the subset, which is fine for debugging. */
 const ONLY = (process.env.EVAL_ONLY ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+// Fault injection, for testing THIS FILE. A case named here throws the shape of error a
+// database gateway timeout has, before spending anything, so the ERROR path can be exercised
+// on purpose instead of waiting for the next outage. run.ts cannot be unit tested (main()
+// runs at import), so this is how its failure handling is proved.
+const FAULT = (process.env.EVAL_FAULT ?? "").split(",").map((x) => x.trim()).filter(Boolean);
 
 /**
  * Faithfulness is opt-in: EVAL_JUDGE=1 npm run eval
@@ -136,8 +157,12 @@ type Result = {
      *  stored result can be inspected instead of re-run: without it a reader sees only
      *  "NO" and has to pay for another judged run to find out whether it was real. */
     faithfulDetail?: FailedClaim[];
-    verdict: "PASS" | "FAIL" | "FLAKY" | "—";
+    /** ERROR: the case could not be RUN (infrastructure), which is not a verdict about the
+     *  pipeline. Kept out of the denominators and it makes the whole run incomplete. */
+    verdict: "PASS" | "FAIL" | "FLAKY" | "—" | "ERROR";
     detail: string;
+    /** Why the case could not run, when it could not. Set exactly when verdict is ERROR. */
+    errored?: string;
     /** Python target only: every run retrieves again, so recall has a per-run answer too. */
     retrievedEvery?: "yes" | "NO" | "varied" | "—";
     /** Python target only: in how many runs the expected page was retrieved. */
@@ -245,6 +270,30 @@ function verdictOf(c: EvalCase, runs: number, s: Scored, found: boolean | null):
                         ? "expected doc not retrieved"
                         : `answered ${s.answered}/${runs}, expected ${expected}`;
     return { verdict, detail };
+}
+
+/**
+ * A case that could not be RUN: the database gateway timed out, a connection dropped, a
+ * provider was down. Deliberately NOT scored as a failure. The pipeline said nothing about
+ * this case, and recording silence as a wrong answer is how a red run stops meaning anything.
+ */
+function erroredResult(c: EvalCase, err: unknown): Result {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+        id: c.id,
+        intent: "search",
+        degraded: false,
+        retrieved: "—",
+        chunks: 0,
+        topScore: "—",
+        answered: 0,
+        runs: 0,
+        sample: "",
+        faithful: "—",
+        verdict: "ERROR",
+        detail: message,
+        errored: message,
+    };
 }
 
 async function runCase(c: EvalCase): Promise<Result> {
@@ -543,7 +592,15 @@ async function main() {
     const results: Result[] = [];
     for (const [i, c] of active.entries()) {
         if (i > 0) await sleep(RERANK_INTERVAL_MS);
-        const r = target ? await runCaseOnAgent(target, c, i) : await runCase(c);
+        // One case that cannot run must not cost the other 26 their results (eval #34).
+        let r: Result;
+        try {
+            if (FAULT.includes(c.id)) throw new Error("Retrieval failed: Gateway Timeout (EVAL_FAULT)");
+            r = target ? await runCaseOnAgent(target, c, i) : await runCase(c);
+        } catch (err) {
+            r = erroredResult(c, err);
+            console.log(`  ERROR ${c.id.padEnd(22)} could not run: ${r.detail}`);
+        }
         results.push(r);
         // A run without the reranker measures a different pipeline (cosine order, 0.45
         // threshold) and must not be scored as this one. Found the expensive way: the Cohere
@@ -576,6 +633,27 @@ async function main() {
 
     if (target && JUDGE) await judgeAgentRuns(results, active);
 
+    const byId = new Map(results.map((r) => [r.id, r]));
+    // A case that could not run is not evidence about the pipeline, so it is kept out of every
+    // headline denominator, exactly as a parked (expectFail) case is and for the same reason:
+    // scoring it drags a number down and reads as a regression that did not happen. It cannot
+    // hide anything, because a single errored case makes the WHOLE run incomplete below.
+    const errored = results.filter((r) => r.verdict === "ERROR");
+    const ran = (c: EvalCase) => byId.get(c.id)!.verdict !== "ERROR";
+    // Called after the real-failure exits in both modes: a genuine failure is still exit 1 and
+    // still the headline. Exit 4 means nothing failed, but not everything was measured.
+    const reportIncomplete = () => {
+        if (!errored.length) return;
+        console.log(`\n${errored.length} case(s) could NOT RUN. This run is INCOMPLETE and is not a baseline:`);
+        for (const r of errored) console.log(`  ${r.id.padEnd(22)} ${r.detail}`);
+        console.log(
+            `  Infrastructure, not verdicts, so they are left out of the denominators above\n` +
+            `  rather than counted as failures. Re-run. If the same case errors twice it is not\n` +
+            `  the network, and the numbers above were measured on a smaller suite than they say.`
+        );
+        process.exit(4);
+    };
+
     console.log();
     console.table(
         results.map((r) => ({
@@ -595,11 +673,10 @@ async function main() {
     // expectFail (parked, known-failing) cases are excluded from every headline metric and
     // reported on their own line — otherwise a documented, deferred bug drags coverage
     // below 5/5 and reads as a regression.
-    const injections = active.filter((c) => c.injection && !c.expectFail);
-    const answerable = active.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail);
-    const guardrails = active.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail);
+    const injections = active.filter((c) => c.injection && !c.expectFail && ran(c));
+    const answerable = active.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail && ran(c));
+    const guardrails = active.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail && ran(c));
     const parked = active.filter((c) => c.expectFail);
-    const byId = new Map(results.map((r) => [r.id, r]));
 
     const coverage = answerable.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
     const held = guardrails.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
@@ -629,9 +706,16 @@ async function main() {
 
     const sorted = [...retrievalMs].sort((a, b) => a - b);
     const retrievalMedian = median(sorted);
+    // With every retrieval errored (a total outage, or EVAL_FAULT on everything) there is no
+    // population at all, and median and max of nothing are NaN and -Infinity. Say there were
+    // none rather than print those: a latency line is exactly where a nonsense number gets
+    // copied into a README and believed.
+    const latency = sorted.length
+        ? `${retrievalMedian.toFixed(0)}ms median, ${Math.max(...sorted).toFixed(0)}ms worst`
+        : `no successful retrievals`;
     if (target) {
         const { answered: a, canned: k } = agentMs;
-        console.log(`retrieval latency  ${retrievalMedian.toFixed(0)}ms median, ${Math.max(...sorted).toFixed(0)}ms worst, n=${sorted.length}  (run 1 of each case, request → data-retrieval: planner + retrieval + thread read + HTTP; the TS baseline's population)`);
+        console.log(`retrieval latency  ${latency}, n=${sorted.length}  (run 1 of each case, request → data-retrieval: planner + retrieval + thread read + HTTP; the TS baseline's population)`);
         console.log(`answered path      n=${a.total.length}   to sources ${ms(a.retrieval)}, first token ${ms(a.firstToken)}, done ${ms(a.total)}  (medians, every run)`);
         console.log(`canned path        n=${k.total.length}   reply done ${ms(k.total)}  (median; greeting and off-topic, planner only)`);
         console.log(`retrieval recall   ${recall}/${answerable.length}   run 1 (one retrieval per case, comparable to the TS baseline)`);
@@ -639,7 +723,7 @@ async function main() {
         if (varied.length)
             console.log(`recall varied      ${varied.map((c) => `${c.id} (${byId.get(c.id)!.foundRuns}/${byId.get(c.id)!.runs})`).join(", ")} — HyDE moved the page between runs`);
     } else {
-        console.log(`retrieval latency  ${retrievalMedian.toFixed(0)}ms median, ${Math.max(...sorted).toFixed(0)}ms worst  (embed + search + rerank)`);
+        console.log(`retrieval latency  ${latency}  (embed + search + rerank)`);
         console.log(`retrieval recall   ${recall}/${answerable.length}   expected doc survived rerank + threshold`);
     }
     if (RUNS > 0) {
@@ -720,6 +804,7 @@ async function main() {
             console.log(`\nretrieval regression — expected doc not retrieved twice: ${stillMissing.join(", ")}`);
             process.exit(1);
         }
+        reportIncomplete();
         return;
     }
 
@@ -747,7 +832,9 @@ async function main() {
 
     const parkedIds = new Set(parked.map((c) => c.id));
     const unfaithful = results.filter((r) => r.faithful === "NO" && !parkedIds.has(r.id));
-    const failed = results.filter((r) => r.verdict !== "PASS" && !parkedIds.has(r.id));
+    // verdict !== "PASS" would otherwise fold every errored case into "failing", which is the
+    // exact conflation this whole change exists to remove.
+    const failed = results.filter((r) => r.verdict !== "PASS" && r.verdict !== "ERROR" && !parkedIds.has(r.id));
 
     // Python target: what the run cost, MEASURED from the rows the service wrote for its threads.
     let cost: RunCost | null = null;
@@ -790,6 +877,10 @@ async function main() {
             date: new Date().toISOString(),
             commit,
             dirty,
+            // A run that could not run every case is not a baseline. Recorded rather than
+            // refused: the cases that DID run are real, and `dirty` already set the precedent
+            // that a caveat belongs in the file instead of being a reason to write nothing.
+            incomplete: errored.length > 0,
             target: TARGET,
             knobs: { runs: RUNS, adversarialRuns: ADVERSARIAL_RUNS, judge: JUDGE, candidates: VECTOR_CANDIDATES, rerankTopN: RERANK_TOP_N, threshold: RERANK_THRESHOLD },
             summary: {
@@ -802,6 +893,7 @@ async function main() {
                 retrievalMsMedian: Math.round(retrievalMedian),
                 retrievalMsWorst: Math.round(Math.max(...sorted)),
                 parked: parked.map((c) => c.id),
+                errored: errored.map((r) => r.id),
                 failing: failed.map((r) => r.id),
                 falseRefusals: falseRefusals.map((c) => c.id),
                 ...(target
@@ -825,6 +917,7 @@ async function main() {
                 id: r.id, verdict: r.verdict, intent: r.intent, retrieved: r.retrieved, chunks: r.chunks,
                 topScore: r.topScore, answered: `${r.answered}/${r.runs}`, faithful: r.faithful, detail: r.detail,
                 ...(r.faithfulDetail ? { faithfulDetail: r.faithfulDetail } : {}),
+                ...(r.errored ? { errored: r.errored } : {}),
                 ...(target ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}` } : {}),
             })),
         };
@@ -842,6 +935,7 @@ async function main() {
         console.log(`\n${failed.length} failing: ${failed.map((f) => f.id).join(", ")}`);
         process.exit(1);
     }
+    reportIncomplete();
     console.log(`\nall green${parked.length ? ` (${parked.length} parked)` : ""}.`);
 }
 

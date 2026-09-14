@@ -218,10 +218,13 @@ expected to hold to that, not just to keep the tests green.
 npm run dev                          # local app; limiter fails open without Upstash keys
 npm test                             # Vitest unit tests (Mac, not the bridge VM)
 npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail; writes evals/results/<stamp>.json (commit it)
+#   a case that cannot RUN (gateway timeout, dropped connection) is verdict ERROR, not a failure:
+#   the run continues, errored cases leave every denominator, and the run exits 4 as INCOMPLETE
 EVAL_RUNS=0 npm run eval             # retrieval-only (still pays planner+embed+rerank); fails on a recall miss twice
 npm run eval:planner                 # planner-only: intent, sub-query count, must/must-not strings; cheap
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
 DEBUG_PLAN=1 EVAL_RUNS=0 npm run eval # hypotheticals + vector candidates per sub-query
+EVAL_FAULT=id1,id2 npm run eval      # make those cases throw a simulated gateway timeout, free: proves the ERROR path
 EVAL_JUDGE=1 npm run eval            # + faithfulness judge per answered case
 EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval   # the same suite against a running agent service over HTTP: every run plans + retrieves again, recall run 1 and every run, measured cost from query_log (origin eval); no judge, no EVAL_RUNS=0; writes evals/results/<stamp>-python.json
 npm run eval:calibrate               # validate the judge against known-labelled answers first (last: 0/12 FA, 0/23 missed, n=35)
