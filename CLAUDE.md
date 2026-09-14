@@ -33,6 +33,8 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
+| `agent/infra/` | The AWS deploy (phase 2b): `aws_secret.py` builds one Secrets Manager secret from `.env.local` with the service's own dotenv parser and validates it with the service's own `Settings` before upload; `roles.sh` the two IAM roles, the three service-linked roles and a `GetSecretValue` policy scoped to one ARN; `service.sh` the Express Mode service, with every overridden default and why. Redeploy is those three in order |
+| `agent/experiments/container_memory.sh` | What the container needs: the real image under a hard `--memory` cap with real `/chat` turns, reporting cgroup `anon` and `file` separately. Measured 145 MiB working set; page cache is charged to whichever container faults the image layers in first, so read position 1 |
 | `db/000..008_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) |
 
 ## Invariants — do not break these
@@ -249,6 +251,12 @@ npm run exp:refusal-verdicts         # freeze isRefusal's verdicts for the Pytho
 cd agent && uv run python experiments/checkpoint_overhead.py   # checkpointer cost per turn (time, rows, bytes) per durability, database only (free)
 cd agent && uv run pytest -m integration tests/test_checkpoint_live.py   # the saver on the real database: round trip, and the Data API roles see no rows (free)
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
+cd agent && ./experiments/container_memory.sh          # what the container needs under a hard cap; about 6 cents
+cd agent && uv run python infra/aws_secret.py          # dry run: key names and lengths, no values; --write uploads
+cd agent && ./infra/roles.sh                           # IAM roles, service-linked roles, the scoped secret policy
+cd agent && ./infra/service.sh                         # create the Express Mode service at the current commit tag
+#   teardown: aws ecs delete-express-gateway-service --service-arn <arn>; the deregistration delay is 300 s,
+#   so the container gets SIGTERM about five minutes later and its shutdown lines land then
 ```
 
 ## Environment gotchas
