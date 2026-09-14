@@ -129,6 +129,17 @@ def describe_retention(retention: Retention) -> list[str]:
     ]
 
 
+def estimated_rows(reltuples: int) -> str:
+    """Postgres writes -1 in reltuples for a table it has never analysed, and it means UNKNOWN.
+
+    The first run of `check` printed "0 rows" for checkpoint_migrations, a table that cannot be
+    empty because the migration number on the line above is read out of it. A diagnostic that
+    turns "I do not know" into a confident zero is worse than one that says nothing, so an
+    unanalysed table says so. `analyse checkpoints;` in the SQL editor refreshes the estimate.
+    """
+    return "?" if reltuples < 0 else f"{reltuples:,}"
+
+
 def human_bytes(size: float) -> str:
     if size < 1024:
         return f"{size:.0f} B"
@@ -233,12 +244,12 @@ async def read_sizes(pool: AsyncConnectionPool) -> dict[str, tuple[int, int]]:
     """Estimated live rows and total bytes per table, so `check` shows what retention is for.
 
     reltuples is the planner's estimate, refreshed by analyse and autovacuum, and it is -1 on a
-    table that has never been analysed. Exact counts would be four sequential scans to print a
-    diagnostic line; an estimate is all this line is.
+    table that has never been analysed; estimated_rows keeps that distinction. Exact counts would
+    be four sequential scans to print a diagnostic line; an estimate is all this line is.
     """
     async with pool.connection() as conn:
         cur = await conn.execute(
-            "select c.relname, greatest(c.reltuples, 0)::bigint, pg_total_relation_size(c.oid) "
+            "select c.relname, c.reltuples::bigint, pg_total_relation_size(c.oid) "
             "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
             "where n.nspname = current_schema() and c.relkind = 'r' and c.relname = any(%s)",
             (list(CHECKPOINT_TABLES),),
@@ -291,10 +302,11 @@ async def check(pool: AsyncConnectionPool) -> None:
     sizes = await read_sizes(pool)
     print(f"migration {version} (the saver needs {latest_migration()})")
     for table in CHECKPOINT_TABLES:
-        rows, size = sizes.get(table, (0, 0))
+        rows, size = sizes.get(table, (-1, 0))
         security = str(row_security.get(table, "missing"))
         print(
-            f"  {table:24} row level security {security:7} {rows:>9,} rows {human_bytes(size):>10}"
+            f"  {table:24} row level security {security:7} "
+            f"{estimated_rows(rows):>9} rows {human_bytes(size):>10}"
         )
     for line in describe_retention(await read_retention(pool)):
         print(line)

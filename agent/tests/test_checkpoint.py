@@ -17,6 +17,7 @@ from copilot_agent.checkpoint import (
     RETENTION_JOB,
     Retention,
     describe_retention,
+    estimated_rows,
     human_bytes,
     readiness_problems,
     serializer,
@@ -174,3 +175,14 @@ def test_the_last_run_is_reported_in_utc_whatever_the_session_timezone() -> None
 def test_human_bytes(size: int, expected: str) -> None:
     # 9532 is the measured 9.3 KiB a turn stores at durability=exit: the unit the growth is in.
     assert human_bytes(size) == expected
+
+
+@pytest.mark.parametrize(
+    ("reltuples", "expected"),
+    [(-1, "?"), (0, "0"), (916, "916"), (4462, "4,462")],
+)
+def test_an_unanalysed_table_says_so_instead_of_zero(reltuples: int, expected: str) -> None:
+    # The first run of `check` reported 0 rows for checkpoint_migrations, which cannot be empty:
+    # the migration number printed on the line above is read out of it. -1 is Postgres saying it
+    # has never analysed the table, and a diagnostic must not round that to a confident zero.
+    assert estimated_rows(reltuples) == expected
