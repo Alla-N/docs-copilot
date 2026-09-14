@@ -5,6 +5,7 @@ real database in test_checkpoint_live.py (integration).
 """
 
 import dataclasses
+from datetime import UTC, datetime
 
 import ormsgpack
 import pytest
@@ -13,6 +14,10 @@ from langgraph._internal._serde import collect_allowlist_from_schemas
 from copilot_agent.checkpoint import (
     CHECKPOINT_TABLES,
     PERSISTED_TYPES,
+    RETENTION_JOB,
+    Retention,
+    describe_retention,
+    human_bytes,
     readiness_problems,
     serializer,
 )
@@ -123,3 +128,49 @@ def test_a_class_not_in_the_allowlist_is_not_rebuilt() -> None:
     # What strict mode buys: a blob naming any other class does not get it imported and called.
     loaded = serializer().loads_typed(serializer().dumps_typed(NotInTheState("x")))
     assert not isinstance(loaded, NotInTheState)
+
+
+# ---- retention (db/008), reported and never enforced ---------------------------------------------
+
+
+def test_no_retention_job_says_the_tables_grow_without_bound() -> None:
+    # The whole point of the line. A deploy check that printed nothing here would let a database
+    # collect conversations for a year before anybody noticed.
+    head, detail = describe_retention(Retention())
+    assert "NO " + RETENTION_JOB in head
+    assert "grow without bound" in head
+    assert "db/008" in detail
+
+
+def test_a_database_without_pg_cron_is_reported_not_raised() -> None:
+    # CI, Docker and a laptop run against databases with no cron schema and no db/008. That is an
+    # ordinary state for this command, so read_retention turns the psycopg error into this line.
+    head, detail = describe_retention(Retention(unreadable="InvalidSchemaName"))
+    assert "InvalidSchemaName" in detail
+    assert "NO " + RETENTION_JOB in head
+
+
+def test_a_scheduled_job_that_has_never_run_is_not_the_same_as_no_job() -> None:
+    head, detail = describe_retention(Retention(scheduled="17 3 * * *"))
+    assert "17 3 * * *" in head
+    assert detail.strip() == "never run"
+
+
+def test_the_last_run_is_reported_in_utc_whatever_the_session_timezone() -> None:
+    # timestamptz comes back in the connection's timezone. The line says UTC, so it converts.
+    ran = datetime.fromisoformat("2026-09-13T06:17:00+03:00")
+    _, detail = describe_retention(
+        Retention(scheduled="17 3 * * *", last_ran=ran, last_retain_days=30, last_threads_deleted=4)
+    )
+    assert "2026-09-13 03:17 UTC" in detail
+    assert "4 threads over 30 days" in detail
+    assert ran.astimezone(UTC).hour == 3
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [(0, "0 B"), (1023, "1023 B"), (1024, "1.0 KiB"), (9532, "9.3 KiB"), (5 << 20, "5.0 MiB")],
+)
+def test_human_bytes(size: int, expected: str) -> None:
+    # 9532 is the measured 9.3 KiB a turn stores at durability=exit: the unit the growth is in.
+    assert human_bytes(size) == expected

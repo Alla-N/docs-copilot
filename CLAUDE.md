@@ -33,7 +33,7 @@ expected to hold to that, not just to keep the tests green.
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
-| `db/000..007_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` |
+| `db/000..008_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) |
 
 ## Invariants — do not break these
 
@@ -140,7 +140,14 @@ expected to hold to that, not just to keep the tests green.
    the real `parseChatRequest` by a golden file). The checkpoint tables are created by
    `python -m copilot_agent.checkpoint setup` from a terminal, never at startup, with Row Level
    Security on (the saver puts them in `public`, which the Supabase Data API exposes), and the
-   service refuses to start unless they are migrated and locked down. Checkpoint blobs are read
+   service refuses to start unless they are migrated and locked down. They are the only tables
+   here with a RETENTION policy (`db/008_checkpoint_retention.sql`): a pg_cron job deletes whole
+   THREADS whose newest checkpoint is over 30 days old, because `checkpoint_blobs` has no
+   `checkpoint_id` and ageing out one checkpoint of a live thread would orphan or steal its
+   blobs. The prune function lives in `maintenance`, not `public`, or the Data API would serve it
+   as an unauthenticated RPC that deletes conversations. It is reported by `checkpoint check`,
+   never enforced at startup: CI, Docker and a laptop run against databases with no pg_cron.
+   `query_log` is NOT pruned - it is the measurement record. Checkpoint blobs are read
    back through a strict serializer (`checkpoint.serializer`): LangGraph's default imports and
    calls any class a blob names.
 14. **With `AGENT_URL` set, the route is a byte pipe.** (Step 2.6, `lib/agent-forward.ts`.) Rate
@@ -232,7 +239,8 @@ npm run exp:generation-requests      # same for the answer step (streamText requ
 cd agent && uv run uvicorn --factory copilot_agent.api:create_app --reload   # agent service on 127.0.0.1:8000 (needs AGENT_API_KEY + ASSISTANT_SIGNING_SECRET; add ENABLE_SEARCH_ENDPOINT=1 for /search)
 cd agent && uv run python experiments/chat_latency.py "how do I stream text"   # warm /chat timings against a running service: headers, start, first token, total (about a cent per run)
 cd agent && UPDATE_GOLDEN=1 uv run pytest tests/test_chat_api.py   # rewrite the golden /chat streams after changing the stream; then npm test (the contract test reads them)
-cd agent && uv run python -m copilot_agent.checkpoint setup   # create/migrate LangGraph's checkpoint tables + turn RLS on (once per database; `check` only reports)
+cd agent && uv run python -m copilot_agent.checkpoint setup   # create/migrate LangGraph's checkpoint tables + turn RLS on (once per database)
+cd agent && uv run python -m copilot_agent.checkpoint check   # reports only: migration, RLS, rows and size per table, and the db/008 retention job
 npm run exp:history-caps             # freeze what parseChatRequest keeps of a conversation into agent/tests/golden/ (free, no network); rerun after editing lib/chat-request.ts
 npm run exp:refusal-verdicts         # freeze isRefusal's verdicts for the Python port (free, no network); rerun after editing lib/refusal.ts
 cd agent && uv run python experiments/checkpoint_overhead.py   # checkpointer cost per turn (time, rows, bytes) per durability, database only (free)

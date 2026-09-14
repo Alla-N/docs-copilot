@@ -28,6 +28,16 @@ checkpoint_blobs, checkpoint_writes). Three things here are decisions, not defau
    silently: the persisted state is a schema now, and changing HistoryTurn changes how existing
    threads load.
 
+4. Retention is a scheduled job in the database, not code in here. The four tables grow
+   without bound and LangGraph ships no TTL: adelete_thread(thread_id) takes a thread id, never
+   an age, and it is the only delete the library has. db/008_checkpoint_retention.sql deletes
+   whole THREADS whose newest checkpoint is over 30 days old, daily, from pg_cron, in a schema
+   Supabase's Data API does not expose. Deliberately NOT part of readiness_problems: pg_cron is
+   a Supabase extension, and CI, Docker and a laptop all run against databases without one, so
+   a service that refused to start without a retention job would be a service that cannot be
+   tested. `check` reports it instead, and deploying with it in place is a checklist item
+   (agent/README.md).
+
 One pool of ONE connection: the saver serialises every database call behind a single asyncio.Lock
 (AsyncPostgresSaver._cursor in langgraph/checkpoint/postgres/aio.py), even when handed a pool, so
 it never uses more than one connection at a time. A separate pool keeps checkpoint traffic from
@@ -38,15 +48,23 @@ import argparse
 import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import psycopg
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg import errors
 from psycopg_pool import AsyncConnectionPool
 
 from copilot_agent.graph import GenerationMetrics, SubQueryRetrieval
 from copilot_agent.planner import HistoryTurn, Plan, SubQuery, TokenUsage
-from copilot_agent.retrieval import POOL_OPEN_TIMEOUT_S, RetrievedChunk, connection_kwargs
+from copilot_agent.retrieval import (
+    POOL_CLOSE_TIMEOUT_S,
+    POOL_OPEN_TIMEOUT_S,
+    RetrievedChunk,
+    connection_kwargs,
+)
 from copilot_agent.settings import Settings, get_settings
 
 if TYPE_CHECKING:
@@ -72,6 +90,53 @@ PERSISTED_TYPES: tuple[type, ...] = (
 )
 
 SETUP_HINT = "run: cd agent && uv run python -m copilot_agent.checkpoint setup"
+
+# db/008_checkpoint_retention.sql: the pg_cron job's name, and the table it writes a row to on
+# every run. Both live in schemas the Data API does not serve, which is why a function that
+# deletes conversations is not also an HTTP endpoint (the file says more).
+RETENTION_JOB = "prune-checkpoint-threads"
+RETENTION_LOG = "maintenance.checkpoint_retention_log"
+RETENTION_HINT = "run db/008_checkpoint_retention.sql in the Supabase SQL editor"
+
+
+@dataclass(frozen=True)
+class Retention:
+    """What db/008 has done to this database. Reported by `check`, never enforced (point 4)."""
+
+    scheduled: str | None = None  # the job's cron schedule; None when there is no job
+    last_ran: datetime | None = None
+    last_retain_days: int | None = None
+    last_threads_deleted: int | None = None
+    unreadable: str | None = None  # the psycopg error class, on a database without pg_cron or 008
+
+
+def describe_retention(retention: Retention) -> list[str]:
+    """The two lines `check` prints about retention. Pure, so a test can pin the wording."""
+    if retention.scheduled is None:
+        head = f"retention: NO {RETENTION_JOB} job - the tables grow without bound"
+    else:
+        head = f"retention: {RETENTION_JOB} on {retention.scheduled}"
+    if retention.unreadable is not None:
+        return [head, f"  not readable here ({retention.unreadable}); {RETENTION_HINT}"]
+    if retention.scheduled is None:
+        return [head, f"  {RETENTION_HINT}"]
+    if retention.last_ran is None:
+        return [head, "  never run"]
+    return [
+        head,
+        f"  last run {retention.last_ran.astimezone(UTC):%Y-%m-%d %H:%M} UTC: "
+        f"{retention.last_threads_deleted} threads over {retention.last_retain_days} days",
+    ]
+
+
+def human_bytes(size: float) -> str:
+    if size < 1024:
+        return f"{size:.0f} B"
+    for unit in ("KiB", "MiB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} GiB"
 
 
 def serializer() -> JsonPlusSerializer:
@@ -128,6 +193,59 @@ async def read_readiness(pool: AsyncConnectionPool) -> tuple[int | None, dict[st
     return version, row_security
 
 
+async def read_retention(pool: AsyncConnectionPool) -> Retention:
+    """The retention job and its last run, or the reason neither could be read.
+
+    A database without pg_cron has no cron schema, and one where db/008 has not been run has no
+    maintenance schema. Both are ordinary states here (CI, Docker, a laptop), not errors, so the
+    psycopg error becomes a line of output instead of an exception. The pool is autocommit
+    (retrieval.connection_kwargs), so a failed statement does not leave the next one inside an
+    aborted transaction.
+    """
+    async with pool.connection() as conn:
+        try:
+            cur = await conn.execute(
+                "select schedule from cron.job where jobname = %s", (RETENTION_JOB,)
+            )
+            row = await cur.fetchone()
+        except psycopg.Error as exc:
+            return Retention(unreadable=type(exc).__name__)
+        scheduled = row[0] if row else None
+        try:
+            cur = await conn.execute(
+                f"select ran_at, retain_days, threads_deleted from {RETENTION_LOG} "
+                "order by ran_at desc limit 1"
+            )
+            row = await cur.fetchone()
+        except psycopg.Error as exc:
+            return Retention(scheduled=scheduled, unreadable=type(exc).__name__)
+    if row is None:
+        return Retention(scheduled=scheduled)
+    return Retention(
+        scheduled=scheduled,
+        last_ran=row[0],
+        last_retain_days=row[1],
+        last_threads_deleted=row[2],
+    )
+
+
+async def read_sizes(pool: AsyncConnectionPool) -> dict[str, tuple[int, int]]:
+    """Estimated live rows and total bytes per table, so `check` shows what retention is for.
+
+    reltuples is the planner's estimate, refreshed by analyse and autovacuum, and it is -1 on a
+    table that has never been analysed. Exact counts would be four sequential scans to print a
+    diagnostic line; an estimate is all this line is.
+    """
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select c.relname, greatest(c.reltuples, 0)::bigint, pg_total_relation_size(c.oid) "
+            "from pg_class c join pg_namespace n on n.oid = c.relnamespace "
+            "where n.nspname = current_schema() and c.relkind = 'r' and c.relname = any(%s)",
+            (list(CHECKPOINT_TABLES),),
+        )
+        return {name: (rows, size) for name, rows, size in await cur.fetchall()}
+
+
 @asynccontextmanager
 async def open_pool(settings: Settings) -> AsyncIterator[AsyncConnectionPool]:
     pool = AsyncConnectionPool(
@@ -141,7 +259,7 @@ async def open_pool(settings: Settings) -> AsyncIterator[AsyncConnectionPool]:
     try:
         yield pool
     finally:
-        await pool.close()
+        await pool.close(timeout=POOL_CLOSE_TIMEOUT_S)
 
 
 @asynccontextmanager
@@ -170,9 +288,16 @@ async def setup(settings: Settings) -> None:
 
 async def check(pool: AsyncConnectionPool) -> None:
     version, row_security = await read_readiness(pool)
+    sizes = await read_sizes(pool)
     print(f"migration {version} (the saver needs {latest_migration()})")
     for table in CHECKPOINT_TABLES:
-        print(f"  {table:24} row level security {row_security.get(table, 'missing')}")
+        rows, size = sizes.get(table, (0, 0))
+        security = str(row_security.get(table, "missing"))
+        print(
+            f"  {table:24} row level security {security:7} {rows:>9,} rows {human_bytes(size):>10}"
+        )
+    for line in describe_retention(await read_retention(pool)):
+        print(line)
     problems = readiness_problems(version, row_security, latest=latest_migration())
     print("ready" if not problems else "NOT READY:\n  " + "\n  ".join(problems))
 

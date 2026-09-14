@@ -66,7 +66,16 @@ COPY --from=builder /app/.venv /app/.venv
 # PYTHONUNBUFFERED: logs reach `docker logs` (and CloudWatch in 2b) as they are written,
 # not when a buffer fills, so a crash cannot swallow its last lines.
 ENV PATH="/app/.venv/bin:$PATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    OTEL_BSP_EXPORT_TIMEOUT=4000
+
+# OTEL_BSP_EXPORT_TIMEOUT: the OpenTelemetry batch processor's own export timeout, in
+#   milliseconds, read by opentelemetry/sdk/trace/export/__init__.py. Its default is 30000,
+#   which is longer than the 5 s cap tracing.py puts on the flush AND longer than the whole
+#   window ECS gives a stopping task. That cap bounds the AWAIT, not the worker thread doing
+#   the work, so with the default the thread outlives the process's chance to exit cleanly
+#   and the container leaves by SIGKILL. Below the cap, the thread's own bound is the tighter
+#   one. A deployment constraint, so it lives in the deployment artefact.
 
 WORKDIR /app
 USER 999:999
@@ -81,4 +90,13 @@ EXPOSE 8000
 # network interface, so a server bound to 127.0.0.1 in here is unreachable from outside.
 # --factory: create_app() runs at startup and reads settings then, as in local dev.
 # One process per container: scale with more containers (ECS tasks), not workers inside one.
-CMD ["uvicorn", "--factory", "copilot_agent.api:create_app", "--host", "0.0.0.0", "--port", "8000"]
+# --timeout-graceful-shutdown: uvicorn's default is None, which means wait forever, and it
+# waits for in-flight connections BEFORE running the lifespan (uvicorn/server.py, shutdown()).
+# An open /chat stream would therefore hold a stopping task past ECS's 30 s, SIGKILL would
+# arrive, and the lifespan would never run at all: the last query_log rows and the queued
+# spans dropped, three pools severed rather than closed. 10 s is longer than a measured
+# answer (about 5.2 s to done) and leaves the rest of the budget room inside the 30 s.
+# tests/test_shutdown_budget.py adds it all up; agent/README.md has the table.
+CMD ["uvicorn", "--factory", "copilot_agent.api:create_app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--timeout-graceful-shutdown", "10"]

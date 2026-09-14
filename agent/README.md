@@ -427,3 +427,144 @@ Add `-e ENABLE_SEARCH_ENDPOINT=1` before the image name to get `POST /search`.
 
 CI (`.github/workflows/agent.yml`) runs ruff, pytest (no integration tests, no secrets) and a
 `docker build` with an import smoke test on every push that touches `agent/`.
+
+## Before AWS: startup, connections and shutdown (before phase 2b)
+
+Four properties a container has to have before it is worth putting behind a load balancer. Each
+one is a number somewhere in the code; this section is where they add up.
+
+### The task fails fast, and exits 3
+
+Nothing in here degrades gracefully into a half-working service. The lifespan opens tracing, the
+search pool, the checkpointer and the query log in that order, and three of them refuse:
+
+| refuses when | raised by |
+|---|---|
+| `AGENT_API_KEY` or `ASSISTANT_SIGNING_SECRET` missing | `api.create_app`, before the lifespan |
+| `DATABASE_URL` is Supabase's IPv6-only direct host | `settings.Settings`, at import of the app |
+| the database is unreachable | `pool.open(wait=True)`, after `POOL_OPEN_TIMEOUT_S` (10 s) |
+| the checkpoint tables are missing, behind migration 9, or have RLS off | `checkpoint.readiness_problems` |
+| `query_log` is missing any column the service writes, `origin`, `thread_id` and `trace_id` included, or has RLS off | `query_log.readiness_problems` |
+
+A `RuntimeError` out of the lifespan is not a 500 on the first request: uvicorn logs
+`Application startup failed. Exiting.` and calls `sys.exit(STARTUP_FAILURE)`, which is exit code
+3 (`uvicorn/lifespan/on.py`, `uvicorn/server.py`). So a task deployed against a database that has
+not had `db/006` and `db/007` run never serves a byte; it crash-loops, the ECS deployment never
+reaches steady state, and the circuit breaker rolls it back. That is the intended behaviour, and
+`tests/test_api.py` pins both refusals.
+
+`GET /health` deliberately queries nothing. Startup already proved the database, and a health
+check that hit Supabase would let one blip mark every task unhealthy at the same moment.
+
+### Connections: 3 idle, 6 at peak, per task
+
+| pool | min | max | why |
+|---|---|---|---|
+| search (`retrieval.open_search`) | 1 | 4 | up to four sub-queries retrieve in parallel (`Send`) |
+| checkpoints (`checkpoint.open_pool`) | 1 | 1 | the saver serialises everything behind one lock anyway |
+| query log (`query_log.open_query_log`) | 1 | 1 | its own pool so an insert never queues behind a search |
+
+`DATABASE_URL` is the **session** pooler (port 5432). Session mode hands each client connection a
+dedicated Postgres backend for its whole life, so those are real backends, not multiplexed ones:
+**3 per idle task and 6 per busy one**, and `min_size=1` means an idle task still holds three.
+
+The ceiling on ECS task count is therefore `pool size / 6`, and the pool size is a project
+setting, not something to guess from a docs page. Read it before sizing the service:
+
+```sql
+show max_connections;
+select count(*) as in_use from pg_stat_activity;
+```
+
+plus **Pool Size** under Project Settings > Database > Connection pooling in the dashboard. Write
+the answer here with the date, the way every other number in this README is written down.
+
+If the ceiling turns out to be too low for the task count autoscaling wants, the escape hatch is
+already built and needs no code: point `DATABASE_URL` at the **transaction** pooler (port 6543)
+and `settings.uses_transaction_pooler` adds `prepare_threshold=None` to every connection
+(`retrieval.connection_kwargs`), because that pooler cannot keep prepared statements between
+transactions. Measure the suite again afterwards; do not assume the ports are interchangeable.
+
+### Shutdown fits in ECS's 30 s
+
+ECS sends SIGTERM and kills the task `stopTimeout` seconds later, 30 by default. uvicorn is PID 1
+(the Dockerfile's exec-form `CMD`) so it gets the signal, and then does this
+(`uvicorn/server.py`, `shutdown()`):
+
+```
+close the listening sockets
+connection.shutdown() on every live connection
+await wait_for(_wait_tasks_to_complete(), timeout=timeout_graceful_shutdown)
+await lifespan.shutdown()      <- the drain, the pool closes and the trace flush are all HERE
+```
+
+**The lifespan runs last, after the wait for in-flight connections, and that wait defaults to
+forever.** An open `/chat` stream would hold a stopping task until SIGKILL arrived, and the
+lifespan would then never run at all: the last `query_log` rows dropped, the queued spans
+dropped, and three pools severed rather than closed, so Supavisor holds those backends until its
+own timeout. Hence `--timeout-graceful-shutdown 10` in the `CMD`, and the whole budget:
+
+| step | cap | where |
+|---|---|---|
+| wait for in-flight streams | 10 s | `--timeout-graceful-shutdown` in the Dockerfile |
+| `QueryLog.drain` | 5 s | `DRAIN_TIMEOUT_S` |
+| query log pool close | 2 s | `POOL_CLOSE_TIMEOUT_S` |
+| checkpoint pool close | 2 s | `POOL_CLOSE_TIMEOUT_S` |
+| search pool close | 2 s | `POOL_CLOSE_TIMEOUT_S` |
+| Langfuse flush | 5 s | `SHUTDOWN_TIMEOUT_S` |
+| **worst case** | **26 s** | of 30, so 4 s of slack |
+
+Two of those numbers moved for this section. psycopg's `pool.close()` defaults to a 5 s wait, and
+three pools close one after another, so the default alone was 15 s that nothing had costed.
+And `tracing.py` bounds the *await* on the flush, not the worker thread doing it: the
+OpenTelemetry batch processor's own export timeout defaults to 30 000 ms, longer than our cap and
+longer than the entire ECS window, so `OTEL_BSP_EXPORT_TIMEOUT=4000` in the Dockerfile makes the
+thread's own bound the tighter one.
+
+`tests/test_shutdown_budget.py` adds the table up from the constants and the Dockerfile, so
+raising any one of them fails a test instead of a deploy. It also carries a canary on uvicorn's
+unbounded default, which is the only reason the flag exists.
+
+**Task definition:** leave `stopTimeout` at 30 (the budget is sized for it), and give the target
+group a deregistration delay so a task leaves the load balancer before it is asked to stop.
+
+### Retention: the checkpoint tables have a bound now
+
+The four checkpoint tables grew without limit until `db/008_checkpoint_retention.sql`. LangGraph
+ships no TTL and no prune: `adelete_thread(thread_id)` is the library's only delete and it takes
+a thread id, never an age. The file deletes whole **threads** whose newest checkpoint is over 30
+days old, daily at 03:17 UTC, from `pg_cron`.
+
+- **Threads, not checkpoints.** `checkpoint_blobs` is keyed by
+  `(thread_id, checkpoint_ns, channel, version)` with no `checkpoint_id`; which version a
+  checkpoint uses is inside its own `channel_versions` map. Ageing out one checkpoint of a live
+  thread orphans blobs, or removes a version a surviving checkpoint still needs and that thread
+  loads with nulls. Whole threads is the only unit the three tables agree on without a join.
+- **Age comes out of the JSONB.** No table has a timestamp column. `checkpoint->>'ts'` is the ISO
+  string LangGraph writes; `checkpoint_id` is time-ordered too but it is a UUIDv6, 100-nanosecond
+  intervals since 1582 split over three fields.
+- **30 days, because that is Langfuse's free-tier retention**, so a trace and the state that
+  produced it expire together. Nothing longer is reachable anyway: `app/page.tsx` makes the
+  thread id with `useState(() => crypto.randomUUID())`, so a reloaded tab can never address its
+  thread again.
+- **Not in the `public` schema.** Supabase serves every `public` function as
+  `POST /rest/v1/rpc/<name>` to the publishable anon key, and PostgreSQL grants EXECUTE to PUBLIC
+  by default: a prune function there would be an unauthenticated endpoint that deletes
+  conversations. It lives in `maintenance`, which the Data API does not expose.
+- **`query_log` keeps everything**, on purpose. It is the measurement record behind every latency
+  and cost figure above, and one row per turn is a rounding error next to the checkpoints.
+- **Not a startup check.** pg_cron is a Supabase extension and CI, Docker and a laptop run
+  against databases without one, so a service that refused to start without a retention job could
+  not be tested. `uv run python -m copilot_agent.checkpoint check` reports it instead, next to
+  each table's estimated rows and size, and running that is the deploy checklist item.
+
+### Deploy checklist
+
+1. `db/006`, `db/007` and `db/008` have been run on the target database.
+2. `uv run python -m copilot_agent.checkpoint check` prints `ready` and a retention line with a
+   schedule.
+3. `DATABASE_URL` is a pooler host (the settings validator refuses the direct one), and the task
+   count is under `pool size / 6`.
+4. `stopTimeout` is 30 and the target group has a deregistration delay.
+5. `LANGFUSE_ENVIRONMENT` is set to something other than `development`, so the deployed service
+   does not share a dashboard with this laptop.

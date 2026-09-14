@@ -49,6 +49,12 @@ RERANK_TIMEOUT_S = 15.0
 POOL_MIN_SIZE = 1
 POOL_MAX_SIZE = 4
 POOL_OPEN_TIMEOUT_S = 10.0
+# How long pool.close() waits for its worker threads to stop. psycopg's default is 5 s, and
+# the lifespan closes THREE pools one after another (query log, checkpoints, search), so the
+# default alone is 15 s of the 30 s ECS gives a stopping task - before uvicorn has waited for
+# a single in-flight stream. A close only has to outlast a checked-in connection's shutdown;
+# an expired one closes the pool anyway, with a warning. See tests/test_shutdown_budget.py.
+POOL_CLOSE_TIMEOUT_S = 2.0
 
 RetrievalMode = Literal["reranked", "cosine-fallback", "skipped"]
 
@@ -354,4 +360,4 @@ async def open_search(settings: Settings) -> AsyncIterator[SearchDocs]:
 
             yield search
     finally:
-        await pool.close()
+        await pool.close(timeout=POOL_CLOSE_TIMEOUT_S)
