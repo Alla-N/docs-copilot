@@ -28,6 +28,18 @@ TRANSACTION_POOLER_PORT = 6543
 
 MIN_AGENT_API_KEY_LENGTH = 32
 
+# A value that both starts and ends with the same quote character was almost certainly pasted out
+# of .env.local with its quotes attached. pydantic-settings reads that file as dotenv, where
+# quotes are syntax and get stripped, so this can never fire for local development; every other
+# way a value reaches this process keeps them (Docker env files, ECS task definitions, Secrets
+# Manager). Like the length check on AGENT_API_KEY it is a typo test, not a strength test: a real
+# secret wrapped in matching quotes would be rejected, and the message says how to fix that.
+# Found in 2b.2. DATABASE_URL and LANGFUSE_BASE_URL already catch a quoted value by accident, as
+# a malformed URL. AGENT_API_KEY and ASSISTANT_SIGNING_SECRET catch nothing, and a quoted secret
+# is not invalid - it is simply the wrong secret. The service would start, sign with it, and
+# every signature it produced would fail verification elsewhere with nothing naming the cause.
+QUOTE_CHARACTERS = ("'", '"')
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -98,6 +110,35 @@ class Settings(BaseSettings):
     # (The prefix check is a validator, not part of the pattern: pydantic compiles `pattern` with
     # Rust's regex crate, which has no lookahead.)
     langfuse_environment: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9_-]*$")
+
+    @field_validator(
+        "openai_api_key",
+        "cohere_api_key",
+        "database_url",
+        "agent_api_key",
+        "assistant_signing_secret",
+        "langfuse_public_key",
+        "langfuse_secret_key",
+        "langfuse_base_url",
+        mode="before",
+    )
+    @classmethod
+    def _not_pasted_with_its_quotes(cls, value: object) -> object:
+        # mode="before" puts this ahead of SecretStr coercion and ahead of the URL validators
+        # below, so the error names the cause rather than a symptom of it.
+        wrapped_in_quotes = (
+            isinstance(value, str)
+            and len(value) >= 2
+            and value[0] in QUOTE_CHARACTERS
+            and value[-1] == value[0]
+        )
+        if wrapped_in_quotes:
+            raise ValueError(
+                "starts and ends with a quote character, so it was probably pasted out of "
+                ".env.local with the quotes. Those are dotenv syntax, not part of the value. "
+                "Paste it without them."
+            )
+        return value
 
     @field_validator("langfuse_base_url")
     @classmethod

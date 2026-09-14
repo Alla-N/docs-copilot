@@ -177,3 +177,39 @@ def test_durability_is_one_of_langgraphs_three(env: pytest.MonkeyPatch) -> None:
     env.setenv("CHECKPOINT_DURABILITY", "sometimes")
     with pytest.raises(ValidationError):
         load()
+
+
+QUOTED = [
+    ("OPENAI_API_KEY", '"sk-test-not-real"'),
+    ("DATABASE_URL", f'"{POOLER_URL}"'),
+    ("AGENT_API_KEY", '"' + "a" * 32 + '"'),
+    ("ASSISTANT_SIGNING_SECRET", "'shared-with-next'"),
+    ("LANGFUSE_BASE_URL", '"https://cloud.langfuse.com"'),
+]
+
+
+@pytest.mark.parametrize(("name", "value"), QUOTED)
+def test_a_value_pasted_with_its_quotes_fails_startup(
+    env: pytest.MonkeyPatch, name: str, value: str
+) -> None:
+    # Observed in 2b.2: docker --env-file is not a dotenv parser, so a quoted .env.local value
+    # reaches the process with its quotes. LANGFUSE_BASE_URL failed on its scheme; the two
+    # service secrets would not have failed at all, they would simply have been wrong.
+    env.setenv(name, value)
+    with pytest.raises(ValidationError, match="quote") as error:
+        load()
+    assert value.strip("\"'") not in str(error.value)
+
+
+def test_a_quoted_database_url_blames_the_quotes_not_the_host(env: pytest.MonkeyPatch) -> None:
+    # The quote check runs mode="before", so it wins over the pooler validator and the message
+    # points at the real cause instead of sending the reader to inspect a hostname.
+    env.setenv("DATABASE_URL", f'"{POOLER_URL}"')
+    with pytest.raises(ValidationError, match="quote"):
+        load()
+
+
+@pytest.mark.parametrize("fine", ['sk-has-"quotes"-inside', "'mismatched\"", '"'])
+def test_quotes_that_are_not_a_wrapper_are_left_alone(env: pytest.MonkeyPatch, fine: str) -> None:
+    env.setenv("OPENAI_API_KEY", fine)
+    assert load().openai_api_key.get_secret_value() == fine

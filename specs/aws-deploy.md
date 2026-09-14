@@ -99,7 +99,7 @@ this service.
 |---|---|---|---|
 | `--health-check-path` | `/ping` | `/health` | We have `/health`, and it queries nothing on purpose, which is what an ALB health check should hit. `/ping` is a 404, so every task would fail its health check and the deploy would roll back with a healthy service inside it. |
 | `containerPort` | 80 | 8000 | The Dockerfile's `EXPOSE`/`CMD`. |
-| `--cpu` / `--memory` | 256 / 512 | **256 / 512, the default** | Decision 8. The prediction written here first was 512 / 1024 and it was wrong. That stays on the record: a default being correct is only knowable after measuring it, and a spec that quietly deletes its wrong predictions is not a record of anything. |
+| `--cpu` / `--memory` | 256 / 512 | **256 / 512, the default** | Decision 8. The prediction written here first was 512 / 1024 and it was wrong. That stays on the record: a default being correct is only knowable after measuring it, and a spec that quietly deletes its wrong predictions is not a record of anything. **And the two AWS pages disagree about what the default even is**: the CLI reference says 256 / 512, while the Express Mode getting-started page says its minimal command produces 1 vCPU and 2 GB, which is four times the cost. Passing both explicitly makes the question moot, which is the argument for passing them explicitly. |
 | `--scaling-target` | AWS's | `minTaskCount=1,maxTaskCount=2` | Decision 6. |
 | `--task-role-arn` | none | none | Stated so that "we did not need one" is a decision on the record rather than an omission. |
 | `--cpu-architecture` | `X86_64` | `X86_64` | Decision 7: stated, not defaulted. Absent from the published reference for this command; the installed CLI has it. |
