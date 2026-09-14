@@ -469,15 +469,27 @@ dedicated Postgres backend for its whole life, so those are real backends, not m
 **3 per idle task and 6 per busy one**, and `min_size=1` means an idle task still holds three.
 
 The ceiling on ECS task count is therefore `pool size / 6`, and the pool size is a project
-setting, not something to guess from a docs page. Read it before sizing the service:
+setting rather than something to guess from a docs page.
 
-```sql
-show max_connections;
-select count(*) as in_use from pg_stat_activity;
-```
+**Read 2026-09-14**, Project Settings > Database > Connection pooling, compute size **Nano**:
+connection pool size **15** (Supavisor's connections to the Postgres cluster, per user and
+database, the Nano default), max client connections **200** (fixed for Nano, and not the binding
+constraint in session mode). So the ceiling is **2 tasks**, or 5 if sized on the three each holds
+idle. Use 2: Express Mode starts at 1 and should autoscale no higher than that.
 
-plus **Pool Size** under Project Settings > Database > Connection pooling in the dashboard. Write
-the answer here with the date, the way every other number in this README is written down.
+**Left at 15, deliberately.** Supabase's own services (Auth, Storage, PostgREST, the health
+checker) come out of the same `max_connections` as the pooler, and the TypeScript route talks to
+PostgREST on every request, so the front end this service sits behind is competing for the same
+total. Supabase's guidance is to stay under about 40% of `max_connections` when the database API
+is in use; Nano is documented at 60 direct connections, which puts 15 at about 25%. Raising the
+pool to fit a third task would take connections from the app. (`show max_connections;` is the
+check on the documented 60; not run yet.)
+
+**An eval run costs 6 of the 15 too**, on the same pooler and the same user, because a local
+service opens the same three pools. Two busy tasks (12) plus a local run (6) is over the pool,
+and session mode queues a client for about a minute before it fails. Once the service is
+deployed: run the suite against the deployed URL, or against a local service with the ECS service
+scaled to zero, never both at once.
 
 If the ceiling turns out to be too low for the task count autoscaling wants, the escape hatch is
 already built and needs no code: point `DATABASE_URL` at the **transaction** pooler (port 6543)
@@ -564,7 +576,8 @@ days old, daily at 03:17 UTC, from `pg_cron`.
 2. `uv run python -m copilot_agent.checkpoint check` prints `ready` and a retention line with a
    schedule.
 3. `DATABASE_URL` is a pooler host (the settings validator refuses the direct one), and the task
-   count is under `pool size / 6`.
+   count is at most 2 (pool size 15 / 6 per task), with no local eval running against the same
+   database at the same time.
 4. `stopTimeout` is 30 and the target group has a deregistration delay.
 5. `LANGFUSE_ENVIRONMENT` is set to something other than `development`, so the deployed service
    does not share a dashboard with this laptop.
