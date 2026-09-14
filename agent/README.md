@@ -581,3 +581,140 @@ days old, daily at 03:17 UTC, from `pg_cron`.
 4. `stopTimeout` is 30 and the target group has a deregistration delay.
 5. `LANGFUSE_ENVIRONMENT` is set to something other than `development`, so the deployed service
    does not share a dashboard with this laptop.
+
+## Phase 2b: deployed on AWS, measured, and taken down again
+
+Run on 2026-09-14 on ECS Express Mode in `eu-west-1`, from image `59d35b9` in ECR, on a Fargate
+task behind an internet-facing Application Load Balancer, with six secrets in one Secrets Manager
+secret and logs in CloudWatch. `specs/aws-deploy.md` holds the decisions; `infra/` holds the three
+scripts, so a redeploy is `aws_secret.py --write`, `roles.sh`, `service.sh`.
+
+The service was deleted after the measurement. The claim is "built the image, ran it on Fargate
+behind a load balancer, and ran the 27-case suite against the deployed URL", which is earned by
+having done it and by the numbers below, not by paying about $35 a month to keep a URL warm.
+
+### The numbers
+
+Two runs against the deployed URL, next to the phase 2 pair measured against a local service on
+the laptop. Same image, same model, same corpus: the only variable is where the service ran.
+
+| | phase 2, local (2.8) | phase 2b, AWS |
+|---|---|---|
+| retrieval median | 2647 / 2761 ms | **2093 / 2112** |
+| answered, to sources | 2892 / 3023 | **2358 / 2370** |
+| answered, first token | 3582 / 3780 | 3086 / 3372 |
+| answered, done | 5247 / 5153 | 4434 / 4817 |
+| canned, done | 1262 / 1210 | 1290 / 1401 |
+| cost per run | $0.1972 | $0.1972 |
+| recall run 1 | 12/12, 12/12 | 12/12, 11/12 |
+| recall every run | 11/12 both | 11/12 both |
+| coverage / guardrails / injection | 12/12 · 6/6 · 8/8 | 12/12 · 6/6 · 8/8 |
+| false refusals | 0 | 0 |
+| faithfulness | 12/13, 13/14 | 13/13, 12/13 |
+
+Stored runs: `evals/results/2026-09-14T18-11-57-python.json` and `2026-09-14T18-25-17-python.json`.
+
+**The prediction in the spec was written before the measurement and held: latency improved.** The
+reasoning was that a turn makes more Postgres round trips than inbound HTTP hops, so moving the
+container into the pooler's region should win more than the extra hop from a laptop in Athens
+costs. It did, by about 570 ms per turn.
+
+**The evidence is the spread, not the gap.** The two AWS runs agree on retrieval median to within
+19 ms and on time-to-sources to within 12 ms, while both sit about 570 ms below the local pair.
+Compare 2.8, where two runs on identical code differed by 815 ms on the first-token median: a
+difference only means something when it is large next to the within-condition spread.
+
+**And the signal appears exactly where round trips happen.** Retrieval and time-to-sources are
+tight and clearly improved. First token and done are noisy (286 and 383 ms of within-pair spread)
+because they add the generation call, and the model's variance swamps the network. The canned
+path, which is planner-only and barely touches the database, did not improve at all. A gain that
+lands on the database-bound path and nowhere else is what makes the explanation more than a story.
+
+**`followup` moved again, and it is the case that always moves.** Recall run 1 was 12/12 then
+11/12, because `followup` went 2/3 then 1/3. Both AWS runs report 11/12 for recall in every run,
+identical to the phase 2 pair. Replaying real turns gives the planner a different antecedent each
+time (step 2.6); this is that, not a deployment regression.
+
+### Findings
+
+**The judge flagged `followup` as unfaithful over a sentence that is not a claim.** The unsupported
+text was `Here is a basic setup for using streamText.` - scaffolding prose introducing a code
+block, for which the quote matcher wanted verbatim support. 2.8 found that a verdict is only as
+wide as its criterion; this is the same criterion catching a discourse marker. Backlog.
+
+**Two AWS pages disagree about the `--cpu` and `--memory` defaults.** The CLI reference says
+256 / 512; the Express Mode getting-started page says its minimal command produces 1 vCPU and 2 GB,
+four times the cost. Both are passed explicitly, which is the argument for passing them explicitly.
+
+**`--cpu-architecture` exists in the installed CLI and not in the published reference for the
+command.** Reading the synopsis the installed CLI prints is what found it.
+
+**Three service-linked roles are documented as created automatically; on a new account at least
+the ECS one is not.** `CreateExpressGatewayService` fails with `Unable to assume the service linked
+role`, naming neither the role nor how to make one, after every parameter has validated. On any
+account where somebody had once made an ECS service by hand this would have worked first time, and
+`infra/` would carry a silent dependency on a resource it never creates.
+
+**A quoted value in `.env.local` is dotenv syntax, and only dotenv strips it.** Docker env files,
+ECS task definitions and Secrets Manager all keep the quotes. `LANGFUSE_BASE_URL` failed loudly
+because a scheme validator was watching; `ASSISTANT_SIGNING_SECRET` and `AGENT_API_KEY` have
+nothing watching, and a quoted secret is not invalid, it is simply the wrong secret. Hence the
+paste check in `settings.py` and `infra/aws_secret.py` reading the file with the service's own
+parser rather than anyone copying values by hand.
+
+**The container's memory is 145 MiB of working set, and the first measurement of it was wrong.**
+See `experiments/container_memory.sh`: the reported figure moved with the position of the run
+rather than with the cgroup cap, and the whole difference was page cache charged to whichever
+container faulted the image layers in first. Every Fargate task is a first-position container, so
+the larger number is the one production gets.
+
+### The shutdown budget, verified in production
+
+Deleting the service is the only chance to watch it, so the logs were kept and read.
+
+```
+18:27:49      last health check            <- deregistration begins
+              5 minutes 40 s of silence    <- the 300 s deregistration delay
+18:33:29.964  Shutting down                <- SIGTERM
+18:33:30.064  Waiting for application shutdown.
+18:33:30.067  Application shutdown complete.
+18:33:30.067  Finished server process [1]
+```
+
+**The lifespan ran.** That is the failure the whole before-2b block was written against: uvicorn
+waiting forever for in-flight connections, SIGKILL arriving, and the lifespan never executing, so
+the last `query_log` rows and queued spans are dropped and three pools are severed rather than
+closed. `Application shutdown complete` on a real SIGTERM is that not happening.
+
+**The budget did not bind, and this run could not have tested it.** The two lines bracketing the
+lifespan are 3 ms apart, against a computed worst case of 26 000 ms. That is not headroom
+demonstrated: the deregistration delay had left the task idle for five minutes before SIGTERM, so
+there were no open streams for the 10 s wait, nothing queued for the drain, spans already exported
+and pools holding only idle connections. Every term was already zero. What is verified is the
+mechanism; the bound still matters for a SIGTERM that arrives while the task is busy - a scale-in
+under load, a shorter deregistration delay, a rollback.
+
+**The deregistration delay is visible in the log as a silence**, which is the cleanest evidence
+that a task leaves the load balancer before it is asked to stop.
+
+### What was left standing
+
+ECR (the image, inside the free tier), both IAM roles, the three service-linked roles, and the log
+group, which expires itself in 30 days - the same 30 days as the checkpoint retention job and the
+Langfuse free tier, so a trace, the state that produced it and the log line about it go together.
+
+The Secrets Manager secret was deleted with `--force-delete-without-recovery`. A recovery window
+exists for secrets that cannot be regenerated; this one is rebuilt by one command from
+`.env.local`, so the window buys nothing and blocks the name for a week.
+
+### Two things an eval against a deployed URL does not tell you
+
+**The harness records its own commit, not the system under test.** For `EVAL_TARGET=python`
+against a deployed service, the local working tree is not what answered the questions - the image
+digest is, and nothing in the results file says which one. `AGENT_URL` and the image digest belong
+in that record. Backlog.
+
+**One client is not a crowd.** Every one of the 156 requests came from a single ALB node, because
+the harness uses one `httpx.Client` and keeps the connection alive. The load balancer has a node
+in each of the three subnets and each health-checks the task every 30 s, which is the only traffic
+that was ever spread.

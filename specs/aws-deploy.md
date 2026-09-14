@@ -1,6 +1,6 @@
 # Spec — Phase 2b: the agent service on AWS
 
-**Status:** IN PROGRESS, opened 2026-09-14. Step 2b of `claude/windward-plan.md`.
+**Status:** DONE 2026-09-14, service deleted the same day. Step 2b of `claude/windward-plan.md`. Results and findings: the phase 2b section of `agent/README.md`; stored runs `evals/results/2026-09-14T18-11-57-python.json` and `2026-09-14T18-25-17-python.json`. Spec kept as the design record, wrong predictions included.
 **Why now:** phase 2 is complete and measured. The role brief asks for AWS, and the honest
 version of that claim needs a container the author actually built, pushed, ran behind a load
 balancer, measured, and then deleted on purpose.
