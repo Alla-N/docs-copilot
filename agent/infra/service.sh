@@ -51,11 +51,22 @@ echo "image: $IMAGE"
 # Our own log group, with the same 30 days the checkpoint retention job and the Langfuse free
 # tier use, so a trace, the conversation state that produced it and the log line about it all
 # expire together. A log group created implicitly never expires, and nobody goes back for it.
-if ! aws_ logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" \
-     --query "logGroups[?logGroupName=='$LOG_GROUP'] | [0]" --output text | grep -q .; then
-  aws_ logs create-log-group --log-group-name "$LOG_GROUP"
+# Create-and-tolerate, not check-then-create. The check that was here asked describe-log-groups
+# for the group and tested whether the answer was empty - but --output text renders a null
+# JMESPath result as the literal string None, which is not empty, so "does not exist" read as
+# "exists", nothing was created, and put-retention-policy failed on a group that was never made.
+# Same shape as the reltuples bug in e6bbc7d: a placeholder meaning I do not know, read as a value.
+LOG_ERR=$(mktemp -t docs-copilot-logs)
+if aws_ logs create-log-group --log-group-name "$LOG_GROUP" 2>"$LOG_ERR"; then
   echo "log group $LOG_GROUP created"
+elif grep -q ResourceAlreadyExistsException "$LOG_ERR"; then
+  echo "log group $LOG_GROUP already exists"
+else
+  cat "$LOG_ERR" >&2
+  rm -f "$LOG_ERR"
+  exit 1
 fi
+rm -f "$LOG_ERR"
 aws_ logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 30
 
 # The container payload, built by python so a value can never be mangled by shell quoting, and
@@ -111,4 +122,5 @@ aws_ ecs create-express-gateway-service \
   --cpu-architecture X86_64 \
   --scaling-target minTaskCount=1,maxTaskCount=2 \
   --tags key=project,value=docs-copilot key=phase,value=2b \
+  --monitor-resources DEPLOYMENT \
   --monitor-mode TEXT-ONLY

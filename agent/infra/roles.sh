@@ -42,6 +42,26 @@ if [ -z "$SECRET_ARN" ] || [ "$SECRET_ARN" = "None" ]; then
 fi
 echo "secret: $SECRET_ARN"
 
+# Service-linked roles. AWS documents all three as created automatically, and on a brand new
+# account at least the ECS one is not: CreateExpressGatewayService fails with "Unable to assume
+# the service linked role", which names neither the role nor how to make one. Creating them here
+# is idempotent - an existing one comes back as InvalidInput saying the name is taken.
+SLR_SERVICES="ecs.amazonaws.com elasticloadbalancing.amazonaws.com"
+SLR_SERVICES="$SLR_SERVICES ecs.application-autoscaling.amazonaws.com"
+for SLR in $SLR_SERVICES; do
+  SLR_ERR=$(mktemp -t docs-copilot-slr)
+  if aws_ iam create-service-linked-role --aws-service-name "$SLR" >/dev/null 2>"$SLR_ERR"; then
+    echo "service-linked role for $SLR created"
+  elif grep -qi "has been taken\|InvalidInput" "$SLR_ERR"; then
+    echo "service-linked role for $SLR already exists"
+  else
+    cat "$SLR_ERR" >&2
+    rm -f "$SLR_ERR"
+    exit 1
+  fi
+  rm -f "$SLR_ERR"
+done
+
 ensure_role() {  # name, trust json
   if aws_ iam get-role --role-name "$1" >/dev/null 2>&1; then
     echo "role $1 already exists"
