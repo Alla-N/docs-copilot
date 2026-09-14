@@ -31,6 +31,7 @@ keep a URL warm. Everything below is scripted so a redeploy for a demo is minute
 | 5 | **One Secrets Manager secret with six JSON keys**, not six secrets | ECS resolves `valueFrom` as `<secret-arn>:<json-key>::`, so one secret can back six environment variables. Secrets Manager is priced per secret per month, and one blast radius is easier to rotate than six. Cost is the smaller reason; rotation is the real one. |
 | 6 | **`maxTaskCount` 2** | Measured, not chosen: the Supabase pool is 15 connections and a busy task holds 6 (`agent/README.md`). Autoscaling that can outgrow the database is a worse outage than autoscaling that cannot. |
 | 7 | **`--cpu-architecture X86_64`, passed explicitly** | The Mac is a 2020 Intel i5-1038NG7, settled by the CPU brand string and by `sysctl.proc_translated` not existing, not by `uname -m`, which reports x86_64 under Rosetta too and so cannot answer the question on its own. The image built and measured in 1g is therefore already x86-64, and ARM64 would mean deploying an artifact never built or run here, from an emulated cross build. Graviton is about 20 percent cheaper and would be the right answer on an Apple Silicon machine; it is the wrong one here. Passed explicitly rather than defaulted, so the deployed architecture is a stated choice. **This parameter is not in the published command reference at all** and was found in the synopsis the installed CLI prints. Installed code settles shapes, again. |
+| 8 | **`--cpu 256 --memory 512`** | Measured in 2b.2, not chosen. The container's working set (cgroup `anon`) is 144.5 and 146.9 MiB across two caps and two positions: the process is the same size whatever the cap. Worst observed total including page cache is 218.3 MiB. Both 512m and 1024m survived every run with no OOM kill, so 512 MiB wins on about 3.5 times headroom over the part that can actually kill a task. 512 MiB is offered only with 256 CPU units, so one measurement settles both parameters. |
 
 ## Step 0 — the account (nothing is deployed here)
 
@@ -98,7 +99,7 @@ this service.
 |---|---|---|---|
 | `--health-check-path` | `/ping` | `/health` | We have `/health`, and it queries nothing on purpose, which is what an ALB health check should hit. `/ping` is a 404, so every task would fail its health check and the deploy would roll back with a healthy service inside it. |
 | `containerPort` | 80 | 8000 | The Dockerfile's `EXPOSE`/`CMD`. |
-| `--cpu` / `--memory` | 256 / 512 | measure first (2b.2), expect 512 / 1024 | The process loads langchain, langgraph and the OpenTelemetry SDK. 512 MiB is a guess and this project does not ship guesses: `docker stats` on the local container under one `/chat` turn settles it. |
+| `--cpu` / `--memory` | 256 / 512 | **256 / 512, the default** | Decision 8. The prediction written here first was 512 / 1024 and it was wrong. That stays on the record: a default being correct is only knowable after measuring it, and a spec that quietly deletes its wrong predictions is not a record of anything. |
 | `--scaling-target` | AWS's | `minTaskCount=1,maxTaskCount=2` | Decision 6. |
 | `--task-role-arn` | none | none | Stated so that "we did not need one" is a decision on the record rather than an omission. |
 | `--cpu-architecture` | `X86_64` | `X86_64` | Decision 7: stated, not defaulted. Absent from the published reference for this command; the installed CLI has it. |
@@ -108,6 +109,39 @@ this service.
 generates the task definition, and this plan is not allowed to assume what it generated.
 2b.5 reads the generated task definition back and checks the number. Same for the target
 group's deregistration delay.
+
+### What the container actually costs (measured 2b.2)
+
+`agent/experiments/container_memory.sh`: the real image under a hard cap, with real `/chat`
+turns driven through it, three runs covering 512m and 1024m in both orders.
+
+| | position 1 | position 2 |
+|---|---|---|
+| total (`docker stats`) | 218 to 220 MiB | 148 to 151 MiB |
+| working set (cgroup `anon`) | 144.5 MiB | 146.9 MiB |
+| page cache (cgroup `file`) | 99.4 MiB | 0.0 MiB |
+| boot to `/health` | 8 to 11 s | 5 to 8 s |
+
+**FINDING: the number moved with position, not with the cap, and moved the wrong way** - the
+tighter cap appearing to use 70 MiB more, which is backwards for a cgroup. Running both orders
+separated the two variables and splitting the cgroup counters named the cause: the first
+container to run faults the image layers in from disk and is charged for them, the second finds
+them resident and is charged nothing, while `anon` stays constant within 2.4 MiB.
+
+This decides the sizing rather than being a curiosity. **Every Fargate task is a position-1
+container**, on a host that has never seen the image, so the larger number is the one the
+deployment experiences. Sizing on the 149 MiB a second-position container reports would have
+been sizing on a state production never reaches.
+
+**The totals are not `anon` plus `file`, and should not be.** Each column is a maximum taken
+independently across the samples, and `docker stats` on cgroup v2 reports `memory.current`
+minus `inactive_file`, so it already omits part of what `file` counts.
+
+**A correction from the same runs.** The latency difference was read as an ordering effect too,
+and that half was wrong: across three runs the position-1 warm median went 6770, 6439, 5405 ms
+and position-2 went 5668, 5722, 7428 ms. Mixed, so latency here is upstream API variance. One
+run showed two differences and only one of them was real, which is the whole argument for
+running it twice before believing a knob.
 
 ## Environment: what goes in plain, what goes in the secret
 
@@ -128,6 +162,18 @@ The agent talks to Postgres over psycopg and needs no REST credentials at all.
 | `LANGFUSE_ENVIRONMENT` | plain env | **`production`** — deploy checklist item 5, so AWS traces do not share a dashboard with the laptop |
 | `ENABLE_SEARCH_ENDPOINT` | **never set** | invariant 2: unset means the paid debug route does not exist, rather than existing behind a check |
 | `CHECKPOINT_DURABILITY` | not set | `exit` is the default and the measured choice |
+
+**Every value copied out of `.env.local` must be copied unquoted.** Seven of its lines are
+written with surrounding quotes, `ASSISTANT_SIGNING_SECRET` and `LANGFUSE_BASE_URL` among
+them. pydantic-settings reads that file as dotenv and strips the quotes; nothing else does.
+Found by the 2b.2 memory experiment, which passed the same file through Docker's `--env-file`,
+which is not a dotenv parser: the container refused to start on `LANGFUSE_BASE_URL`, where a
+scheme validator was watching. The two variables that matter for this deploy had no validator
+watching. A quoted `ASSISTANT_SIGNING_SECRET` or `AGENT_API_KEY` is simply the wrong secret,
+and the symptom is a 401 from the service or history dropped by the route, never an error
+naming the variable. So 2b.3 adds a paste check to `settings.py` that refuses a value which
+both starts and ends with the same quote character, next to the existing length check on
+`AGENT_API_KEY` and for exactly the same reason: it is a typo test, not a strength test.
 
 ## The door is the key
 
