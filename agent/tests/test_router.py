@@ -59,7 +59,7 @@ def test_the_json_schema_and_the_parsed_model_allow_the_same_routes() -> None:
 # ---- what it returns -------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("route", ["docs", "github", "both"])
+@pytest.mark.parametrize("route", ["docs", "both"])
 async def test_each_route_comes_back_with_the_call_s_tokens(route: str) -> None:
     router, _ = router_replying({"route": route})
     routing = await route_question("when was v7 released", router=router)
@@ -67,15 +67,11 @@ async def test_each_route_comes_back_with_the_call_s_tokens(route: str) -> None:
     assert routing.usage == TokenUsage(input_tokens=300, output_tokens=4)
 
 
-@pytest.mark.parametrize(
-    ("route", "docs", "github"),
-    [("docs", True, False), ("github", False, True), ("both", True, True)],
-)
-def test_wants_docs_and_wants_github_cover_the_three_routes(
-    route: Route, docs: bool, github: bool
-) -> None:
-    routing = Routing(route=route, usage=NO_USAGE)
-    assert (routing.wants_docs, routing.wants_github) == (docs, github)
+@pytest.mark.parametrize(("route", "github"), [("docs", False), ("both", True)])
+def test_wants_github_is_the_only_question_left(route: Route, github: bool) -> None:
+    # There is no wants_docs. Every route wants the documentation now, so the property would be
+    # True always -- a branch nobody can reach, which is worse than no branch (finding 9).
+    assert Routing(route=route, usage=NO_USAGE).wants_github is github
 
 
 # ---- what it does when it fails ---------------------------------------------------------------
@@ -87,6 +83,9 @@ def test_wants_docs_and_wants_github_cover_the_three_routes(
         (None, RuntimeError("openai is down"), "the call raised"),
         (None, None, "the reply was not valid JSON (parsed is None)"),
         ({"route": "gitlab"}, None, "the reply named a route that does not exist"),
+        # The route that could take the documentation away, removed by its first measurement on
+        # 2026-09-15. If it ever validates again, the three defects it caused come back with it.
+        ({"route": "github"}, None, "the third route was removed and must not come back"),
         ({}, None, "the reply had no route at all"),
         ({"route": "docs", "reason": "x"}, None, "the reply carried an extra field"),
     ],
@@ -137,7 +136,7 @@ async def test_the_router_is_given_the_history_because_a_follow_up_needs_it() ->
     # Not a style preference: "and when was that released?" cannot be routed from its own text,
     # and a router structurally unable to be right about follow-ups would be measuring something
     # other than routing. The assertion is that the previous turn reaches the prompt.
-    router, calls = router_replying({"route": "github"})
+    router, calls = router_replying({"route": "both"})
     await route_question(
         "and when was that released?",
         [HistoryTurn("user", "what is streamText"), HistoryTurn("assistant", "It streams text.")],

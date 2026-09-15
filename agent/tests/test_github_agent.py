@@ -259,10 +259,16 @@ async def test_a_failure_cannot_be_read_as_data(introspection) -> None:
     # The through-line of phase 3: an empty `result:` block under a query reads exactly like a
     # repository with no releases. A failure does not get that shape at all.
     evidence = state["result"].evidence
-    assert evidence.startswith("NO GITHUB DATA")
+    assert not state["result"].ok
+    assert "returned nothing" in evidence
     assert "Could not resolve" in evidence
     # Nothing in it can be read as a result: no query block, no JSON.
     assert "result:" not in evidence
+    # And nothing in it can be read as a TOKEN. It opened `NO GITHUB DATA:` until 2026-09-15,
+    # when a turn whose lookup had SUCCEEDED answered the user with that phrase -- copied from
+    # the generation prompt, which explained what the marker meant. `ok` above is the machine
+    # signal, and always was.
+    assert "NO GITHUB DATA" not in evidence
 
 
 async def test_a_model_that_gives_up_reports_no_query(introspection) -> None:
@@ -274,7 +280,8 @@ async def test_a_model_that_gives_up_reports_no_query(introspection) -> None:
     assert not result.ok
     assert result.attempts == 0
     assert result.query is None
-    assert result.evidence.startswith("NO GITHUB DATA")
+    assert "no query" in result.evidence
+    assert "NO GITHUB DATA" not in result.evidence
 
 
 async def test_a_transport_failure_is_its_own_stage_and_not_repairable(introspection) -> None:

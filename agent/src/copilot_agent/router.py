@@ -25,7 +25,10 @@ Three things here are deliberate:
   - **A failure routes to docs, not to both.** The router is an enhancement, like the planner
     (plan_query's fallback rule). `both` on a failed router call would spend a subagent loop and
     GitHub points on a question nobody classified; `docs` degrades to the pipeline phase 2 already
-    measured. The cheapest known-good answer is the right fallback.
+    measured. The cheapest known-good answer is the right fallback. Since the routes became two,
+    this is also the only remaining way a turn can lose GitHub -- and losing a supplement is a
+    strictly smaller failure than losing the documentation, which is what the third route could
+    do.
 
 The model is the planner's (decision 8: every phase 3 call is gpt-4o-mini, so phase 6's Bedrock
 A/B moves one variable), and it is configured through the same explicit switches, for the same
@@ -53,7 +56,28 @@ from copilot_agent.settings import Settings
 
 logger = logging.getLogger(__name__)
 
-Route = Literal["docs", "github", "both"]
+# Two routes, not three. There WAS a third, `github`, which answered from GitHub alone and
+# skipped retrieval, and it was removed by its first measurement rather than by an argument.
+#
+# In the 3.5 eval run (2026-09-15, 27 documentation questions) the router chose it twice, for
+# "what is new in AI SDK 7" and "what was changed in AI SDK 7" -- the near-synonym pair this
+# project already keeps as its retrieval diagnosis. Both turns retrieved nothing, and the same
+# defect came out wearing two faces: one answered from GitHub after opening with the
+# documentation refusal sentence, so isRefusal (positional, invariant 5) logged an answered turn
+# as refused and the harness scored it 0/3; the other answered cleanly from GitHub with no
+# documentation behind it and PASSED. The suite also got CHEAPER, $0.1892 against $0.1972, because
+# the skipped rerank calls cost more than the router saved -- a cost improvement that was a
+# correctness regression.
+#
+# Making GitHub additive kills all of it by construction: a mis-route now costs latency and
+# GitHub points and can never cost an answer, and no case can go green with no documentation
+# because of a routing decision. What it costs is retrieval on every GitHub question (about 2 s
+# and $0.004), and routing accuracy in 3.6 becomes a two-label measure.
+#
+# db/009's check constraint still allows 'github'. It has run against the database, so it is not
+# edited; a constraint that permits a value this code cannot emit is harmless, and narrowing it
+# would be a migration whose only effect is tidiness.
+Route = Literal["docs", "both"]
 
 DOCS: Route = "docs"
 
@@ -66,32 +90,30 @@ ROUTER_MAX_OUTPUT_TOKENS = 64
 ROUTER_MAX_RETRIES = 2
 
 SYSTEM_PROMPT = """\
-You decide which source can answer a question about the Vercel AI SDK. You do NOT answer.
+You decide whether a question about the Vercel AI SDK needs the GitHub repository as well as the
+documentation. You do NOT answer.
 
-There are two sources:
-- DOCS: the Vercel AI SDK documentation. What the SDK is, what its functions and hooks do, how to
-  use them, settings, providers, migration guides, error handling, examples. Anything about how
-  the library works or how to write code with it.
-- GITHUB: the vercel/ai repository on GitHub. Releases and their dates, version tags, what a
-  release contained, issues and their state, pull requests and who wrote or merged them, commits,
-  contributors, and the contents of files in the repository.
+The documentation is always searched. It covers what the SDK is, what its functions and hooks do,
+how to use them, settings, providers, migration guides, error handling and examples.
+
+The vercel/ai repository on GitHub can be searched as well. It covers releases and their dates,
+version tags, issues and their state, pull requests and who wrote or merged them, commits,
+contributors, and the contents of files in the repository.
 
 Answer with one of:
-- "docs" when the documentation alone can answer it.
-- "github" when only the repository can: the question is about a release, a version's date, an
-  issue, a pull request, a commit, a contributor, or the repository's own files.
-- "both" when the question needs each of them, for example when it asks how something works AND
-  when it shipped, or whether a documented behaviour has an open issue against it.
+- "docs" when the documentation is enough on its own.
+- "both" when the question asks for something only the repository can say: a release date, a
+  version tag, an issue, a pull request, a commit, a contributor, or a file in the repository.
 
 Rules:
-- Prefer "docs". A question about how to do something is a docs question even when the answer may
-  have changed between versions.
-- A question naming a version number is not automatically GitHub: "how do I migrate to v7" is
-  documentation. "when was v7 released" is GitHub.
-- Choose "both" only when an answer that left one source out would be incomplete, not when the
-  other source might add colour.
-- Use the conversation so far to resolve a follow-up. "and when was that released?" is a GITHUB
-  question about whatever the previous turn was about."""
+- Prefer "docs". Choosing "both" when the repository is not needed costs a slow lookup for
+  nothing, so ask whether a repository fact is genuinely being requested.
+- A question naming a version number is not by itself a repository question. "how do I migrate to
+  v7", "what is new in v7" and "what changed in v7" are answered by the migration guide, which is
+  documentation. "when was v7 released" and "which release first carried this tag" are repository
+  questions.
+- Use the conversation so far to resolve a follow-up. "and when was that released?" needs the
+  repository, about whatever the previous turn was about."""
 
 # The reply schema, sent the way the planner sends its own (a ready-made {name, schema, strict}
 # dict rather than a Pydantic class, so what the model reads is written here and not derived by
@@ -103,12 +125,12 @@ ROUTE_JSON_SCHEMA: dict[str, Any] = {
     "properties": {
         "route": {
             "type": "string",
-            "enum": ["docs", "github", "both"],
+            "enum": ["docs", "both"],
             "description": (
-                "'docs' when the Vercel AI SDK documentation alone can answer the question, "
-                "'github' when only the vercel/ai repository can (releases, issues, pull "
-                "requests, commits, contributors, files), 'both' when an answer that left "
-                "either out would be incomplete."
+                "'docs' when the Vercel AI SDK documentation is enough on its own, 'both' when "
+                "the question also asks for something only the vercel/ai repository can say: a "
+                "release date, a version tag, an issue, a pull request, a commit, a contributor, "
+                "or a file in the repository."
             ),
         }
     },
@@ -128,18 +150,20 @@ class RouterOutput(BaseModel):
 
 @dataclass(frozen=True)
 class Routing:
-    """Where the turn goes, and what deciding cost. NO_USAGE on the fallback, like Plan."""
+    """Where the turn goes, and what deciding cost. NO_USAGE on the fallback, like Plan.
+
+    There is no `wants_docs`. Every route wants the documentation now, so the property would
+    return True always -- a branch nobody can reach, which phase 3 finding 9 says is worse than
+    no branch at all. The fact that retrieval always runs is expressed where it is enforced, in
+    graph.route_after_router.
+    """
 
     route: Route
     usage: TokenUsage
 
     @property
-    def wants_docs(self) -> bool:
-        return self.route in ("docs", "both")
-
-    @property
     def wants_github(self) -> bool:
-        return self.route in ("github", "both")
+        return self.route == "both"
 
 
 # Same shape as planner.Planner: messages in, {"raw", "parsed", "parsing_error"} out.

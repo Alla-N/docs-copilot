@@ -1,6 +1,6 @@
 # Spec — Phase 3: the GitHub GraphQL data subagent
 
-**Status:** IN PROGRESS, opened 2026-09-14. 3.1 to 3.4 are built, green and measured. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
+**Status:** IN PROGRESS, opened 2026-09-14. 3.1 to 3.5 are built, green and measured; 3.5b and 3.6 remain. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
 the before-2b block and 2b are complete and measured. Results and findings will go in the phase 3
 section of `agent/README.md`; this file is the design record and is kept with its wrong
 predictions in it, like `specs/aws-deploy.md`.
@@ -29,7 +29,7 @@ DeepAgents orchestrator next to it and the A/B is the point.
 
 | # | Decision | Why |
 |---|---|---|
-| 1 | **A separate router node**, not a new field on the planner | Extending the planner's structured output would change its prompt, which forks it from the TypeScript baseline and invalidates `tests/test_planner_request_parity.py` and the 23x5 planner eval suite. Phase 2's retrieval numbers would stop being a clean comparison for the sake of saving one small call. A node of its own also makes routing accuracy a number that can be measured alone, which is what the phase-3 done-when asks for. Cost: one extra model call per turn, on every turn including docs-only ones. That is a regression to the existing 27-case latency marks and prediction P6 says where it will show. |
+| 1 | **A separate router node**, not a new field on the planner | Extending the planner's structured output would change its prompt, which forks it from the TypeScript baseline and invalidates `tests/test_planner_request_parity.py` and the 23x5 planner eval suite. Phase 2's retrieval numbers would stop being a clean comparison for the sake of saving one small call. A node of its own also makes routing accuracy a number that can be measured alone, which is what the phase-3 done-when asks for. Cost: one extra model call per turn, on every turn including docs-only ones. That is a regression to the existing 27-case latency marks and prediction P6 says where it will show. **Amended in 3.5:** the routes are two, not three (decision 18), and the cost came in at about 930 ms rather than P6's 200 to 400. **And the decision has a bill:** the planner gates off-topic messages before the router, and its prompt has no concept of the repository, so most repository questions never reach the router at all. 3.5b pays it. |
 | 2 | **Local validation first, then `rateLimit(dryRun: true)`** | Two failure classes, two mechanisms. A malformed or misspelled query is caught offline and free against the cached schema (`graphql-core`: `build_client_schema` then `parse` + `validate`), which makes the repair loop cheap and makes first-try validity measurable without the network. A well-formed but expensive query is caught by GitHub's own `cost` and `nodeCount` under `dryRun: true`, which calculates both **without evaluating the query**. Counting braces ourselves would be our approximation of GitHub's arithmetic; this is GitHub's answer. Cost: one extra round trip before every real query. |
 | 3 | **Frozen-answer labelled set** | Only questions whose true answer cannot change: the author of a merged PR, which release first carried a tag, the state a closed issue ended in, a release's published date, the content of a file at a pinned commit. The suite stays green a year from now with no maintenance and still exercises every query shape we care about. Live counts are deliberately excluded: a failing case must mean the agent moved, not the repository. |
 | 4 | **Read-only enforced twice: token scope and a code check** | The token is a fine-grained PAT with public-repository read-only access and no account permissions. Independently, the runner parses the operation and **refuses anything whose operation type is not `query`** before it reaches the network. The token makes a mutation fail; the code check makes it never leave the process, and unlike the token it is testable offline with no secret. Defence in depth is the reason given in interviews; the real reason is that the code check is the one of the two that has a test. |
@@ -305,6 +305,166 @@ Two branches in this file have never fired and say so in the source: the mixed-b
 offline. Phase 3 finding 9 is the rule being followed -- an untested branch that claims to save
 something is worse than no branch, so the ones that are there are written as limitations.
 
+## Built and measured in 3.5 (2026-09-15): the router and the graph wiring
+
+`router.py`, the routed shape in `graph.py`, the additive generation prompt, `db/009_router.sql`,
+and `experiments/subgraph_stream.py`. Two full eval runs, green, plus five hand-driven turns
+through `chat_cli`.
+
+### What the probe settled before the build
+
+`experiments/subgraph_stream.py` was written first, because 3.4 finding 8 was that three API
+facts went out in a build unmeasured and all three happened to be right. Four fakes, no network,
+langgraph 1.2.11.
+
+1. **`subgraphs=True` does not change the chunk shape.** Every chunk is a dict with keys
+   `data`, `ns`, `type`, with the flag on or off; the namespace is already a field and never
+   becomes a `(namespace, chunk)` pair. The claim that it would, recorded after the 3.4 lesson,
+   came from reading rather than from the installed library. Phase 2b finding 6 again.
+   **The decision it was supporting survives for a different, measured reason:** with
+   `subgraphs=True` the subagent's model tokens DO enter the parent `messages` stream, named by
+   their own node, and `ui_stream`'s `langgraph_node == "generate"` fence becomes the only thing
+   between the subagent's query writing and the reader's answer bubble. With the flag off and a
+   wrapper node, they never arrive at all. Off, so there is nothing to fence.
+2. **Attaching the compiled subgraph directly loses its output, silently.** The parent ran to
+   completion, wrote five checkpoints and produced an answer, and the evidence key was simply
+   absent from the state. No exception, no warning. The child writes `result` and the parent
+   declares `evidence`, and LangGraph dropped the write. So the wrapper node is not a style
+   choice: it is the translation, and the alternative is a correctly shaped run carrying no
+   information, which is this phase's through-line for the sixth time.
+3. **`checkpointer=False` is doing real work, and the wrapper counts as nesting.** The same run
+   wrote 5 checkpoints with `False` and 9 with `None`, and the `None` run put the subgraph's
+   `messages`, `steps` and `result` into the PARENT's channel values. Decision 15 had only been
+   confirmed one way; the contrast was one line of the experiment and it is what makes the
+   decision a decision rather than a preference.
+
+### Decision 1 reversed in part: the routes are two, not three
+
+The first build had `docs`, `github` and `both`, and `github` answered from GitHub alone with
+retrieval skipped. Its first measurement removed it. In the eval run of 2026-09-15 the router
+chose it exactly twice, for **"what is new in AI SDK 7"** and **"what was changed in AI SDK 7"**,
+the near-synonym pair this project already keeps as its retrieval diagnosis. Both turns retrieved
+nothing, and three separate defects came out of that one fact:
+
+- **One defect, two faces.** `new-7` answered from GitHub after opening with the documentation
+  refusal sentence, so `isRefusal` (positional, invariant 5) logged an answered turn as refused
+  and the harness scored it `answered 0/3`: red. `changed-7` answered cleanly from GitHub with no
+  documentation behind it at all: **PASS**. Same defect, one visible and one silent, and the
+  visible one is the lucky case. `recall 10/12` was the only trace of the second, and it does not
+  name which two.
+- **The suite got cheaper.** $0.18923 against the stored $0.1972, with a third model call added
+  per turn, because the skipped rerank calls cost more than the router. Two runs of the broken
+  code agreed on that figure to within $0.00006. A cost improvement that was a correctness
+  regression, and it would have read as good news in any summary.
+- **The measurement was invalid for P6.** The done-when assumed the router would route all 27
+  cases to `docs`. It did not, so the to-sources mark averaged two different pipelines, one of
+  them carrying a whole subagent loop. The clean number needed the `route` column, which is why
+  `db/009` existed in time to produce it.
+
+Making GitHub additive kills all of it by construction: a mis-route now costs latency and points
+and can never cost an answer, and no case can go green with no documentation because of a routing
+decision. What it costs is retrieval on every GitHub question, and a two-label routing measure in
+3.6 instead of three.
+
+**Worth stating plainly:** the replacement router prompt names "what is new in v7" and "what
+changed in v7" as documentation questions, which is a prompt tuned against the two cases that had
+to pass. It is defensible, because the migration guide genuinely is the documentation's answer,
+and it is still the move this project has lost to structural fixes four times. Only 3.6's labelled
+set can say whether the router still sends real repository questions to `both`.
+
+### Measured: the 27-case suite with the router in the path
+
+Two runs at the fixed code, both green: recall 12/12, coverage 12/12, guardrails 6/6, injection
+8/8, false refusals 0, and `recallEveryRun` 12/12 then 11/12. The pair agrees to **31 ms** on
+to-sources and **$0.00004** on cost, against the 815 ms spread 2.8 recorded on identical code.
+
+| mark | 2.8 local | 3.5, two runs | delta |
+|---|---|---|---|
+| to sources | 2892 / 3023 | 3885 / 3854 | **+930 +/- 60** |
+| retrieval median | 2647 / 2761 | 3509 / 3594 | +790 to +860 |
+| first token minus to sources | 690 / 757 | 809 / 828 | unchanged |
+| done minus first token | 1665 / 1373 | 1311 / 1668 | unchanged |
+| cost per run | $0.1972 | $0.20220 / $0.20224 | +2.5 percent |
+
+**P6 was right about the shape and wrong about the size.** It predicted 200 to 400 ms, landing on
+the to-sources mark rather than first-token or done, for the reason phase 2b finding 3 gave: the
+marks before generation are the tight ones. The increment is ~930 ms and it sits entirely inside
+the to-sources segment, with every later segment unmoved. Off by about 2.5x.
+
+Two things the route column added that no prediction covered:
+
+- **Canned turns pay nothing.** 87 of 156 rows routed `null`, median 1176 ms: the planner gates
+  greetings and off-topic messages before the router, so the regression lands on 69 turns rather
+  than all of them.
+- **The subagent costs about 4.4 s.** In the broken run, `github` turns had a median to-sources of
+  8623 ms against `docs` 4205. That is the price of every `both` turn now, and it is the first
+  number 3.6 has for the subagent's latency.
+
+### Measured by hand: the capability the green runs never touched
+
+`both` was chosen **zero times** across both green runs. The suite is 27 documentation questions,
+so routing to `docs` throughout is correct, and it means neither run exercised the subgraph, the
+wrapper, the additive prompt or the lazy schema fetch. Everything green in 3.5 is the docs
+pipeline plus a router that says `docs`. Five `chat_cli` turns were run by hand for that reason,
+and two of them found things the suite could not.
+
+**The whole path works, once it is reached.** "is there an open issue about streamText retries"
+routed `both`, ran retrieval and the subagent concurrently, fetched the schema lazily, wrote a
+query that was **valid on the first try**, spent **1 point** after **2 lookups**, and returned
+data. First evidence for P3 (median 1 point) and a first counter-observation for P1 (no missing
+`first` on that query). The subagent took 8.7 s of the turn's 14.5 s.
+
+**The planner's off-topic gate makes the capability unreachable for most of what it is for.**
+Three of three canonical repository questions never reached the router:
+
+| question | planner intent |
+|---|---|
+| when was ai 5.0.0 released | off-topic |
+| when was **AI SDK** 5.0.0 released | off-topic |
+| who merged the pull request that added the **AI SDK 7 migration guide** | off-topic |
+
+The one that got through named an SDK API. So the planner admits a question only when it mentions
+a documentation concept, which excludes release dates, PR authors, commits, contributors and
+repository files: the spec's own list of what the subagent exists for. **This is decision 1's bill
+coming due.** The router was made a separate node precisely so the planner's prompt would never
+have to change, and the planner's prompt is now the wall standing in front of the router. It also
+blocks 3.6 outright, since a frozen-answer set of release dates and merged PRs would be canned
+before routing. Sub-step 3.5b is that fix.
+
+**A marker leaked from the rule that explained it, not from the data.** The successful turn above
+answered the reader with `NO GITHUB DATA. I could not find any open issues...`, on a turn whose
+lookup had **succeeded**. The phrase was never in that turn's evidence. It was in the generation
+prompt, which named the marker and said what it meant, so the model learned it there. Two lessons
+and the second is the better one: a token that is both a machine signal and prompt text gets
+quoted eventually, which `NO RELEVANT DOCUMENTATION FOUND` and the retrieval prompt's internal
+marker already say; and **the marker was redundant from the start**, because `GitHubEvidence.ok`
+was always the machine signal and this string only ever had to be read by a model. The token is
+deleted rather than reworded, and what is left is prose that stays true if it is repeated.
+
+### The prompt change, and what "additive" had to mean
+
+A docs-only turn renders `SYSTEM_PROMPT_TEMPLATE` and nothing else, character for character, so
+`test_generation_request_parity.py` still pins the Python generation request to the TypeScript one
+and invariant 3's claim survives. A turn with documentation AND GitHub evidence appends a block.
+
+A turn with GitHub evidence and NO documentation gets a **different prompt entirely**
+(`GITHUB_ONLY_PROMPT_TEMPLATE`), because the pinned template's refusal rule is about the
+documentation and a turn holding none of it cannot be asked to apply that rule. Asked anyway, the
+model applied both rules in order and refused and answered in the same breath. The branch is on
+what the turn HOLDS, not on what the router chose: a `both` turn whose chunks all fall below the
+0.30 threshold holds no documentation either, and deciding it from the route would be one signal
+answering two questions, which is finding 2 of the query runner arriving in a third place.
+
+### New decisions
+
+| # | Decision | Why |
+|---|---|---|
+| 18 | **Two routes. GitHub is additive, never exclusive.** | Reversed by its own first measurement, above. A mis-route can cost latency and points; it can no longer cost the documentation. |
+| 19 | **The subagent is reached through a wrapper node, not attached as one.** | The direct attachment drops the child's write silently, measured. The wrapper is the translation between two state schemas and the only place a subagent failure can be given a shape the parent understands. |
+| 20 | **`subgraphs` stays off; Langfuse carries the observability half of decision 5.** | Spans come from the callback handler walking the run tree, not from the stream, so the subagent is visible in a trace either way. Turning it on would put the subagent's tokens in the parent `messages` stream with only the answer fence between them and the reader. |
+| 21 | **The generation prompt is additive, and a turn with evidence and no documentation gets its own template.** | Keeps the TypeScript parity golden meaningful on every docs turn, and stops the refuse-and-answer defect at the only place it can be stopped structurally. |
+| 22 | **`db/009` records `route`, `router_input_tokens` and `router_output_tokens`, and prices the router in `query_cost`.** | Without it the harness's measured cost per request would have come back unchanged from the phase 3 runs, not because the cost had not moved but because nothing was watching the part that moved. `route` is null when no router ran, which is not the same as `docs`. |
+
 ## Sub-steps
 
 Each ends with a measured result, the Mac gate, a commit and CI, in the project's usual order.
@@ -324,10 +484,21 @@ Each ends with a measured result, the Mac gate, a commit and CI, in the project'
   `updates` stream reports explore, run_query, explore, run_query, summarise as five steps. The
   Langfuse half of the done-when is deferred to 3.5, where the subgraph is nested and
   `subgraphs=True` decides whether the parent stream sees the same five steps.
-- **3.5 — the router and the graph wiring.** The router node, the three-way route, the merge of
-  two evidence sets, and the generation prompt change that keeps them apart. Done when the
-  existing 27-case suite still passes with the router in the path, twice, with the latency delta
-  recorded against P6.
+- **3.5 — the router and the graph wiring. DONE.** The router node, the route, the merge of two
+  evidence sets, and the generation prompt change that keeps them apart. Done when the existing
+  27-case suite still passes with the router in the path, twice, with the latency delta recorded
+  against P6. **Met:** two green runs, `recall` 12/12 both, P6 recorded at about +930 ms against a
+  prediction of 200 to 400. The three-way route became two along the way, and the hand-driven
+  turns found the planner gate below.
+- **3.5b — the planner's off-topic gate.** Measured in 3.5: three of three canonical repository
+  questions are classified `off-topic` by the planner and canned before the router sees them, so
+  the capability is reachable only for questions that happen to name a documentation concept.
+  Decided 2026-09-15: **teach the Python planner that the repository is in scope**, and re-frame
+  the parity pin rather than delete it, so `test_planner_request_parity.py` asserts the Python
+  prompt is the TypeScript prompt plus exactly one documented paragraph. Its own sub-step because
+  it changes the planner, which means the 23x5 planner eval and the 27-case suite both have to be
+  re-run: one variable at a time. Done when a release-date question routes `both`, the planner
+  eval is unchanged on every existing case, and the 27-case suite passes twice.
 - **3.6 — the labelled set and the done-when run.** The 12 frozen questions, the routing labels,
   the harness reading the new per-turn GitHub block, and the five measures, run twice.
 
@@ -338,9 +509,16 @@ Each ends with a measured result, the Mac gate, a commit and CI, in the project'
   `EVAL_TARGET=python`). Adding the GitHub set there keeps one command for everything, which is
   worth more than keeping the phase's code in one language. Decision 12 is what makes that
   possible. To confirm in 3.6.
-- **Whether the router should see the sub-queries.** It runs after `plan`, so the planner's
-  resolved sub-queries are available to it. Giving it more context probably helps routing and
-  certainly costs tokens. Start without them and see whether the failures are context failures.
+- ~~**Whether the router should see the sub-queries.**~~ Settled in 3.5: it does not. It sees the
+  question and the recent history, folded in exactly as `planner_messages` folds it. History is
+  not optional the way the sub-queries are: "and when was that released?" cannot be routed from
+  its own text, and a router structurally unable to be right about follow-ups would be measuring
+  something other than routing. The sub-queries stay out so that a routing failure is a routing
+  failure and not a plan it inherited.
+- **Whether `both` is ever chosen on a documentation suite.** It was chosen zero times across the
+  two green runs of 3.5, which is correct for 27 documentation questions and means the route is
+  unmeasured. 3.6's labelled set is the first thing that will exercise it, and the router prompt
+  it has to get past was written after the only two mis-routes anyone has seen.
 - **Secondary rate limits.** Finding 9 of phase 2b says the harness is one client, so
   concurrency limits should not fire. If they do, that is a finding, not a bug to route around.
 

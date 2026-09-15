@@ -18,11 +18,15 @@ graph above, so CI, Docker and a laptop keep running and measuring the phase 2 p
     START -> plan --route--> canned -> END
                         \\--> router --> retrieve x N --\\
                                     \\--> github --------+--> merge -> generate -> END
+                                     (only on route `both`)
 
   - the router is its own node, not a field on the planner (spec decision 1): extending the
     planner's structured output would change its prompt, fork it from the TypeScript baseline,
     and cost the 23x5 planner eval and the phase 2 retrieval comparison their meaning;
-  - its three routes fan out through the same mechanism as the sub-queries, one Send each, so a
+  - **retrieval runs on every routed turn.** The router chooses whether to ADD GitHub, never
+    whether to replace the documentation. It could do the latter for one afternoon, and the
+    measured result was three defects at once (router.py has them, with the numbers);
+  - its two routes fan out through the same mechanism as the sub-queries, one Send each, so a
     `both` turn runs retrieval and the subagent in one superstep and they meet at merge;
   - the subagent is reached through a WRAPPER node, not attached as a node itself. Its state
     schema is not this one, and a compiled subgraph attached directly writes back only the keys
@@ -273,31 +277,32 @@ def route_after_plan_routed(state: ChatState) -> Literal["canned", "router"]:
 
 
 def route_after_router(state: ChatState) -> list[Send]:
-    """The router's decision, as a fan-out: retrieval, the subagent, or both in one superstep.
+    """The router's decision, as a fan-out: retrieval always, and the subagent as well on `both`.
 
-    Never empty, and not defended against being empty: `plan.intent` is "search" to have got
-    here, plan_query guarantees a search carries at least one sub-query, and `route` is one of
-    three values of which two include the documentation. An unreachable branch here would be a
-    claim no test could check (phase 3 finding 9).
+    **Retrieval is unconditional, and that is the point.** The first version of this function had
+    a third route that skipped it, and the run of 2026-09-15 is why it does not any more: the
+    router sent two documentation questions to GitHub alone, and a turn with no documentation in
+    it turned out to break three separate things at once (specs/github-subagent.md, the 3.5
+    findings). GitHub is a supplement now, so the worst a routing mistake can do is spend a
+    lookup nobody needed.
+
+    Never empty: `plan.intent` is "search" to have got here, and plan_query guarantees a search
+    carries at least one sub-query.
     """
-    route = state["route"]
-    sends: list[Send] = []
-    if route != "github":
-        sends.extend(retrieve_sends(state["plan"]))
-    if route != "docs":
+    sends = retrieve_sends(state["plan"])
+    if state["route"] == "both":
         sends.append(Send("github", GitHubTask(question=state["question"])))
     return sends
 
 
 def merge_retrievals(retrievals: list[SubQueryRetrieval]) -> dict[str, object]:
-    """plannedRetrieve's union, mode and rerank count, over the per-sub-query results."""
-    if not retrievals:
-        # A github-only turn: the router sent no retrieve run, so there is nothing to union and
-        # no Cohere call was made. "skipped" is already what this column and the UI's retrieval
-        # pill mean by "retrieval did not happen" (the canned path writes it), and inventing a
-        # fourth mode would change the stream's data-retrieval part, which the TypeScript client
-        # parses with a strict schema.
-        return {"relevant": [], "mode": "skipped", "rerank_calls": 0}
+    """plannedRetrieve's union, mode and rerank count, over the per-sub-query results.
+
+    No empty-list branch. There was one for a moment, when a route could skip retrieval; with
+    retrieval unconditional (route_after_router) this function cannot be reached with nothing,
+    and a branch that cannot be reached is a claim no test can check. The invariant it was
+    protecting is asserted where it is created instead.
+    """
     return {
         "relevant": union_relevant([r.relevant for r in retrievals]),
         # One fallback makes the whole answer a fallback answer: the UI says so.

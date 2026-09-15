@@ -34,8 +34,13 @@ expected to hold to that, not just to keep the tests green.
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
 | `agent/infra/` | The AWS deploy (phase 2b): `aws_secret.py` builds one Secrets Manager secret from `.env.local` with the service's own dotenv parser and validates it with the service's own `Settings` before upload; `roles.sh` the two IAM roles, the three service-linked roles and a `GetSecretValue` policy scoped to one ARN; `service.sh` the Express Mode service, with every overridden default and why. Redeploy is those three in order |
+| `agent/.../github_schema.py` | Phase 3: introspection fetched lazily and cached per process (3.2 MiB of JSON, 2.5 MiB RSS, measured), `describe_type` in outline and detail modes, and `capped_block` — the byte cap answers *does all of it fit*, never *does this entry fit plus a footer* |
+| `agent/.../github_query.py` | Phase 3: the seven gates (parse, one operation, read-only, validate, variables supplied, `rateLimit(dryRun)` pre-flight, budget). `RunOutcome.stage` says which gate refused. Repairability is decided by error `type` against an allow-list, NOT by `path`: a connection missing `first` is a field-level error, and `path` would have made the repair loop unable to fire on the failure it exists for |
+| `agent/.../github_agent.py` | Phase 3: the subagent subgraph. `explore` -> `lookup` or `run_query` -> `summarise`, the repair being the tool loop going round again. Compiled `checkpointer=False`, measured: `None` writes the subgraph's messages into the parent's checkpoint. `open_github_agent` yields None without `GITHUB_TOKEN`, and then there is no GitHub path at all |
+| `agent/.../router.py` | Phase 3.5: docs or both, never GitHub alone. The planner's call shape with a different prompt; any failure routes to `docs`. The third route existed for one afternoon and its first measurement removed it (the file has the run) |
+| `agent/experiments/github_schema_size.py` · `dry_run_semantics.py` · `subgraph_stream.py` | The phase 3 measurements: what a cached schema weighs; what `dryRun` actually does (it prices without validating, and is free); and what nesting a subgraph does to the parent's stream and checkpoint. The last one was written BEFORE the 3.5 build, and it overturned two things that were already written down |
 | `agent/experiments/container_memory.sh` | What the container needs: the real image under a hard `--memory` cap with real `/chat` turns, reporting cgroup `anon` and `file` separately. Measured 145 MiB working set; page cache is charged to whichever container faults the image layers in first, so read position 1 |
-| `db/000..008_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) |
+| `db/000..009_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) · the router's tokens and `route`, priced into `query_cost` |
 
 ## Invariants — do not break these
 
@@ -173,6 +178,20 @@ expected to hold to that, not just to keep the tests green.
    Everything exported passes the mask, which is handed this process's real secret VALUES rather
    than a guess at their shape, so any attribute quoting one leaves without it.
 
+16. **The router adds GitHub; it never replaces the documentation.** (Step 3.5,
+   `agent/.../router.py`, `graph.route_after_router`.) There are two routes, `docs` and `both`,
+   and retrieval runs on every routed turn. A third route answered from GitHub alone, and on
+   2026-09-15 it sent the `new-7` / `changed-7` pair there and produced three defects from one
+   fact: an answer that opened with REFUSAL_MESSAGE and then answered, so `isRefusal` logged an
+   answered turn as refused; a sibling case that passed the suite with no documentation behind
+   it at all; and a run that got CHEAPER than the baseline because the skipped rerank calls cost
+   more than the router. A mis-route must be able to cost latency and GitHub points, never an
+   answer. The generation prompt follows the same rule from the other side: a turn holding
+   evidence and NO documentation gets its own template, because the pinned template's refusal
+   rule is about the documentation and a turn without any cannot apply it. No marker token in
+   either prompt: `GitHubEvidence.ok` is the machine signal, and a token that is also prompt
+   text gets quoted into an answer (it did).
+
 ## How to change things here
 
 - **Baseline first, one variable at a time, full suite after.** `npm run eval` — the
@@ -252,6 +271,8 @@ cd agent && uv run python experiments/checkpoint_overhead.py   # checkpointer co
 cd agent && uv run pytest -m integration tests/test_checkpoint_live.py   # the saver on the real database: round trip, and the Data API roles see no rows (free)
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 cd agent && ./experiments/container_memory.sh          # what the container needs under a hard cap; about 6 cents
+cd agent && uv run python experiments/subgraph_stream.py   # what nesting a subgraph does to the parent stream and checkpoint (free, instant fakes)
+cd agent && uv run python -m copilot_agent.chat_cli "is there an open issue about streamText retries"   # the GitHub path by hand; prints router, attempts, lookups, points
 cd agent && uv run python infra/aws_secret.py          # dry run: key names and lengths, no values; --write uploads
 cd agent && ./infra/roles.sh                           # IAM roles, service-linked roles, the scoped secret policy
 cd agent && ./infra/service.sh                         # create the Express Mode service at the current commit tag

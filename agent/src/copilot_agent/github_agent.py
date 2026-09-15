@@ -317,20 +317,34 @@ def evidence_of(question: str, query: str, data: dict | None) -> str:
 
 
 def no_evidence_of(attempts: list[Attempt]) -> str:
-    """The failed result, said in words that cannot be mistaken for an answer.
+    """The failed result, in words that cannot be mistaken for an answer OR quoted as a token.
 
     The through-line of this whole phase is that a correctly shaped output carrying no information
     reads exactly like a real one. This block is the place that would happen: an empty `result:`
     under a query looks like a repository with no releases. So a failure does not use that shape
     at all.
+
+    **It also does not use a marker.** The first version opened `NO GITHUB DATA:`, and on
+    2026-09-15 a turn whose lookup had SUCCEEDED answered the user with "NO GITHUB DATA. I could
+    not find any open issues...". The phrase was never in that turn's evidence -- the evidence was
+    the success shape -- it came from the generation prompt, which explained what the marker meant
+    and so taught the model to write it. A token that is both a machine signal and prompt text
+    gets quoted eventually; `NO RELEVANT DOCUMENTATION FOUND` and the retrieval prompt's internal
+    marker are the same bug already open in the backlog.
+
+    The deeper point is that the marker was redundant from the start. `GitHubEvidence.ok` is the
+    machine signal for a failed lookup, and it always was; this string only ever had to be read
+    by a model. So the token is deleted rather than reworded, and what is left is prose that
+    stays true if the model does repeat it.
     """
     if not attempts:
-        return "NO GITHUB DATA: the subagent wrote no query."
+        return "The GitHub lookup produced no query for this question, so it returned nothing."
     last = attempts[-1]
     reason = "; ".join(last.messages) or "no reason given"
     return (
-        f"NO GITHUB DATA: {len(attempts)} attempt(s), the last refused at the {last.stage} "
-        f"stage ({reason}). Nothing about GitHub can be answered from this turn."
+        f"The GitHub lookup returned nothing for this question. It made {len(attempts)} "
+        f"attempt(s); the last was refused at the {last.stage} stage ({reason}). Nothing about "
+        f"the repository can be answered from this turn."
     )
 
 
