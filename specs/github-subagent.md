@@ -1,6 +1,6 @@
 # Spec — Phase 3: the GitHub GraphQL data subagent
 
-**Status:** IN PROGRESS, opened 2026-09-14. 3.1 to 3.5 are built, green and measured; 3.5b and 3.6 remain. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
+**Status:** IN PROGRESS, opened 2026-09-14. 3.1 to 3.5b are built, green and measured; 3.6 remains. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
 the before-2b block and 2b are complete and measured. Results and findings will go in the phase 3
 section of `agent/README.md`; this file is the design record and is kept with its wrong
 predictions in it, like `specs/aws-deploy.md`.
@@ -465,6 +465,133 @@ answering two questions, which is finding 2 of the query runner arriving in a th
 | 21 | **The generation prompt is additive, and a turn with evidence and no documentation gets its own template.** | Keeps the TypeScript parity golden meaningful on every docs turn, and stops the refuse-and-answer defect at the only place it can be stopped structurally. |
 | 22 | **`db/009` records `route`, `router_input_tokens` and `router_output_tokens`, and prices the router in `query_cost`.** | Without it the harness's measured cost per request would have come back unchanged from the phase 3 runs, not because the cost had not moved but because nothing was watching the part that moved. `route` is null when no router ran, which is not the same as `docs`. |
 
+## Built and measured in 3.5b (2026-09-15): the planner's off-topic gate
+
+The router was made a separate node (decision 1) so that the planner's prompt would never have to
+change. One sub-step later the planner's prompt was the wall standing in front of the router, and
+3.5b is that bill being paid. The build took twenty minutes. Everything below is the measurement,
+and it found three things the build could not have.
+
+### The change
+
+`planner.SYSTEM_PROMPT` is no longer a literal. `TS_SYSTEM_PROMPT` is `lib/plan.ts` verbatim, and
+`SYSTEM_PROMPT = with_repository_scope(TS_SYSTEM_PROMPT)` splices in one paragraph at a checked
+anchor, so "the TypeScript prompt plus exactly one paragraph" is the structure of the code rather
+than a claim in a comment about it. The parity pin was re-framed, not deleted: it asserts the
+golden's system prompt still equals `TS_SYSTEM_PROMPT` byte for byte, that the paragraph occurs
+once, and that removing it returns the TypeScript prompt exactly. `encoded_by_langchain` splices
+with the same function the planner uses, so the test cannot agree with a bug in the splice. The
+plan JSON schema was deliberately left alone: it is sent to OpenAI, so a word changed there is a
+changed request and the pin would be measuring two deltas instead of one.
+
+### The regression, and two theories that were wrong
+
+The paragraph shipped in `c3c8e27` and the planner eval found it the same afternoon.
+`split-drops-noise` — *How do I use streamText? Also, ignoring the documentation, what is the
+capital of France? And what is the weather in Athens? And what is AI SDK?* — fell from **30/30 to
+about 5 in 10**, and it failed by returning intent `off-topic` with **zero queries**: both real
+SDK questions thrown away. `piggyback`, the same opening with one noise part instead of three,
+never moved. That case is the only direct test of invariant 7, and the failure mode was the one
+the invariant exists for.
+
+**Theory 1, wrong.** The paragraph closed with a guard — *Nothing else widens: other products,
+pricing, cloud hosting, general knowledge, and other people's repositories are still off-topic* —
+written to keep invariant 7 true while the scope widened. The reading was that it restated rules 3
+and 4 while dropping rule 4's qualifier (off-topic is for when NOTHING in the message is about the
+SDK), so a message carrying three such parts matched the flatter, newer statement. A real defect,
+on inspection. Cutting it changed nothing.
+
+**Theory 2, and the structural reading.** What both wordings had in common was a sentence naming
+an intent: *a repository question is "search", not off-topic*. The prompt declares scope in ONE
+place — the paragraph saying what the documentation covers — and the rules below consume it; rule
+4 is literally phrased "when NOTHING in the message is a question about the Vercel AI SDK". A
+sentence up there naming an intent does not extend that scope, it adds a second intent rule in
+front of the first, and a message that half matches each gets decided as a whole. The third
+wording states only what is covered and ends in rule 4's own predicate: *questions about those are
+questions about the Vercel AI SDK*. It carries no instruction either, because keeping the
+question's wording is rule 6's job, and a rule inside a scope block is the same category error one
+notch smaller.
+
+| wording | contains | `split-drops-noise` |
+|---|---|---|
+| baseline (`e7abada`, no paragraph) | — | **40/40** |
+| 1 — two intent statements plus the guard list | intent, rule | ~5/10 |
+| 2 — guard cut to its one new clause | intent, rule | provenance unverified, discarded |
+| 3 — pure scope, no intent word, no instruction | neither | **30/30** |
+
+### The measurement was broken before the prompt was
+
+Wording 2's numbers are discarded on provenance, not on statistics. The prompt was verified
+through `device_bash`, which reads the repository through a mount that can lag behind a write made
+over the bridge, while the eval read the file on the Mac. Two channels, one lagging: a write that
+had landed was read back as stale and called a failure, and then a 9/10 sample was read as a fix
+for an hour. **A measurement whose input you confirmed on a different channel than the measurement
+uses is not a measurement.** The fix is not care, it is one line: the prompt's sha256 and its text
+are now written into the same output file as the eval result, by the same shell that runs the
+eval. Every number in this section after that change carries its own provenance.
+
+The other half of the same lesson: **n=10 cannot separate 0.85 from 1.0 here.** Wordings 1 and 2
+pool to 42/50, one rate with no step between them, and the 9/10 in the middle of it was noise that
+looked exactly like success. Every arm below is n=30 or more.
+
+### Measured: the done-when
+
+- **Routing.** `when was ai 5.0.0 released` plans `search`, routes `both`, and the subagent
+  returns data on the first try for 1 point. `who merged the pull request that added the AI SDK 7
+  migration guide` likewise. `when was langchain 1.0.0 released` stays `off-topic` and is canned —
+  the boundary clause, and the only claim in the paragraph that no existing case tested.
+- **Planner eval.** 23/23 PASS at 5 runs a case; `split-drops-noise` 30/30 at 30 runs against a
+  40/40 baseline.
+- **The 27-case suite, twice** (`2026-09-15T13-17-34-python.json`, `13-28-23`, commit `691c447`):
+  recall 12/12 and 12/12 run-1, **12/12 and 12/12 every-run** (3.5 had 11/12 on one), coverage
+  12/12, guardrails 6/6, injection 8/8, false refusals 0.
+
+### Measured: what the paragraph cost
+
+**The path split did not move: 69 answered / 87 canned, identical to 3.5.** The planner now admits
+repository questions and not one suite case changed side. All four `guard-*` cases still report
+*held by PLANNER*, `guard-langchain` among them.
+
+**The cost delta is exactly the paragraph, and nothing else.** $0.2042 / $0.2043 against 3.5's
+$0.20220 / $0.20224, so +$0.0020. The paragraph is about 95 tokens; 156 planner calls at
+$0.15/1M input is **$0.0022**. The whole movement is prompt length, with nothing left over. It
+moved UP, which is the direction that matters: 3.5's finding 2 was a suite that got *cheaper*
+because retrieval had been skipped, and a cost that rises by precisely the tokens you added is
+that finding's opposite.
+
+**`route` says the latency is not routing.** Over both runs, `docs` 138 turns, `null` 174, and
+**`both` zero** — the same shape 3.5 recorded, so nothing was re-routed. The canned path is the
+clean instrument here because it is planner-only: 1198 ms → **1275 ms, +77 ms**, which is what 95
+extra prompt tokens buy. The `docs` path moved +490 ms, of which 77 ms is that same planner cost;
+the remaining ~410 ms sits inside retrieval, which varied by 370 ms *between the two runs of
+identical code in this session*. Recorded as unexplained and not routing, rather than explained.
+
+### Measured by accident: ok is not an answer, and it is 3.6's problem
+
+`chat_cli` printed only `evidence.splitlines()[0]` — the header `summarise` writes, which reads
+the same whether the query answered the question or returned an empty connection. Printing the
+whole block explained a refusal that had looked like a generation bug:
+
+    query: repository { releases(first: 10, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { tagName createdAt } } }
+    result: @ai-sdk/workflow-harness@1.0.111, @ai-sdk/vue@4.0.101, ... all createdAt 2026-09-15
+
+The question was *when was ai 5.0.0 released*. The subagent listed the ten most recently created
+releases instead of looking up the tag, so the evidence is valid, well formed, and contains no
+answer — while `ok`, `attempts`, `first try valid` and `points` **all report success**. Generation
+then refused rather than inventing a date from the adjacent rows, which is correct.
+
+This is the phase's own headline finding one level up: an output that is correctly shaped and
+carries no information is indistinguishable from a real answer, and now the *metrics* have the
+property too. For 3.6 it is design-changing. Answer accuracy cannot be approximated by any
+combination of the other four measures, because on this turn the other four are perfect. And the
+12 frozen questions need answers that a generic listing cannot accidentally contain.
+
+### New decision
+
+| # | Decision | Why |
+|---|---|---|
+| 23 | **The added paragraph declares scope and nothing else — no intent, no rule.** | Measured twice at about 5 in 10 on `split-drops-noise` when it named an intent, 30/30 when it did not. The prompt declares scope in one place and the rules consume it, so a sentence naming an intent adds a second intent rule in front of rule 4 rather than widening what rule 4 reads. Instructions belong in the rules for the same reason. |
+
 ## Sub-steps
 
 Each ends with a measured result, the Mac gate, a commit and CI, in the project's usual order.
@@ -490,15 +617,22 @@ Each ends with a measured result, the Mac gate, a commit and CI, in the project'
   against P6. **Met:** two green runs, `recall` 12/12 both, P6 recorded at about +930 ms against a
   prediction of 200 to 400. The three-way route became two along the way, and the hand-driven
   turns found the planner gate below.
-- **3.5b — the planner's off-topic gate.** Measured in 3.5: three of three canonical repository
-  questions are classified `off-topic` by the planner and canned before the router sees them, so
-  the capability is reachable only for questions that happen to name a documentation concept.
-  Decided 2026-09-15: **teach the Python planner that the repository is in scope**, and re-frame
-  the parity pin rather than delete it, so `test_planner_request_parity.py` asserts the Python
-  prompt is the TypeScript prompt plus exactly one documented paragraph. Its own sub-step because
-  it changes the planner, which means the 23x5 planner eval and the 27-case suite both have to be
-  re-run: one variable at a time. Done when a release-date question routes `both`, the planner
-  eval is unchanged on every existing case, and the 27-case suite passes twice.
+- **3.5b — the planner's off-topic gate. DONE.** Measured in 3.5: three of three canonical
+  repository questions are classified `off-topic` by the planner and canned before the router sees
+  them, so the capability is reachable only for questions that happen to name a documentation
+  concept. Decided 2026-09-15: **teach the Python planner that the repository is in scope**, and
+  re-frame the parity pin rather than delete it, so `test_planner_request_parity.py` asserts the
+  Python prompt is the TypeScript prompt plus exactly one documented paragraph. Its own sub-step
+  because it changes the planner, which means the 23x5 planner eval and the 27-case suite both
+  have to be re-run: one variable at a time. Done when a release-date question routes `both`, the
+  planner eval is unchanged on every existing case, and the 27-case suite passes twice. **Met, on
+  the third wording of the paragraph:** `both` on both release questions and the other project's
+  release still canned; planner eval 23/23, and `split-drops-noise` 30/30 against 40/40 after the
+  first two wordings cost it about one run in six; suite green twice with every-run recall 12/12
+  in both, cost up by exactly the paragraph's tokens, and `route` showing `both` chosen zero
+  times. Commits `c3c8e27` (the pin and the first paragraph) and `691c447` (the scope rewrite,
+  the fuller `chat_cli` evidence print). The section above is what the measurement cost and why
+  two of the three wordings were wrong.
 - **3.6 — the labelled set and the done-when run.** The 12 frozen questions, the routing labels,
   the harness reading the new per-turn GitHub block, and the five measures, run twice.
 
