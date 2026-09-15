@@ -33,6 +33,10 @@ from copilot_agent.retrieval import open_search
 from copilot_agent.settings import get_settings
 from copilot_agent.tracing import open_tracing
 
+# How much of the subagent's evidence to print. Generous: the block is capped at 4000 bytes by
+# github_agent.EVIDENCE_BYTE_CAP, so this is a terminal courtesy, not a second budget.
+EVIDENCE_LINES = 40
+
 
 def show_update(node: str, update: dict[str, Any], started: float) -> None:
     at = f"[{(time.perf_counter() - started) * 1000:6.0f} ms]"
@@ -61,7 +65,20 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
                 f"({', '.join(evidence.stages) or 'none'})  lookups={evidence.lookups}  "
                 f"points={evidence.points_spent}  first try valid={evidence.first_try_valid}"
             )
-            print(f"           {evidence.evidence.splitlines()[0]}")
+            # The whole evidence string, not its first line. That line is the header summarise
+            # writes, so it reads the same whether the query returned the answer or an empty
+            # connection -- the one line in the block guaranteed to look fine. Printing only it
+            # made a turn that answered with the documentation refusal over ok=True evidence
+            # impossible to diagnose from the CLI that exists for exactly that (3.5b). Capped,
+            # because EVIDENCE_BYTE_CAP is 4000 and this is a terminal; the cap is announced
+            # rather than silent, since a quiet truncation is the same defect one level down.
+            lines = evidence.evidence.splitlines()
+            for line in lines[:EVIDENCE_LINES]:
+                print(f"           {line}")
+            if len(lines) > EVIDENCE_LINES:
+                print(f"           ... {len(lines) - EVIDENCE_LINES} more lines, see the trace")
+            if evidence.query:
+                print(f"           query: {' '.join(evidence.query.split())[:200]}")
 
 
 async def run(question: str, thread_id: str) -> None:

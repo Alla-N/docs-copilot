@@ -129,17 +129,42 @@ Return at most 4 queries."""
 # Why it names a category and not the three questions: this project has lost four times to
 # prompts tuned against the cases that had to pass (3.5 finding 4 is the most recent). The seven
 # kinds of repository fact listed here are the seven router.SYSTEM_PROMPT lists, deliberately —
-# the two prompts must not disagree about what the repository is for. The last sentence is the
-# other half of the change: invariant 7 still holds, and widening the scope by one source must
-# not widen it by anything else. evals/planner_eval.py (23 cases x 5 runs) is what tests that.
+# the two prompts must not disagree about what the repository is for.
+#
+# Why the paragraph declares SCOPE and never states an intent. This is the third wording, and the
+# first two are worth keeping because of how they failed.
+#
+# Wording 1 said a repository question "is search, not off-topic", and ended with a guard —
+# "Nothing else widens: other products, pricing, cloud hosting, general knowledge, and other
+# people's repositories are still off-topic" — meant to keep invariant 7 true while the scope
+# widened by one source. split-drops-noise ("How do I use streamText? ... capital of France? ...
+# weather in Athens? ... what is AI SDK?") fell from 30/30 to about 5 in 10, and it failed by
+# returning intent off-topic with ZERO queries: both real SDK questions thrown away. piggyback,
+# the same opening with one noise part instead of three, never moved.
+#
+# Wording 2 cut the guard to its one new clause, on the theory that it restated rules 3 and 4
+# without rule 4's qualifier (off-topic is for when NOTHING in the message is about the SDK).
+# Measured: unchanged. Pooling every run of wordings 1 and 2 gives 42/50, one rate, no step
+# between them. The theory was wrong, and a 9/10 sample in the middle of it read like a fix for
+# about an hour — n=10 cannot separate 0.85 from 1.0, and this file is the place to say so.
+#
+# What both had in common is the structural reading. The prompt declares scope in ONE place, the
+# paragraph above, and the rules below refer to it: rule 4 is phrased "when NOTHING in the message
+# is a question about the Vercel AI SDK". A sentence up here that names an intent does not extend
+# that scope, it adds a second intent rule in front of the first, and a message that half matches
+# each gets decided as a whole. So this wording states only what is covered, in rule 4's own
+# words: questions about the repository ARE questions about the Vercel AI SDK. It carries no
+# instruction either — "write it as a standalone query in the user's words" is rule 6's job, and a
+# rule in a scope block is the same category error one notch smaller. Every intent decision is
+# made in one place again, and the paragraph is the size of the one it sits beside.
+#
+# evals/planner_eval.py is what tests all of this and what caught it, at n=30 or more per arm.
+# Ten runs is not a measurement here; the numbers above are why.
 REPOSITORY_SCOPE_PARAGRAPH = """\
-The AI SDK's own repository, vercel/ai on GitHub, is in scope too: releases and their dates,
-version tags, issues, pull requests and who opened or merged them, commits, contributors, and the
-contents of files in the repository. A message asking for one of those about the AI SDK is
-"search", not off-topic. A later step decides whether to read the repository, so your own job is
-unchanged: write the question as a standalone query in the user's own words, and do not dress it
-up as a documentation topic or invent one for it. Nothing else widens — other products, pricing,
-cloud hosting, general knowledge, and other people's repositories are still off-topic."""
+This search sits beside a lookup in the AI SDK's own repository, vercel/ai on GitHub, which covers
+releases and their dates, version tags, issues, pull requests and who opened or merged them,
+commits, contributors, and the contents of files in the repository. Questions about those are
+questions about the Vercel AI SDK; another project's repository is not covered."""
 
 # Where it goes: immediately before the rules, so the model has read the whole of the scope
 # before any rule refers to it.
