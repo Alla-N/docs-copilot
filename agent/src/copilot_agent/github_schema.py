@@ -75,7 +75,7 @@ INTROSPECTION_TIMEOUT_S = 60.0
 DEFAULT_BYTE_CAP = 8000
 
 # Room kept for the "(N of M ... shown)" footer, so a truncated result can always say it was
-# truncated. Reserved only once truncation is known to be happening; see _capped.
+# truncated. Reserved only once truncation is known to be happening; see capped_block.
 FOOTER_RESERVE = 80
 
 # Descriptions are the bulk of the introspection payload and most of a field line. One line each.
@@ -283,7 +283,7 @@ def _field_detail(name: str, field: GraphQLField) -> str:
     return "\n".join(lines)
 
 
-def _capped(header: list[str], entries: list[str], byte_cap: int, noun: str) -> str:
+def capped_block(header: list[str], entries: list[str], byte_cap: int, noun: str) -> str:
     """Join header and entries under a byte cap, and say how many entries were dropped.
 
     Asked in the order that matters: does the whole thing fit? Only when it does not is anything
@@ -300,6 +300,10 @@ def _capped(header: list[str], entries: list[str], byte_cap: int, noun: str) -> 
 
     Cut at an entry boundary, never mid-line: half a field definition is worse than a missing
     one, because the model will use it.
+
+    Public since 3.4, where the subagent packages a GitHub result for the answer model under the
+    same discipline. It stopped being private the moment a second module needed the same rule:
+    one place to be wrong is the whole point.
     """
     whole = "\n".join(header + entries)
     if len(whole.encode()) <= byte_cap:
@@ -343,7 +347,7 @@ def describe_type(
         ]
         if _one_line(named.description):
             header.append(_one_line(named.description))
-        return _capped(header, members, byte_cap, "members")
+        return capped_block(header, members, byte_cap, "members")
 
     if not isinstance(named, GraphQLObjectType | GraphQLInterfaceType):
         # Scalars, enums and input objects: small enough to print whole.
@@ -358,7 +362,7 @@ def describe_type(
 
     if fields is None:
         entries = [_field_outline(n, f) for n, f in named.fields.items()]
-        return _capped(header, entries, byte_cap, "fields")
+        return capped_block(header, entries, byte_cap, "fields")
 
     entries = []
     for wanted in fields:
@@ -367,7 +371,7 @@ def describe_type(
             entries.append(f"  {wanted}: no such field on {named.name}")
         else:
             entries.append(_field_detail(wanted, field))
-    return _capped(header, entries, byte_cap, "fields")
+    return capped_block(header, entries, byte_cap, "fields")
 
 
 def schema_summary(schema: GraphQLSchema, *, byte_cap: int = DEFAULT_BYTE_CAP) -> str:

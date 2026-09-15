@@ -1,6 +1,6 @@
 # Spec — Phase 3: the GitHub GraphQL data subagent
 
-**Status:** IN PROGRESS, opened 2026-09-14. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
+**Status:** IN PROGRESS, opened 2026-09-14. 3.1 to 3.4 are built, green and measured. Phase 3 of `claude/windward-plan.md`. Phases 1, 2,
 the before-2b block and 2b are complete and measured. Results and findings will go in the phase 3
 section of `agent/README.md`; this file is the design record and is kept with its wrong
 predictions in it, like `specs/aws-deploy.md`.
@@ -41,6 +41,11 @@ DeepAgents orchestrator next to it and the A/B is the point.
 | 10 | **Budget gate: reject before running if `cost` > 10 points or `nodeCount` > 50,000** | Both are from the `dryRun` pre-flight, so both are GitHub's numbers. 10 points is generous for a single-repo query that should cost 1 (P3); it is set where it is so that tripping it is a signal and not a nuisance. A rejection is fed back to the model as a repairable error with the number in it, which is a more useful message than a depth limit. |
 | 11 | **`GITHUB_TOKEN` is optional in `Settings`, and the GitHub route is only wired when it is set** | Same discipline as `enable_search_endpoint`: a deployment without the token has no GitHub subagent at all, and the router only ever emits `docs`. A capability behind a runtime check somebody can get wrong is worse than a capability that is absent. The AWS secret grows from six JSON keys to seven. |
 | 12 | **The subagent's own metrics travel with the turn**, not in a side channel | The harness cannot see inside the service, so the per-turn record (`query_log` and the stream's finish metadata) grows a GitHub block: attempts, first-try valid, final valid, points spent, node count, which errors were request-level and which were field-level. This is how first-try validity and points per question become numbers the eval harness can report next to cost, the same way it already reports tokens. |
+| 13 | **Schema exploration is tool nodes inside the subgraph** | The model calls `github_schema` and `github_type` itself and the graph answers them, rather than being handed a fixed set of type outlines assembled in code. The alternative is cheaper, fully deterministic and one model call per attempt -- but then the model never chooses what to look at, and the claim in the CV case degrades from *the agent introspects the schema* to *we hardcoded five types*. Cost: an extra model call per lookup, and lookups per question becomes a number 3.6 has to report. |
+| 14 | **`github_query` is declared to the model as a tool and executed by a NODE; there is no repair node** | Declaring it gets a structured, validated call out of the model; running it in a node is what makes each attempt its own step (decision 5). Its reply goes back as an ordinary `ToolMessage`, so the model reads GitHub's refusal in exactly the place it reads a schema lookup, and the repair is the tool loop going round again. The diagram's `repair` box holds no work, and a node that holds no work is a span that says nothing. |
+| 15 | **The subgraph compiles with `checkpointer=False`, not `None`** | `None` INHERITS the parent saver once nested, which would persist every schema outline the loop read, on every GitHub turn. Nothing in the loop needs to survive a restart: invariant 13 records a turn only when it completes, and a half-explored schema is not a turn. 2.5 is the measurement that decides this -- 213 of the 216 KiB written per turn were retrieved text in an appending list, which is exactly the shape of a `messages` list carrying two type outlines. |
+| 16 | **`summarise` packages, it does not summarise** | The node emits the question, the query that ran and the JSON, capped, and generation grounds on that. A model call here would be a second place the answer could be invented, and faithfulness would then measure the summary rather than GitHub. The query travels with the data on purpose: a release date with the query that fetched it is a fact with provenance, and 2.8 settled that the judge measures grounding, not truth. |
+| 17 | **GitHub's `first`/`last` rule is deliberately NOT in the system prompt** | P1 predicts a missing pagination bound is the most common first-try failure. One sentence in the prompt would make that prediction untestable. The rule is already in `github_type`'s detail output, so leaving it there means first-try validity measures whether the model looked before it wrote -- the question worth asking. If 3.6's number is bad the prompt is the first knob, and turning it will then be a measured change instead of a starting assumption. |
 
 ## Architecture
 
@@ -261,6 +266,45 @@ half of that immediately, and then a tightened assertion disproved a consolation
    observed to fire**. That is written in the source as a limitation rather than listed as a
    feature.
 
+## Built in 3.4 (2026-09-15): the subgraph, and the diagram that could not be built
+
+`agent/src/copilot_agent/github_agent.py`, 16 offline test functions (20 cases, one of
+them parametrized), green on the first gate run.
+
+    explore --lookup call--> lookup (github_schema, github_type) --> explore
+       |
+       +--github_query call--> run_query --repairable, under the cap--> explore
+       |                           |
+       |                           | ok, unrepairable, or out of repairs
+       v                           v
+    summarise <--------------------+
+
+**6. The architecture diagram in this spec could not be built as drawn, and the reason is three
+sections above it.** It draws write, validate, preflight and run as four nodes. Three of the four
+need the parsed document, so four nodes means either a `DocumentNode` in state -- which the strict
+serializer of invariant 13 will not rebuild, by design -- or parsing the same text three times, at
+which point the node boundary buys spans and nothing else. `GitHubQueries.run()` already holds all
+seven gates behind one call and `RunOutcome.stage` says which one refused, so one `run_query` node
+per attempt keeps decision 5's claim exactly true. The diagram was drawn before the serializer was
+remembered. Worth saying plainly: this was caught by reading the invariant before building, not by
+a failure, which is the cheapest way this project has ever found one of these.
+
+**7. The repair node holds no work.** Once `github_query` is a tool the model calls and a node the
+graph runs, the refusal comes back as a `ToolMessage` and the next attempt is the next turn of the
+same loop. A separate node would increment a counter that `len(attempts)` already knows. The
+second thing the diagram asked for that the build did not need.
+
+**8. Three API facts went out in a build unmeasured, and all three happened to be right.**
+`compile(checkpointer=False)` being accepted at all, `ToolNode` still living at
+`langgraph.prebuilt`, and `bind_tools(parallel_tool_calls=False)` passing the kwarg through. The
+gate was green on the first run, so nothing was found -- but they were guesses, and the only
+reason they are not a finding is luck. A probe would have cost one round trip.
+
+Two branches in this file have never fired and say so in the source: the mixed-batch reply, which
+`parallel_tool_calls=False` should prevent, and the transport-failure stage. Both are tested
+offline. Phase 3 finding 9 is the rule being followed -- an untested branch that claims to save
+something is worse than no branch, so the ones that are there are written as limitations.
+
 ## Sub-steps
 
 Each ends with a measured result, the Mac gate, a commit and CI, in the project's usual order.
@@ -275,9 +319,11 @@ Each ends with a measured result, the Mac gate, a commit and CI, in the project'
   gate, and the split between request-level and field-level errors. Done when each of the five
   failure shapes has a test built from a recorded GitHub response, and a mutation is refused
   offline.
-- **3.4 — the subagent subgraph.** Write, validate, pre-flight, run, repair, summarise. Done when
-  a question with a deliberately broken first attempt is repaired within the cap, the repair
-  count is in the state, and every attempt appears as its own Langfuse span.
+- **3.4 — the subagent subgraph. DONE.** Write, run, repair, summarise. A question whose first
+  query omits `first` is repaired on the second attempt, the repair count is in the state, and the
+  `updates` stream reports explore, run_query, explore, run_query, summarise as five steps. The
+  Langfuse half of the done-when is deferred to 3.5, where the subgraph is nested and
+  `subgraphs=True` decides whether the parent stream sees the same five steps.
 - **3.5 — the router and the graph wiring.** The router node, the three-way route, the merge of
   two evidence sets, and the generation prompt change that keeps them apart. Done when the
   existing 27-case suite still passes with the router in the path, twice, with the latency delta
