@@ -61,6 +61,7 @@ import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK
 import { generationSettings, generationMessages } from "../lib/generation";
 import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
 import { CASES, type EvalCase } from "./dataset";
+import { FROZEN_AT, GITHUB_CASES, containsAnswer, type GitHubCase } from "./github-cases";
 import { judgeFaithfulness, type Verdict } from "./judge";
 import {
     agentTarget,
@@ -72,9 +73,11 @@ import {
     pagesAsChunks,
     topScore as pagesTopScore,
     traceIdsOfThreads,
+    turnFactsOfThreads,
     type AgentReply,
     type AgentTarget,
     type RunCost,
+    type TurnFacts,
 } from "./agent-target";
 import { contextsByTrace, langfuseApi } from "./langfuse-api";
 
@@ -117,6 +120,22 @@ const FAULT = (process.env.EVAL_FAULT ?? "").split(",").map((x) => x.trim()).fil
  */
 const JUDGE = process.env.EVAL_JUDGE === "1";
 
+/**
+ * The GitHub labelled set (step 3.6): on by default on the Python target, EVAL_GITHUB=0 to skip.
+ *
+ * Its own runs knob, and a small default, because a run here is not a generation: it is a whole
+ * subagent loop of schema lookups and query attempts, 12 to 18 seconds warm. Two runs per case is
+ * NOT a per-case rate — 3.5b is emphatic that n=10 cannot separate 0.85 from 1.0, so n=2 cannot
+ * either. It is two observations per case so that a case which differs between them is reported
+ * as VARIED rather than silently as whichever run came first, and so that the SET-level number
+ * (13 cases x 2) has something under it. The done-when runs the whole suite twice and pools.
+ */
+const GITHUB = process.env.EVAL_GITHUB !== "0";
+const GITHUB_RUNS = Number(process.env.EVAL_GITHUB_RUNS ?? 2);
+/** Case indices for the GitHub set, kept clear of the golden set so thread ids stay unique and
+ *  a GitHub turn is recognisable in query_log by its thread id alone. */
+const GITHUB_INDEX_BASE = 1000;
+
 /** Widening the candidate pool costs latency on every production query. Price it. */
 const retrievalMs: number[] = [];
 
@@ -134,7 +153,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * `expectedSource` may be one slug or several — any match satisfies the case (see dataset.ts
  * for why). One helper, used by the main pass and the push-gate retry, so both judge alike.
  */
-function expectedFound(c: EvalCase, relevant: { source_url: string }[]): boolean | null {
+function expectedFound(c: { expectedSource?: string | string[] }, relevant: { source_url: string }[]): boolean | null {
     if (!c.expectedSource) return null;
     const wanted = Array.isArray(c.expectedSource) ? c.expectedSource : [c.expectedSource];
     return relevant.some((r) => wanted.some((slug) => r.source_url.includes(slug)));
@@ -152,6 +171,13 @@ type Result = {
     sample: string;      // first response, for eyeballing adversarial cases
     /** The run that broke expectation (answered when it should refuse, or vice versa), if any. */
     odd?: { i: number; text: string };
+    /** Run 1's thread id on the Python target, so the route the service recorded for this case
+     *  can be read back afterwards (db/009). Absent on the TypeScript target, which has no router. */
+    threadId?: string;
+    /** What the router chose on run 1: "docs", "both", or null for a turn the planner canned
+     *  before the router ever saw it. Step 3.6 records it per case because without it a
+     *  documentation question answered from GitHub is invisible in a stored result. */
+    route?: TurnFacts["route"];
     faithful: string;    // judge verdict on the first answer, when EVAL_JUDGE=1
     /** The claims behind a "NO", with the span the judge offered for each. Recorded so a
      *  stored result can be inspected instead of re-run: without it a reader sees only
@@ -404,6 +430,15 @@ const agentMs = {
 /** Every thread the run used, and how many completed turns the service should have logged. */
 const agentThreads: string[] = [];
 let agentTurns = 0;
+/**
+ * The GitHub set's threads, kept OUT of agentThreads on purpose. costOfThreads over those two
+ * arrays is the suite's cost per request, which is a series: $0.1972 local, $0.1972 on AWS,
+ * $0.2022 with the router, $0.2042 with the planner paragraph. Folding thirteen subagent turns
+ * into it would break the series at the exact moment it is most worth reading, and would price
+ * two different populations as one. The GitHub set gets its own line instead.
+ */
+const githubThreads: string[] = [];
+let githubTurns = 0;
 /** Identifies this run's threads in query_log: a timestamp plus a little randomness. */
 const RUN_STAMP = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + Math.random().toString(16).slice(2, 6);
 // When the run started, minus a minute of clock skew: the window the judge asks Langfuse for.
@@ -477,6 +512,7 @@ async function runCaseOnAgent(target: AgentTarget, c: EvalCase, index: number): 
     const top = pagesTopScore(first.pages);
     return {
         id: c.id,
+        threadId: evalThreadId(RUN_STAMP, index, 0),
         intent: first.intent,
         degraded,
         retrieved: found === null ? "—" : found ? "yes" : "NO",
@@ -552,6 +588,260 @@ async function judgeAgentRuns(results: Result[], active: EvalCase[]): Promise<vo
 
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 const ms = (xs: number[]) => (xs.length ? `${median(xs).toFixed(0)}ms` : "—");
+
+// ---- the GitHub labelled set (step 3.6) ------------------------------------------------------
+
+type GitHubRun = {
+    threadId: string;
+    text: string;
+    intent: PlanIntent;
+    /** For the compound case: was the documentation page there too? null when the case has none. */
+    pageFound: boolean | null;
+    error: string | null;
+};
+
+type GitHubResult = {
+    id: string;
+    label: GitHubCase["route"];
+    runs: number;
+    correct: number;
+    routes: TurnFacts["route"][];
+    routedRight: number;
+    /** Turns the PLANNER canned before the router existed for them. Not a routing mistake: a
+     *  turn that was never routed. 3.5 found three of three repository questions ending here. */
+    canned: number;
+    /** Turns that came back with a subagent block at all. */
+    subagentRuns: number;
+    firstTryValid: number;
+    ok: number;
+    points: number[];
+    attempts: number[];
+    repairs: number[];
+    verdict: "PASS" | "FAIL" | "VARIED" | "ERROR";
+    detail: string;
+    sample: string;
+    query: string | null;
+    evidence: string | null;
+};
+
+/**
+ * Did the answer decline, rather than assert something?
+ *
+ * Only the control case is scored with this, and it is the one criterion in the set that is
+ * openly approximate. isRefusal alone is not enough here: it is positional (invariant 5) and 3.5
+ * watched it read an answered turn as refused when a GitHub answer opened with the refusal
+ * sentence. A model that declines in its own words is also correct, so both shapes count, and
+ * the control's sample is printed on every run whatever the verdict — the criterion is the thing
+ * most likely to be wrong, so it is the thing kept under the eye.
+ */
+function declined(text: string): boolean {
+    return (
+        isRefusal(text) ||
+        /\b(cannot|can't|can not|unable to|do(es)? not (provide|have|record)|no (historical|record|data))\b/i.test(text)
+    );
+}
+
+function answeredCorrectly(c: GitHubCase, run: GitHubRun): boolean {
+    if (run.error) return false;
+    if (!c.shouldAnswer) return declined(run.text);
+    if (!containsAnswer(run.text, c.answerContains ?? [])) return false;
+    // The compound case is the only test of the claim that `both` means both, so a right date
+    // with the documentation half missing is not a pass.
+    return run.pageFound !== false;
+}
+
+/**
+ * Run the labelled set, then read back what the service recorded for each turn.
+ *
+ * The facts come from query_log and not from the stream: decision 12, and the reason is that the
+ * stream is a product surface. Every measure below except answer accuracy is computed from the
+ * block db/010 stores, and answer accuracy is computed from the text, which is the whole point of
+ * having it — 3.5b's turn had four perfect counters and no answer in it.
+ */
+async function runGitHubCases(target: AgentTarget): Promise<GitHubResult[]> {
+    const cases = ONLY.length ? GITHUB_CASES.filter((c) => ONLY.includes(c.id)) : GITHUB_CASES;
+    if (!cases.length) return [];
+    console.log(
+        `\nGitHub set: ${cases.length} labelled questions x ${GITHUB_RUNS} runs  |  answers frozen ${FROZEN_AT}\n` +
+        `  (a per-case rate at n=${GITHUB_RUNS} is not a rate; a case that differs between its runs is VARIED)\n`
+    );
+
+    const runsByCase = new Map<string, GitHubRun[]>();
+    for (const [i, c] of cases.entries()) {
+        const runs: GitHubRun[] = [];
+        for (let run = 0; run < GITHUB_RUNS; run++) {
+            const threadId = evalThreadId(RUN_STAMP, GITHUB_INDEX_BASE + i, run);
+            githubThreads.push(threadId);
+            let reply: AgentReply;
+            try {
+                reply = await askAgent(target, threadId, c.query);
+            } catch (err) {
+                runs.push({ threadId, text: "", intent: "search", pageFound: null, error: String(err) });
+                continue;
+            }
+            if (!reply.error) githubTurns++;
+            runs.push({
+                threadId,
+                text: reply.text,
+                intent: reply.intent,
+                pageFound: c.expectedSource ? expectedFound(c, pagesAsChunks(reply.pages)) : null,
+                error: reply.error,
+            });
+            await sleep(RERANK_INTERVAL_MS);
+        }
+        runsByCase.set(c.id, runs);
+    }
+
+    // The rows land in the background after each turn, same as the cost and trace rows.
+    const facts = await turnFactsOfThreads(githubThreads);
+
+    const results: GitHubResult[] = [];
+    for (const c of cases) {
+        const runs = runsByCase.get(c.id)!;
+        const blocks = runs.map((r) => facts.get(r.threadId) ?? null);
+        const withBlock = blocks.filter((f) => f?.github).map((f) => f!.github!);
+        const correct = runs.filter((r) => answeredCorrectly(c, r)).length;
+        const routes = blocks.map((f) => f?.route ?? null);
+        const errored = runs.filter((r) => r.error).length;
+
+        let verdict: GitHubResult["verdict"];
+        let detail: string;
+        if (errored === runs.length) {
+            verdict = "ERROR";
+            detail = `could not run: ${runs[0].error}`;
+        } else if (correct === runs.length) {
+            verdict = "PASS";
+            detail = c.shouldAnswer ? "the frozen answer is in every run" : "declined in every run";
+        } else if (correct === 0) {
+            verdict = "FAIL";
+            detail = routes.every((r) => r === null)
+                ? "the planner canned it: never routed, never asked"
+                : withBlock.length === 0
+                  ? "routed, but no GitHub evidence came back"
+                  : withBlock.every((b) => b.ok)
+                    ? "the query ran and the answer is not in it"
+                    : "the subagent could not get a query through";
+        } else {
+            verdict = "VARIED";
+            detail = `${correct}/${runs.length} runs carried the frozen answer`;
+        }
+
+        results.push({
+            id: c.id,
+            label: c.route,
+            runs: runs.length,
+            correct,
+            routes,
+            routedRight: routes.filter((r) => r === c.route).length,
+            canned: routes.filter((r) => r === null).length,
+            subagentRuns: withBlock.length,
+            firstTryValid: withBlock.filter((b) => b.first_try_valid).length,
+            ok: withBlock.filter((b) => b.ok).length,
+            points: withBlock.map((b) => b.points_spent),
+            attempts: withBlock.map((b) => b.attempts),
+            repairs: withBlock.map((b) => b.repairs),
+            verdict,
+            detail,
+            sample: runs[0].text,
+            query: withBlock[0]?.query ?? null,
+            evidence: withBlock[0]?.evidence ?? null,
+        });
+    }
+    return results;
+}
+
+/**
+ * The five measures of the done-when, printed and returned for the results file.
+ *
+ * Routing accuracy is computed over the turns that WERE routed, from both sets: the golden set
+ * supplies the `docs` label and the labelled set the `both` label. Turns the planner canned are
+ * counted on their own line rather than scored, because db/009 is explicit that a null route is
+ * not a route to the documentation — and because 3.5 found the planner throwing away three of
+ * three repository questions before the router existed for them, which is a different defect
+ * with a different fix.
+ */
+function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, unknown> {
+    const sum = (ns: number[]) => ns.reduce((a, b) => a + b, 0);
+    const ran = results.filter((r) => r.verdict !== "ERROR");
+    const observations = sum(ran.map((r) => r.runs));
+    const accuracy = sum(ran.map((r) => r.correct));
+    const subagent = sum(ran.map((r) => r.subagentRuns));
+    const firstTry = sum(ran.map((r) => r.firstTryValid));
+    const ok = sum(ran.map((r) => r.ok));
+    const points = ran.flatMap((r) => r.points);
+    const cannedTurns = sum(ran.map((r) => r.canned));
+
+    // Both sets, one number. The golden set's label is `docs` for every case in it.
+    const docsRouted = docs.filter((r) => r.route === "docs" || r.route === "both" || r.route === "github");
+    const docsRight = docsRouted.filter((r) => r.route === "docs").length;
+    const githubRouted = sum(ran.map((r) => r.runs - r.canned));
+    const githubRight = sum(ran.map((r) => r.routedRight));
+
+    console.log(`\nGitHub set — the five measures (${observations} observations over ${ran.length} cases)`);
+    console.log(`  answer accuracy         ${accuracy}/${observations}`);
+    console.log(`  first-try query valid   ${firstTry}/${subagent}   (of the turns whose subagent ran)`);
+    console.log(`  valid after <= 2 repairs ${ok}/${subagent}`);
+    console.log(
+        `  points per question     median ${points.length ? median(points) : "—"}` +
+        `  max ${points.length ? Math.max(...points) : "—"}  total ${sum(points)}`
+    );
+    console.log(
+        `  routing accuracy        ${githubRight + docsRight}/${githubRouted + docsRouted.length}` +
+        `  (GitHub set ${githubRight}/${githubRouted}, golden set ${docsRight}/${docsRouted.length})`
+    );
+    if (cannedTurns) {
+        console.log(
+            `  canned by the planner   ${cannedTurns} turn(s) never reached the router. Not scored as routing:\n` +
+            `                          a turn that was never routed is not a turn routed to the documentation.`
+        );
+    }
+
+    for (const r of results) {
+        console.log(`  ${r.verdict.padEnd(6)} ${r.id.padEnd(24)} ${r.detail}`);
+        // Always for a non-PASS, and always for the control, whose criterion is the approximate one.
+        if (r.verdict !== "PASS" || !GITHUB_CASES.find((c) => c.id === r.id)?.shouldAnswer) {
+            console.log(`         answer   ${r.sample.replace(/\s+/g, " ").slice(0, 400) || "(empty)"}`);
+            if (r.query) console.log(`         query    ${r.query.replace(/\s+/g, " ").slice(0, 300)}`);
+            if (r.evidence) console.log(`         evidence ${r.evidence.replace(/\s+/g, " ").slice(0, 400)}`);
+            console.log(`         routes   ${r.routes.map((x) => x ?? "null").join(", ")}`);
+        }
+    }
+
+    return {
+        frozenAt: FROZEN_AT,
+        runs: GITHUB_RUNS,
+        observations,
+        accuracy: `${accuracy}/${observations}`,
+        firstTryValid: `${firstTry}/${subagent}`,
+        validAfterRepairs: `${ok}/${subagent}`,
+        points: {
+            median: points.length ? median(points) : null,
+            max: points.length ? Math.max(...points) : null,
+            total: sum(points),
+        },
+        routing: {
+            overall: `${githubRight + docsRight}/${githubRouted + docsRouted.length}`,
+            githubSet: `${githubRight}/${githubRouted}`,
+            goldenSet: `${docsRight}/${docsRouted.length}`,
+            cannedByPlanner: cannedTurns,
+        },
+        cases: results.map((r) => ({
+            id: r.id,
+            verdict: r.verdict,
+            correct: `${r.correct}/${r.runs}`,
+            routes: r.routes,
+            firstTryValid: `${r.firstTryValid}/${r.subagentRuns}`,
+            ok: `${r.ok}/${r.subagentRuns}`,
+            points: r.points,
+            attempts: r.attempts,
+            repairs: r.repairs,
+            detail: r.detail,
+            query: r.query,
+            evidence: r.evidence ? r.evidence.slice(0, 600) : null,
+            answer: r.sample.replace(/\s+/g, " ").slice(0, 600),
+        })),
+    };
+}
 
 async function main() {
     // Duplicate ids fail silently otherwise: byId is a Map, so a second case with the same
@@ -632,6 +922,21 @@ async function main() {
     }
 
     if (target && JUDGE) await judgeAgentRuns(results, active);
+
+    // What the router decided for each golden-set case, read back from the rows the service
+    // wrote (db/009). Recorded per case because without it a documentation question answered
+    // from GitHub is invisible in a stored result -- which is how 3.5's `changed-7` passed.
+    if (target) {
+        const threads = results.map((r) => r.threadId).filter((t): t is string => Boolean(t));
+        const facts = threads.length ? await turnFactsOfThreads(threads) : new Map<string, TurnFacts>();
+        for (const r of results) r.route = r.threadId ? (facts.get(r.threadId)?.route ?? null) : null;
+        const misrouted = results.filter((r) => r.route === "both" || r.route === "github");
+        if (misrouted.length)
+            console.log(`\n  note: ${misrouted.length} documentation case(s) routed to GitHub as well: ${misrouted.map((r) => `${r.id} (${r.route})`).join(", ")}`);
+    }
+
+    let github: GitHubResult[] = [];
+    if (target && GITHUB) github = await runGitHubCases(target);
 
     const byId = new Map(results.map((r) => [r.id, r]));
     // A case that could not run is not evidence about the pipeline, so it is kept out of every
@@ -853,6 +1158,18 @@ async function main() {
             console.log(`  ⚠ ${cost.expected - cost.rows} completed turns have no query_log row: the service logs insert failures, look there.`);
     }
 
+    // The labelled set is priced on its own line, never folded into the figure above: that one is
+    // a series across five stored runs and a different population would break it silently.
+    let githubCost: RunCost | null = null;
+    if (target && github.length) {
+        githubCost = await costOfThreads(githubThreads, githubTurns);
+        console.log(
+            `GitHub set cost    $${githubCost.usd.toFixed(4)} for ${githubCost.rows} requests, ` +
+            `$${githubCost.usdPerRequest?.toFixed(5) ?? "—"} per request (kept out of the figure above)`
+        );
+    }
+    const githubReport = github.length ? reportGitHub(github, results) : null;
+
     // Every full run leaves a record: knobs, per-case verdicts, the headline numbers, the
     // commit it ran against. README numbers cite one of these files instead of a memory of a
     // terminal — a number nobody can trace to a stored run is a rumour with a decimal point.
@@ -909,6 +1226,7 @@ async function main() {
                         cannedMs: { n: agentMs.canned.total.length, done: Math.round(median(agentMs.canned.total)) },
                         historyFieldStatus: historyRefused,
                         cost,
+                        ...(githubReport ? { github: githubReport, githubCost } : {}),
                         threads: `eval-${RUN_STAMP}-*`,
                     }
                     : {}),
@@ -918,7 +1236,7 @@ async function main() {
                 topScore: r.topScore, answered: `${r.answered}/${r.runs}`, faithful: r.faithful, detail: r.detail,
                 ...(r.faithfulDetail ? { faithfulDetail: r.faithfulDetail } : {}),
                 ...(r.errored ? { errored: r.errored } : {}),
-                ...(target ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}` } : {}),
+                ...(target ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}`, route: r.route ?? null } : {}),
             })),
         };
         mkdirSync("evals/results", { recursive: true });
@@ -936,6 +1254,24 @@ async function main() {
         process.exit(1);
     }
     reportIncomplete();
+    // The golden set is green. The labelled set gets its own exit code rather than 1, because
+    // these are two different claims about the system and collapsing them would make "the suite
+    // passed" stop meaning what it has meant in every stored run before this one. Exit 5 says:
+    // the documentation pipeline is fine and the GitHub set is not.
+    // Exit 4 first, for the same reason the golden set exits 4: a case that could not RUN is not
+    // a verdict about the system, and a run that did not measure everything is not a baseline.
+    const githubErrored = github.filter((r) => r.verdict === "ERROR");
+    if (githubErrored.length) {
+        console.log(`\n${githubErrored.length} GitHub case(s) could NOT RUN: ${githubErrored.map((r) => r.id).join(", ")}`);
+        console.log(`  This run is INCOMPLETE and is not a baseline (exit 4).`);
+        process.exit(4);
+    }
+    const githubFailed = github.filter((r) => r.verdict === "FAIL" || r.verdict === "VARIED");
+    if (githubFailed.length) {
+        console.log(`\n${githubFailed.length} GitHub case(s) not answered: ${githubFailed.map((r) => r.id).join(", ")}`);
+        console.log(`  The golden set is green; this is the labelled set (exit 5).`);
+        process.exit(5);
+    }
     console.log(`\nall green${parked.length ? ` (${parked.length} parked)` : ""}.`);
 }
 

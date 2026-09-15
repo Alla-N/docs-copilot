@@ -5,6 +5,7 @@ that the columns are TypeScript's is tested in tests/test_ts_parity.py. Here: th
 """
 
 import asyncio
+import json
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,11 +13,13 @@ from typing import Any
 
 import pytest
 
+from copilot_agent.github_agent import GitHubEvidence
 from copilot_agent.graph import GenerationMetrics
 from copilot_agent.planner import NO_USAGE, Plan, SubQuery, TokenUsage
 from copilot_agent.query_log import (
     COLUMNS,
     INSERT_SQL,
+    JSONB_COLUMNS,
     QueryLog,
     Turn,
     Visitor,
@@ -176,6 +179,95 @@ def test_the_router_s_decision_and_tokens_reach_the_row() -> None:
     row = turn.row()
     assert row["route"] == "both"
     assert (row["router_input_tokens"], row["router_output_tokens"]) == (300, 4)
+
+
+EVIDENCE = GitHubEvidence(
+    question="when was ai 5.0.0 released",
+    ok=True,
+    evidence="releases: ai@5.0.0 published 2025-08-07",
+    query="query { repository { release(tagName: $tag) { publishedAt } } }",
+    attempts=2,
+    repairs=1,
+    first_try_valid=False,
+    stages=["missing first", "ok"],
+    lookups=2,
+    points_spent=1,
+    node_count=3,
+    usage=TokenUsage(900, 60),
+)
+
+
+def test_a_turn_without_the_subagent_logs_no_github_block_and_no_github_tokens() -> None:
+    # Most turns. db/010's check constraint says the same thing from the table's side: a block
+    # without a 'both' route is a row that cannot happen.
+    turn = Turn(question="q", thread_id="t" * 16, origin="web")
+    turn.see(updates("plan", {"plan": PLAN}))
+    turn.see(updates("router", {"route": "docs", "router_usage": TokenUsage(300, 4)}))
+    turn.see(updates("merge", {"relevant": [chunk(0.7)], "mode": "reranked", "rerank_calls": 1}))
+    generation = GenerationMetrics(
+        usage=TokenUsage(100, 20), ttft_ms=1.0, generation_ms=2.0, finish_reason="stop"
+    )
+    assert turn.see(updates("generate", {"answer": "a", "generation": generation})) is True
+    row = turn.row()
+    assert row["github"] is None
+    assert (row["github_input_tokens"], row["github_output_tokens"]) == (None, None)
+
+
+def test_the_subagent_s_whole_block_reaches_the_row_not_only_its_counters() -> None:
+    # 3.5b: `ok`, `attempts`, `first_try_valid` and `points_spent` all reported success on a turn
+    # that listed the ten newest releases instead of looking up the tag it was asked about. So
+    # the counters alone cannot say whether the question was answered, and the query and the
+    # evidence text have to be in the row for 3.6 to tell a wrong lookup from a wasted one.
+    turn = Turn(question="q", thread_id="t" * 16, origin="eval")
+    turn.see(updates("plan", {"plan": PLAN}))
+    turn.see(updates("router", {"route": "both", "router_usage": TokenUsage(300, 4)}))
+    turn.see(updates("github", {"github": EVIDENCE}))
+    turn.see(updates("merge", {"relevant": [chunk(0.7)], "mode": "reranked", "rerank_calls": 1}))
+    generation = GenerationMetrics(
+        usage=TokenUsage(100, 20), ttft_ms=1.0, generation_ms=2.0, finish_reason="stop"
+    )
+    assert turn.see(updates("generate", {"answer": "a", "generation": generation})) is True
+    row = turn.row()
+
+    assert (row["github_input_tokens"], row["github_output_tokens"]) == (900, 60)
+    block = json.loads(str(row["github"]))
+    assert block["ok"] is True
+    assert block["attempts"] == 2
+    assert block["repairs"] == 1
+    assert block["first_try_valid"] is False
+    assert block["points_spent"] == 1
+    assert block["stages"] == ["missing first", "ok"]
+    assert "release(tagName:" in block["query"]
+    assert "2025-08-07" in block["evidence"]
+    # The nested dataclass survives as an object, not as a pair of positions: the harness reads
+    # these by name.
+    assert block["usage"] == {"input_tokens": 900, "output_tokens": 60}
+
+
+def test_a_turn_that_ran_the_subagent_and_lost_it_still_logs_a_row() -> None:
+    # The wrapper node writes `.get("result")`, so a subagent that ended without one hands this
+    # None. 3.5's reason: an answer stream is already a 200 by then, and a KeyError inside it is
+    # worse than a turn recorded without GitHub facts.
+    turn = Turn(question="q", thread_id="t" * 16, origin="eval")
+    turn.see(updates("plan", {"plan": PLAN}))
+    turn.see(updates("router", {"route": "both", "router_usage": TokenUsage(300, 4)}))
+    turn.see(updates("github", {"github": None}))
+    turn.see(updates("merge", {"relevant": [chunk(0.7)], "mode": "reranked", "rerank_calls": 1}))
+    generation = GenerationMetrics(
+        usage=TokenUsage(100, 20), ttft_ms=1.0, generation_ms=2.0, finish_reason="stop"
+    )
+    assert turn.see(updates("generate", {"answer": "a", "generation": generation})) is True
+    assert turn.row()["github"] is None
+
+
+def test_the_jsonb_column_is_cast_in_the_statement() -> None:
+    # The block is passed as a JSON string, so without the cast Postgres would be handed text for
+    # a jsonb column and every insert of a GitHub turn would fail -- in the background task, where
+    # a failure is a log line and not a failed request.
+    assert "github" in JSONB_COLUMNS and len(JSONB_COLUMNS) == 1
+    assert "%(github)s::jsonb" in INSERT_SQL
+    for column in set(COLUMNS) - JSONB_COLUMNS:
+        assert f"%({column})s::" not in INSERT_SQL
 
 
 def test_the_insert_names_every_column_once() -> None:

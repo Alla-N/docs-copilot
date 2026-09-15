@@ -532,6 +532,12 @@ async def test_an_answered_turn_writes_the_row_the_typescript_route_would() -> N
         "route": None,
         "router_input_tokens": None,
         "router_output_tokens": None,
+        # No router means no subagent either, so step 3.6 adds three nulls rather than three
+        # numbers. db/010's check constraint says the same thing from the table's side: a GitHub
+        # block can only exist on a turn that routed `both`.
+        "github": None,
+        "github_input_tokens": None,
+        "github_output_tokens": None,
     }
     assert all(isinstance(ms, int) and ms >= 0 for ms in timings.values())
     assert timings["ttft_ms"] <= timings["generation_ms"]

@@ -24,18 +24,20 @@ container does not silently lose the last rows.
 """
 
 import asyncio
+import json
 import logging
 import math
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import aclosing, asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 from psycopg_pool import AsyncConnectionPool
 
 from copilot_agent.checkpoint import open_pool
+from copilot_agent.github_agent import GitHubEvidence
 from copilot_agent.graph import GenerationMetrics
 from copilot_agent.planner import NO_USAGE, TokenUsage
 from copilot_agent.refusal import is_refusal
@@ -47,8 +49,9 @@ logger = logging.getLogger(__name__)
 
 Origin = Literal["web", "eval"]
 
-# Every column this service writes, in insert order. db/002, 003 and 005 created all but the last
-# two, which db/006_origin.sql adds; the service refuses to start without any of them.
+# Every column this service writes, in insert order. db/002, 003 and 005 created most of them;
+# db/006_origin.sql and db/007_trace_id.sql add three more, db/009_router.sql the router's three
+# and db/010_github.sql the subagent's three. The service refuses to start without any of them.
 COLUMNS = (
     "question",
     "refused",
@@ -74,15 +77,29 @@ COLUMNS = (
     "router_input_tokens",
     "router_output_tokens",
     "route",
+    "github",
+    "github_input_tokens",
+    "github_output_tokens",
 )
+
+# `github` is jsonb, and it is written as a JSON string with the cast in the statement rather than
+# as a mapping the driver is trusted to adapt. Two things follow: the row stays a plain dict that
+# a test can compare field by field, and the SQL says out loud which type it is writing.
+JSONB_COLUMNS = frozenset({"github"})
+
+
+def _placeholder(column: str) -> str:
+    return f"%({column})s::jsonb" if column in JSONB_COLUMNS else f"%({column})s"
+
 
 INSERT_SQL = (
     f"insert into query_log ({', '.join(COLUMNS)}) "
-    f"values ({', '.join(f'%({c})s' for c in COLUMNS)})"
+    f"values ({', '.join(_placeholder(c) for c in COLUMNS)})"
 )
 
 SETUP_HINT = (
-    "run db/006_origin.sql, db/007_trace_id.sql and db/009_router.sql in the Supabase SQL editor"
+    "run db/006_origin.sql, db/007_trace_id.sql, db/009_router.sql and db/010_github.sql "
+    "in the Supabase SQL editor"
 )
 
 # How long shutdown waits for inserts still running. One insert is one round trip (~70 ms on the
@@ -149,6 +166,21 @@ class Visitor:
 NO_VISITOR = Visitor(None, None, None, None, None)
 
 
+def github_block(evidence: GitHubEvidence | None) -> str | None:
+    """The subagent's evidence as the jsonb column holds it: a JSON string, or None.
+
+    Everything, not a chosen few counters. 3.5b is the reason (specs/github-subagent.md): `ok`,
+    `attempts`, `first_try_valid` and `points_spent` all reported success on a turn that listed
+    the ten newest releases instead of looking up the tag it was asked about, so the counters
+    cannot be trusted to say whether the question was answered. The query and the evidence text
+    are what separate a subagent that fetched the wrong facts from a generation that had the
+    right ones and did not use them, and 3.6 has to tell those apart case by case.
+    """
+    if evidence is None:
+        return None
+    return json.dumps(asdict(evidence), ensure_ascii=False)
+
+
 @dataclass
 class Turn:
     """What one /chat request did, gathered from the graph's stream as it goes past."""
@@ -164,6 +196,9 @@ class Turn:
     # Step 3.5. None means no router ran at all, which db/009 keeps distinct from 'docs'.
     route: Route | None = None
     router_usage: TokenUsage = NO_USAGE
+    # Step 3.6. None on every turn the subagent did not run, which is most of them; db/010's
+    # check constraint says the same thing from the table's side.
+    github: GitHubEvidence | None = None
     relevant: list[RetrievedChunk] = field(default_factory=list)
     mode: RetrievalMode | None = None
     rerank_calls: int = 0
@@ -184,6 +219,8 @@ class Turn:
             elif node == "router":
                 self.route = update["route"]
                 self.router_usage = update["router_usage"]
+            elif node == "github":
+                self.github = update["github"]
             elif node in ("merge", "canned"):
                 self.relevant = update["relevant"]
                 self.mode = update["mode"]
@@ -235,6 +272,13 @@ class Turn:
             "router_input_tokens": self.router_usage.input_tokens,
             "router_output_tokens": self.router_usage.output_tokens,
             "route": self.route,
+            # Step 3.6. A fourth model call, priced by db/010 for db/009's reason: the harness
+            # reports a MEASURED cost per request, and a `both` turn that spends subagent tokens
+            # nothing prices would come back at the old figure, not because the cost had not
+            # moved but because nothing was watching the part that moved.
+            "github": github_block(self.github),
+            "github_input_tokens": self.github.usage.input_tokens if self.github else None,
+            "github_output_tokens": self.github.usage.output_tokens if self.github else None,
         }
 
 

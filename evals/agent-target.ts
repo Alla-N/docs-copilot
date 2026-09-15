@@ -249,3 +249,72 @@ export async function costOfThreads(threadIds: string[], expected: number, waitM
         unpriced: rows.filter((r) => !r.priced).length,
     };
 }
+
+/**
+ * The GitHub subagent's evidence block, as db/010_github.sql stores it.
+ *
+ * Every field the 3.6 done-when reports, plus the two the counters cannot stand in for. 3.5b is
+ * why the query and the evidence text are here: `ok`, `attempts`, `firstTryValid` and `points`
+ * all reported success on a turn that listed the ten newest releases instead of looking up the
+ * tag it was asked about, so when a case fails on accuracy the only thing that separates "the
+ * subagent fetched the wrong facts" from "generation had the right ones and did not use them"
+ * is reading these two next to the answer.
+ */
+export type GitHubBlock = {
+    question: string;
+    ok: boolean;
+    evidence: string;
+    query: string | null;
+    attempts: number;
+    repairs: number;
+    first_try_valid: boolean;
+    stages: string[];
+    lookups: number;
+    points_spent: number;
+    node_count: number | null;
+    usage: { input_tokens: number | null; output_tokens: number | null };
+};
+
+/** What the service recorded about one turn, beyond what the stream carries. */
+export type TurnFacts = {
+    /** The router's decision. null means NO ROUTER RAN — the planner canned the turn before it,
+     *  which db/009 keeps distinct from "docs" on purpose: not routing is not a routing choice. */
+    route: "docs" | "github" | "both" | null;
+    github: GitHubBlock | null;
+};
+
+/**
+ * The last turn of each thread, as the service recorded it: the route it chose and what the
+ * GitHub subagent did.
+ *
+ * Read back from query_log rather than taken off the stream, for the reason decision 12 gives:
+ * the harness talks to the service over HTTP and cannot see inside it, and putting subagent
+ * internals into the UI message stream would make a measurement channel out of a surface every
+ * browser visitor receives. Rows land in the background after each turn, so this waits for them
+ * exactly as traceIdsOfThreads and costOfThreads do.
+ *
+ * The LAST turn of the thread, same as the trace ids and for the same reason: a case with
+ * history replays its earlier user turns on that thread and each is a row of its own.
+ */
+export async function turnFactsOfThreads(threadIds: string[], waitMs = 20_000): Promise<Map<string, TurnFacts>> {
+    const supabase = createClient(requireEnv("SUPABASE_URL"), requireEnv("SUPABASE_SERVICE_KEY"));
+    const deadline = Date.now() + waitMs;
+    for (;;) {
+        const found = new Map<string, TurnFacts>();
+        for (let i = 0; i < threadIds.length; i += 100) {
+            const { data, error } = await supabase
+                .from("query_cost")
+                .select("thread_id, route, github, created_at")
+                .eq("origin", "eval")
+                .in("thread_id", threadIds.slice(i, i + 100))
+                .order("created_at", { ascending: true });
+            if (error) throw new Error(`reading query_cost failed: ${error.message}`);
+            // Ascending, so the last row of a thread is the one left in the map.
+            for (const row of (data ?? []) as { thread_id: string | null; route: TurnFacts["route"]; github: GitHubBlock | null }[]) {
+                if (row.thread_id) found.set(row.thread_id, { route: row.route, github: row.github });
+            }
+        }
+        if (found.size >= threadIds.length || Date.now() > deadline) return found;
+        await new Promise((r) => setTimeout(r, 1000));
+    }
+}
