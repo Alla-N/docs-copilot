@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "fastapi>=0.141.1",
+    "graphql-core>=3.2.12",
     "httpx>=0.28.1",
     "langchain>=1.4.0",
     "langchain-openai>=1.6.2",

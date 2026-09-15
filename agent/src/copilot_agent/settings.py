@@ -111,6 +111,13 @@ class Settings(BaseSettings):
     # Rust's regex crate, which has no lookahead.)
     langfuse_environment: str = Field(default="development", pattern=r"^[a-z0-9][a-z0-9_-]*$")
 
+    # GitHub (phase 3). A fine-grained personal access token with public-repository read-only
+    # access and no account permissions. Optional, and the GitHub subagent is only WIRED when it
+    # is set (spec decision 11): a deployment without the token has no GitHub path at all and its
+    # router only ever emits "docs", rather than a capability behind a runtime check somebody can
+    # get wrong. Same shape as enable_search_endpoint, for the same reason.
+    github_token: SecretStr | None = None
+
     @field_validator(
         "openai_api_key",
         "cohere_api_key",
@@ -120,6 +127,7 @@ class Settings(BaseSettings):
         "langfuse_public_key",
         "langfuse_secret_key",
         "langfuse_base_url",
+        "github_token",
         mode="before",
     )
     @classmethod
@@ -199,6 +207,7 @@ class Settings(BaseSettings):
             self.agent_api_key,
             self.assistant_signing_secret,
             self.langfuse_secret_key,
+            self.github_token,
         )
         return [secret.get_secret_value() for secret in held if secret is not None]
 

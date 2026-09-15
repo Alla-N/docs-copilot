@@ -35,7 +35,7 @@ DeepAgents orchestrator next to it and the A/B is the point.
 | 4 | **Read-only enforced twice: token scope and a code check** | The token is a fine-grained PAT with public-repository read-only access and no account permissions. Independently, the runner parses the operation and **refuses anything whose operation type is not `query`** before it reaches the network. The token makes a mutation fail; the code check makes it never leave the process, and unlike the token it is testable offline with no secret. Defence in depth is the reason given in interviews; the real reason is that the code check is the one of the two that has a test. |
 | 5 | **The subagent is a LangGraph subgraph, not a node** | Its loop (write, validate, pre-flight, run, repair) is nodes and edges. Consequence that matters: every attempt is its own step, so it appears in the LangGraph `updates` stream and as its own span in Langfuse, and the repair count is state rather than a local variable. A single node with a `for` loop inside would hide all of it, which is exactly finding 2.3 (inside the graph, a call silently changed shape) waiting to happen again. |
 | 6 | **The schema is fetched lazily on first use, never at startup** | Startup readiness already exits 3 when a dependency is not ready (the before-2b block). Adding GitHub to that list would make the service's availability depend on GitHub's, for a capability most turns do not use. So: fetched on the first GitHub turn, cached in memory for the process lifetime and persisted to a local path for development. **Tests never touch the network**: they build the schema from a recorded fixture, the same discipline as the golden request tests. |
-| 7 | **Tool 2 returns a budgeted type description, not a type dump** | `__type` on `Repository` is thousands of tokens, most of it descriptions. The tool returns: the type's kind, its fields with each field's unwrapped type name and whether it is a connection, which arguments are required, and descriptions truncated to one line — under a hard byte cap, with a note saying how many fields were omitted. **How much to return is the interesting knob of this phase**, and it is a variable worth an A/B in phase 5. |
+| 7 | **Tool 2 returns a budgeted type description, not a type dump** | `__type` on `Repository` is thousands of tokens, most of it descriptions. **Revised in 3.2 to two reading modes**, because one budgeted description cannot do both jobs: `Repository` has 145 fields, so a single cap over a full description cuts the list somewhere in the alphabet and `releases` exists or not depending on where the knife fell. **Outline** (no arguments, no descriptions, one line per field with its SDL type and a `[connection of X]` marker) is complete and cheap; **detail** (named fields only) carries full signatures, required arguments and one line of description each. The byte cap applies to both and a truncated result says how many fields it dropped. **How much to return is the interesting knob of this phase**, and it is a variable worth an A/B in phase 5. |
 | 8 | **`gpt-4o-mini` for the subagent too** | Same model as the planner and the answer, so phase 6's Bedrock A/B moves one variable. If query-writing turns out to need a stronger model, that is a finding with a number attached, not a starting assumption. |
 | 9 | **Repair cap N = 2**, three attempts in total | A guess, to be measured. The thing the cap protects against is not cost (a validation failure costs one round trip and, with decision 2, usually zero points) but a loop that convinces itself. Prediction P2 says most first tries are already valid; if the second attempt rarely helps, the cap comes down to 1. |
 | 10 | **Budget gate: reject before running if `cost` > 10 points or `nodeCount` > 50,000** | Both are from the `dryRun` pre-flight, so both are GitHub's numbers. 10 points is generous for a single-repo query that should cost 1 (P3); it is set where it is so that tripping it is a signal and not a nuisance. A rejection is fed back to the model as a repairable error with the number in it, which is a more useful message than a depth limit. |
@@ -96,7 +96,7 @@ date to a documentation page. That prompt change is the one place phase 3 touche
 | Tool | Signature | Notes |
 |---|---|---|
 | `github_schema` | `() -> SchemaSummary` | Fetches introspection once (decision 6), caches, returns only the top-level entry points and the handful of type names that matter for this repository. Not the schema. |
-| `github_type` | `(name: str) -> str` | The budgeted type description of decision 7. This is the tool the model will call most. |
+| `github_type` | `(name: str, fields: list[str] \| None) -> str` | The budgeted type description of decision 7: outline when `fields` is omitted, full signatures when it is given. This is the tool the model will call most. |
 | `github_query` | `(query: str, variables: dict) -> QueryResult` | Read-only check (decision 4), local validation (decision 2), `dryRun` pre-flight and budget gate (decision 10), then the real call. Returns data, or a typed error that says which class it is. |
 
 ## Done when
@@ -114,6 +114,55 @@ suite, run twice (HyDE is still in the docs path), reporting:
 
 And: the existing 27-case suite is re-run, so the router's cost to every docs-only turn is a
 measured number rather than an assumption (P6).
+
+## Measured in 3.2 (2026-09-14)
+
+The schema cache, from `experiments/github_schema_size.py` on the Mac against the live API:
+
+| | |
+|---|---|
+| types in GitHub's schema | 1,826 |
+| introspection JSON, descriptions included | 3.2 MiB |
+| built schema, tracemalloc | 5.3 MiB |
+| built schema, RSS delta | **2.5 MiB** |
+
+**Phase 2b decision 8 survives.** The task is 256 CPU units and 512 MiB from a measured 145 MiB
+working set, and a cached GitHub schema adds about 1.7 percent of that. The fear written into
+the experiment -- that a parsed 1,800-type schema might weigh 150 MiB and force a redeploy at a
+bigger size -- was wrong by two orders of magnitude.
+
+**Two numbers in the first draft of this spec and of `github_schema.py` were invented**, and are
+corrected above and in the source: "about 1,100 types" (it is 1,826) and "tens of megabytes of
+JSON" (it is 3.2 MiB). The argument they supported still holds -- 3.2 MiB is roughly 800,000
+tokens, so the schema cannot go in a prompt -- but it was being argued from a number nobody had
+measured.
+
+Uncapped outline bytes, which is what `DEFAULT_BYTE_CAP` is now set from: Repository 5,971 over
+145 fields, PullRequest 4,290, Issue 3,357, the Query root 1,362, and everything else under 800.
+
+## Findings so far
+
+1. **A marker that names the wrapper.** The first `_field_outline` reported
+   `[connection of IssueConnection]`, which is true, well formed, and the one fact the model
+   already had from the field type. What it cannot see from there is the node type, `Issue`.
+   Caught by a test that knew the right answer; nothing about the output looked wrong. Same
+   shape as phase 2b finding 1, arriving for the fifth time: **nothing has to look different
+   from no answer, and a correctly shaped answer that carries no information looks like both.**
+2. **A cap that could not be reached, and a fix that did not fix it.** Room for the truncation
+   footer was held back at every step of the walk, against a footer that would never be written
+   if the walk simply finished. The real `Repository` outline is 5,971 bytes and was cut at a
+   6,000 byte cap -- by one field line -- and then told the truth about having been cut. The
+   first fix exempted the final entry and changed nothing: the reserve bites at entry three,
+   long before the last one is in sight. **The bug was never the arithmetic. It was answering a
+   local question -- does this entry fit, plus a footer? -- in place of the only one that decides
+   the outcome: does all of it fit?** The cap now asks that first, and reserves footer room only
+   once truncation is known to be happening.
+3. **The capped measurement could not measure the cap.** The first version of the experiment
+   printed only the capped size, so `Repository` read as "5,936 bytes, CUT" -- over the cap, by
+   an unknown amount. A measurement tool that reports a clipped number is the same bug it is
+   meant to find. It now prints uncapped, capped and field count side by side.
+4. **A fine-grained personal access token works against the GraphQL API.** Settled by the live
+   test, not by the changelog. The classic `public_repo` token is not needed.
 
 ## Predictions, written before the measurement
 
