@@ -4,10 +4,16 @@ The planner turns a user message (plus recent history) into an intent and 0..4 s
 queries, each with a HyDE hypothetical to embed. lib/plan.ts explains why it exists; this module
 ports it call for call, so the Python service plans exactly as the TypeScript route does:
 
-  - the same request to OpenAI: Responses API, temperature 0, 512 output tokens, the same system
-    prompt, and structured output with the same JSON schema, name and strict flag.
+  - the same request to OpenAI: Responses API, temperature 0, 512 output tokens, and structured
+    output with the same JSON schema, name and strict flag.
     tests/test_planner_request_parity.py compares it, byte for byte after JSON parsing, with
     the request the TypeScript planner sends (tests/golden/planner-requests.json);
+  - the same system prompt PLUS exactly one paragraph, REPOSITORY_SCOPE_PARAGRAPH, added in step
+    3.5b so that questions about the vercel/ai repository reach the router instead of being canned
+    as off-topic. This is the only intended difference between the two prompts, it is spliced in
+    by with_repository_scope() rather than typed into the prompt, and the parity test asserts both
+    halves: that the TypeScript half is still byte-identical, and that the paragraph is the whole
+    of the delta;
   - the same normalisation of the reply (trim, drop empty queries, cap at 4, trust the intent);
   - the same failure rule: the planner is an enhancement, so any error falls back to searching
     the raw question.
@@ -52,9 +58,11 @@ HISTORY_TURNS = 4
 # that changes latency under errors, never the plan.
 PLANNER_MAX_RETRIES = 2
 
-# The system prompt, verbatim from lib/plan.ts. Not re-typed by hand: generated from the golden
-# file, and the parity test fails on any difference, down to a changed space.
-SYSTEM_PROMPT = """\
+# The TypeScript planner's system prompt, verbatim from lib/plan.ts. Not re-typed by hand:
+# generated from the golden file, and the parity test fails on any difference, down to a changed
+# space. SYSTEM_PROMPT below is this plus exactly one paragraph; nothing reads this constant at
+# run time except that splice.
+TS_SYSTEM_PROMPT = """\
 You turn a user's message into standalone search queries for a Vercel AI SDK
 documentation search. You do NOT answer — you only rewrite and split.
 
@@ -101,10 +109,80 @@ Rules:
 
 Return at most 4 queries."""
 
+# The one paragraph the Python planner has and lib/plan.ts does not (step 3.5b).
+#
+# Why it exists: phase 3 gave the service a GitHub subagent and a router, and the first
+# hand-driven repository questions then showed that three of three — "when was ai 5.0.0
+# released", "when was AI SDK 5.0.0 released", "who merged the pull request that added the AI SDK
+# 7 migration guide" — never reached the router at all. This planner called them off-topic and
+# the service answered with the canned refusal. Spec decision 1 made the router a separate node
+# precisely so that this prompt would never have to change; the paragraph is that decision's
+# bill. A capability added downstream of a filter is not added.
+#
+# Why a spliced paragraph rather than an edited prompt: TS_SYSTEM_PROMPT above is the TypeScript
+# planner's, and tests/test_planner_request_parity.py is what stops the two implementations
+# drifting apart. Deleting that pin to make one commit green would retire the drift detector, and
+# forking the prompts would let them drift silently. So the pin was re-framed instead: it asserts
+# the golden's system prompt still equals TS_SYSTEM_PROMPT byte for byte, and that what Python
+# sends is that prompt with exactly this string spliced in at the anchor below.
+#
+# Why it names a category and not the three questions: this project has lost four times to
+# prompts tuned against the cases that had to pass (3.5 finding 4 is the most recent). The seven
+# kinds of repository fact listed here are the seven router.SYSTEM_PROMPT lists, deliberately —
+# the two prompts must not disagree about what the repository is for. The last sentence is the
+# other half of the change: invariant 7 still holds, and widening the scope by one source must
+# not widen it by anything else. evals/planner_eval.py (23 cases x 5 runs) is what tests that.
+REPOSITORY_SCOPE_PARAGRAPH = """\
+The AI SDK's own repository, vercel/ai on GitHub, is in scope too: releases and their dates,
+version tags, issues, pull requests and who opened or merged them, commits, contributors, and the
+contents of files in the repository. A message asking for one of those about the AI SDK is
+"search", not off-topic. A later step decides whether to read the repository, so your own job is
+unchanged: write the question as a standalone query in the user's own words, and do not dress it
+up as a documentation topic or invent one for it. Nothing else widens — other products, pricing,
+cloud hosting, general knowledge, and other people's repositories are still off-topic."""
+
+# Where it goes: immediately before the rules, so the model has read the whole of the scope
+# before any rule refers to it.
+REPOSITORY_SCOPE_ANCHOR = "\n\nRules:\n"
+
+
+def with_repository_scope(prompt: str) -> str:
+    """The TypeScript system prompt, plus exactly one documented paragraph.
+
+    The parity test calls this on the golden's system prompt, so the splice is defined once and
+    the test cannot agree with a bug here. The anchor is checked rather than assumed: a
+    TypeScript prompt that grew a second "Rules:" would otherwise get the paragraph in an
+    arbitrary place, and a renamed section would silently get no paragraph at all — the quiet
+    failure being the one that matters, because the prompt would still look right.
+    """
+    found = prompt.count(REPOSITORY_SCOPE_ANCHOR)
+    if found != 1:
+        raise ValueError(
+            f"expected exactly one {REPOSITORY_SCOPE_ANCHOR!r} in the planner prompt, found "
+            f"{found}; lib/plan.ts changed shape and step 3.5b's splice point has to be re-chosen"
+        )
+    return prompt.replace(
+        REPOSITORY_SCOPE_ANCHOR, f"\n\n{REPOSITORY_SCOPE_PARAGRAPH}{REPOSITORY_SCOPE_ANCHOR}"
+    )
+
+
+# What the planner actually sends. Built, not written out, so that "the TypeScript prompt plus one
+# paragraph" is the structure of the code and not a claim in a comment about it.
+SYSTEM_PROMPT = with_repository_scope(TS_SYSTEM_PROMPT)
+
 # The JSON schema zod produces for PlanSchema in lib/plan.ts, as the AI SDK sends it. It is part
 # of the prompt: the model reads the descriptions. Copied from the golden file for the same
 # reason as the system prompt. PlanOutput below validates the reply against the same structure,
 # and tests/test_planner.py checks that the two agree.
+#
+# Step 3.5b did NOT touch this, and the omission is deliberate rather than forgotten. The `intent`
+# description still says off-topic is when "NOTHING in the message is about the Vercel AI SDK",
+# which reads narrower than the system prompt now does. Editing it would fork the request body
+# itself — the schema is sent to OpenAI, so a word changed here is a changed request and the
+# parity pin would be measuring two deltas instead of one. A release date of the SDK's own
+# repository is a question about the Vercel AI SDK on any ordinary reading, so the two are not
+# in conflict; if the planner eval ever shows the model reading them as if they were, the fix is
+# a second documented delta with its own measurement, not a quiet edit here.
 PLAN_SCHEMA_NAME = "query_plan"
 PLAN_JSON_SCHEMA: dict[str, Any] = {
     "$schema": "http://json-schema.org/draft-07/schema#",

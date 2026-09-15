@@ -1,4 +1,13 @@
-"""Request parity: the Python planner sends the request the TypeScript planner sends.
+"""Request parity: the Python planner sends the TypeScript planner's request, plus one paragraph.
+
+Step 3.5b is why "plus one paragraph" is in that sentence. The Python planner needs the vercel/ai
+repository in scope and the TypeScript one does not, so the prompts had to differ. The two
+available moves were both bad: delete this pin and the drift detector dies to make one commit
+green, or fork the prompts and let them drift in silence. The third move is to express the
+intended delta IN the pin, which is what planner.with_repository_scope() and
+test_the_python_prompt_is_the_typescript_prompt_plus_one_paragraph do. Every byte outside that one
+paragraph still has to match the golden, on both sides, so this file is a stricter oracle
+afterwards than it was before: it now pins the delta as well as the base.
 
 scripts/experiments/planner-requests.ts (npm run exp:planner-requests, from the repo root) ran
 planQuery() on every planner-eval case with fetch replaced by a recorder, and froze each request
@@ -24,12 +33,16 @@ import pytest
 
 from copilot_agent.planner import (
     PLANNER_MAX_RETRIES,
+    REPOSITORY_SCOPE_PARAGRAPH,
+    SYSTEM_PROMPT,
+    TS_SYSTEM_PROMPT,
     HistoryTurn,
     SubQuery,
     TokenUsage,
     build_planner,
     openai_planner_model,
     plan_query,
+    with_repository_scope,
 )
 from copilot_agent.settings import Settings
 
@@ -43,20 +56,30 @@ REGENERATE = "regenerate it from the repo root: npm run exp:planner-requests"
 
 
 def encoded_by_langchain(ts_body: dict[str, Any]) -> dict[str, Any]:
-    """The TypeScript body as LangChain encodes the same request.
+    """The TypeScript body as LangChain encodes the same request, with step 3.5b's paragraph.
 
-    Two differences are expected, and nothing else is tolerated. Both are encodings of the same
-    request, not a different one:
+    Two encoding differences are expected, and nothing else is tolerated. Both are encodings of
+    the same request, not a different one:
       - "stream": false. ChatOpenAI always sends its streaming flag; the AI SDK omits it, and
         false is the API's default.
       - "type": "message" on every input item. LangChain writes the item type out; the AI SDK
         leaves it implicit, and "message" is the only type an item with a role can have.
     If LangChain ever stops sending one of them, this fails and the list gets shorter.
+
+    Then one deliberate difference, which is the whole of step 3.5b: the system prompt gains
+    REPOSITORY_SCOPE_PARAGRAPH. It is spliced here by the same function the planner splices with,
+    so this test cannot agree with a bug in the splice — a wrong anchor or a duplicated paragraph
+    raises or shows up as a mismatch, rather than being mirrored into the expectation. Everything
+    else in the prompt, and every other field of the body, is still compared to the golden byte
+    for byte.
     """
     expected = json.loads(json.dumps(ts_body))  # a deep copy
     expected["stream"] = False
     for item in expected["input"]:
         item["type"] = "message"
+    system = expected["input"][0]
+    assert system["role"] == "system", "the golden's first input item is no longer the system turn"
+    system["content"] = with_repository_scope(system["content"])
     return expected
 
 
@@ -109,6 +132,27 @@ def test_the_golden_matches_the_current_typescript() -> None:
     assert sha256("evals/planner-cases.ts") == GOLDEN["meta"]["casesTsSha256"], (
         f"evals/planner-cases.ts changed after the golden file was written; {REGENERATE}"
     )
+
+
+def test_the_python_prompt_is_the_typescript_prompt_plus_one_paragraph() -> None:
+    """The re-framed pin, stated directly rather than only through a request body (step 3.5b).
+
+    Three claims, and the third is the one that stops this becoming a fork. Delete the paragraph
+    from what Python sends and you are back at the TypeScript prompt exactly: no reworded rule, no
+    extra sentence that crept in beside it, nothing removed.
+    """
+    golden_system = CASES[0]["request"]["body"]["input"][0]["content"]
+    assert golden_system == TS_SYSTEM_PROMPT, (
+        f"the golden's system prompt is no longer lib/plan.ts's; {REGENERATE}"
+    )
+    assert SYSTEM_PROMPT.count(REPOSITORY_SCOPE_PARAGRAPH) == 1
+    assert SYSTEM_PROMPT.replace(f"\n\n{REPOSITORY_SCOPE_PARAGRAPH}", "", 1) == TS_SYSTEM_PROMPT
+
+
+def test_every_case_carries_the_same_system_prompt() -> None:
+    # The claim above is made from case 0. It generalises only because the recorder froze one
+    # prompt for all 23; if that ever stops being true, the pin is testing one case out of 23.
+    assert {c["request"]["body"]["input"][0]["content"] for c in CASES} == {TS_SYSTEM_PROMPT}
 
 
 @pytest.mark.parametrize("case", CASES, ids=[c["id"] for c in CASES])

@@ -37,6 +37,7 @@ expected to hold to that, not just to keep the tests green.
 | `agent/.../github_schema.py` | Phase 3: introspection fetched lazily and cached per process (3.2 MiB of JSON, 2.5 MiB RSS, measured), `describe_type` in outline and detail modes, and `capped_block` — the byte cap answers *does all of it fit*, never *does this entry fit plus a footer* |
 | `agent/.../github_query.py` | Phase 3: the seven gates (parse, one operation, read-only, validate, variables supplied, `rateLimit(dryRun)` pre-flight, budget). `RunOutcome.stage` says which gate refused. Repairability is decided by error `type` against an allow-list, NOT by `path`: a connection missing `first` is a field-level error, and `path` would have made the repair loop unable to fire on the failure it exists for |
 | `agent/.../github_agent.py` | Phase 3: the subagent subgraph. `explore` -> `lookup` or `run_query` -> `summarise`, the repair being the tool loop going round again. Compiled `checkpointer=False`, measured: `None` writes the subgraph's messages into the parent's checkpoint. `open_github_agent` yields None without `GITHUB_TOKEN`, and then there is no GitHub path at all |
+| `agent/.../planner.py` | The port of `lib/plan.ts`, call for call. Its prompt is that file's plus **exactly one** paragraph (`REPOSITORY_SCOPE_PARAGRAPH`, step 3.5b, spliced by `with_repository_scope` so the delta is the code's structure and not a claim about it): the vercel/ai repository is in scope, so repository questions reach the router instead of being canned. `tests/test_planner_request_parity.py` pins both halves — the TypeScript prompt byte for byte, and the paragraph as the whole of the difference |
 | `agent/.../router.py` | Phase 3.5: docs or both, never GitHub alone. The planner's call shape with a different prompt; any failure routes to `docs`. The third route existed for one afternoon and its first measurement removed it (the file has the run) |
 | `agent/experiments/github_schema_size.py` · `dry_run_semantics.py` · `subgraph_stream.py` | The phase 3 measurements: what a cached schema weighs; what `dryRun` actually does (it prices without validating, and is free); and what nesting a subgraph does to the parent's stream and checkpoint. The last one was written BEFORE the 3.5 build, and it overturned two things that were already written down |
 | `agent/experiments/container_memory.sh` | What the container needs: the real image under a hard `--memory` cap with real `/chat` turns, reporting cgroup `anon` and `file` separately. Measured 145 MiB working set; page cache is charged to whichever container faults the image layers in first, so read position 1 |
@@ -91,6 +92,18 @@ expected to hold to that, not just to keep the tests green.
    guard-aws held only because the prompt refused. `evals/planner.ts` asserts this
    directly; the main suite can only see its consequences. Greeting intent applies only
    when the whole message is a greeting — a greeting attached to a question is a search.
+   **Step 3.5b widened what counts as on-topic, by one source and no more.** The Python
+   planner's prompt is `lib/plan.ts`'s plus exactly one paragraph
+   (`planner.REPOSITORY_SCOPE_PARAGRAPH`, spliced by `with_repository_scope`): the vercel/ai
+   repository is in scope, so releases, tags, issues, pull requests, commits, contributors
+   and repository files are `search` rather than `off-topic`. Before it, three of three
+   canonical repository questions were canned before the router ever saw them — decision 1
+   put the router behind the planner so this prompt would never change, and a capability
+   added downstream of a filter is not added. Everything above still holds: the paragraph's
+   own last sentence restates it, and the question is still written in the user's words, not
+   dressed up as a documentation topic. `tests/test_planner_request_parity.py` was
+   re-framed, not deleted: it asserts the TypeScript half is still byte-identical AND that
+   the paragraph is the whole of the delta, so the two implementations still cannot drift.
 8. **Assistant turns are signed, and history is verified before anything reads it.** The
    route HMACs every answer it emits (canned replies included); `parseChatRequest` drops any
    assistant turn whose text does not match its signature, BEFORE the caps are applied —
