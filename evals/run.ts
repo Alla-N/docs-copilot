@@ -617,6 +617,12 @@ type GitHubResult = {
     points: number[];
     attempts: number[];
     repairs: number[];
+    /** How many type lookups the subagent spent before writing, and which gate each attempt met.
+     *  Recorded from 3.6b so a change in accuracy can be read against a change in BEHAVIOUR: a
+     *  model that writes from memory and one that reads the schema first can produce the same
+     *  query, and only these two say which happened. */
+    lookups: number[];
+    stages: string[][];
     verdict: "PASS" | "FAIL" | "VARIED" | "ERROR";
     detail: string;
     sample: string;
@@ -740,6 +746,8 @@ async function runGitHubCases(target: AgentTarget): Promise<GitHubResult[]> {
             points: withBlock.map((b) => b.points_spent),
             attempts: withBlock.map((b) => b.attempts),
             repairs: withBlock.map((b) => b.repairs),
+            lookups: withBlock.map((b) => b.lookups),
+            stages: withBlock.map((b) => b.stages),
             verdict,
             detail,
             sample: runs[0].text,
@@ -804,6 +812,8 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
             if (r.query) console.log(`         query    ${r.query.replace(/\s+/g, " ").slice(0, 300)}`);
             if (r.evidence) console.log(`         evidence ${r.evidence.replace(/\s+/g, " ").slice(0, 400)}`);
             console.log(`         routes   ${r.routes.map((x) => x ?? "null").join(", ")}`);
+            if (r.subagentRuns)
+                console.log(`         looked up ${r.lookups.join(", ")} type(s); stages ${r.stages.map((s) => s.join(" > ")).join("  |  ")}`);
         }
     }
 
@@ -835,6 +845,8 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
             points: r.points,
             attempts: r.attempts,
             repairs: r.repairs,
+            lookups: r.lookups,
+            stages: r.stages,
             detail: r.detail,
             query: r.query,
             evidence: r.evidence ? r.evidence.slice(0, 600) : null,

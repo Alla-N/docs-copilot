@@ -118,6 +118,10 @@ Work in this order: look at the types you need, then write the query. Call one t
 Use GraphQL variables for the owner and the repository name rather than writing them into the
 query text. Ask only for the fields that answer the question.
 
+When the question names one particular thing -- a tag name, an issue or pull request number, a
+login -- use the field that takes it as an argument instead of listing the collection it belongs
+to. Look that field up if you are not sure it exists. A connection answers questions about sets.
+
 If github_query refuses a query, read the reason, decide which part of the query it is about, and
 send a corrected one. Do not resend the same query. You get very few attempts, so spend one on
 looking a type up rather than on guessing a field name.

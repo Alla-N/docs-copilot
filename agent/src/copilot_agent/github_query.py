@@ -103,10 +103,18 @@ QUERY_TIMEOUT_S = 30.0
 #   MAX_NODE_LIMIT_EXCEEDED        from GitHub documentation; not observed here, because the
 #                                  budget gate is meant to refuse such a query one round trip
 #                                  earlier. If this ever fires, the gate did not.
+#   EXCESSIVE_PAGINATION           observed 2026-09-15, experiments/github_error_shapes.py, after
+#                                  the 3.6 baseline found it costing a question. A `first: 500`
+#                                  comes back with this type and a path, and the fix is a smaller
+#                                  number -- as rewritable as an error gets. It was missing here,
+#                                  so the turn stopped after ONE attempt with a repair cap of 2
+#                                  unspent, and the omission cost exactly what the note above
+#                                  predicted an omission would cost: one failed question.
 REPAIRABLE_ERROR_TYPES = frozenset(
     {
         "MISSING_PAGINATION_BOUNDARIES",
         "MAX_NODE_LIMIT_EXCEEDED",
+        "EXCESSIVE_PAGINATION",
     }
 )
 

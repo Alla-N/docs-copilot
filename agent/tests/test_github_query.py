@@ -241,6 +241,24 @@ def test_path_says_where_and_type_says_whether_it_is_worth_repairing() -> None:
     assert not is_repairable(FieldError(message="?", path=["x"], type=None))
 
 
+def test_an_over_large_first_is_repairable() -> None:
+    # The allow-list's own note says an omitted repairable type costs one failed question. The
+    # 3.6 baseline is that bill: asked who opened pull request 500, the subagent wrote
+    # `pullRequests(first: 500)`, GitHub refused it, and because this type was missing here the
+    # turn stopped after ONE attempt with a repair cap of 2 unspent. The fix is a smaller number
+    # and the model is holding the pen, so it is as rewritable as an error gets.
+    #
+    # Shape measured 2026-09-15, experiments/github_error_shapes.py: type EXCESSIVE_PAGINATION,
+    # with a path, alongside data that was still returned.
+    over_large = FieldError(
+        message="Requesting 500 records on the `pullRequests` connection exceeds the `first` "
+        "limit of 100 records.",
+        path=["repository", "pullRequests"],
+        type="EXCESSIVE_PAGINATION",
+    )
+    assert is_repairable(over_large)
+
+
 async def test_a_pagination_error_from_the_preflight_short_circuits(schema_cache_factory) -> None:
     # One request, not two. The first version discarded the pre-flight's field errors and paid
     # for the real call to learn what the free one already knew.

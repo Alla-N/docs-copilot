@@ -147,8 +147,12 @@ export const GITHUB_CASES: GitHubCase[] = [
         answerContains: ["a5e92fe"],
         frozen: "ai5Tag.oid = a5e92fe3c692f8e152fe1eb9ef50a4e734ad0ffb",
         note:
-            "The freeze run also settled the SHAPE: __typename came back Commit, not Tag, so " +
-            "ai@5.0.0 is a lightweight tag and a query insisting on Tag.target gets null.",
+            "The tag is ANNOTATED, measured in experiments/github_error_shapes.py: ref.target " +
+            "is a Tag whose own oid is 87cbd3b5, wrapping the commit a5e92fe. So there are two " +
+            "oids and only one of them answers the question. This note said lightweight until " +
+            "the baseline disproved it -- the freeze run asked object(expression:), which " +
+            "PEELS to the commit, and I read a peeled result as a direct one. An inference " +
+            "written down as a measurement, in the file whose whole purpose is provenance.",
     },
 
     // ── Issues and pull requests: the other half of the schema ───────────────
