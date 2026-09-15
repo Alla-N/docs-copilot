@@ -57,6 +57,7 @@ from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from psycopg import errors
 from psycopg_pool import AsyncConnectionPool
 
+from copilot_agent.github_agent import GitHubEvidence
 from copilot_agent.graph import GenerationMetrics, SubQueryRetrieval
 from copilot_agent.planner import HistoryTurn, Plan, SubQuery, TokenUsage
 from copilot_agent.retrieval import (
@@ -87,6 +88,13 @@ PERSISTED_TYPES: tuple[type, ...] = (
     SubQueryRetrieval,
     RetrievedChunk,
     GenerationMetrics,
+    # Step 3.5. Only the evidence: the subagent's messages, attempts and query data never reach
+    # this list, because the subgraph compiles with checkpointer=False and its channels are not
+    # this graph's. Measured, both ways (experiments/subgraph_stream.py, 2026-09-15): with
+    # checkpointer=None the same run wrote 9 checkpoints instead of 5 and put `messages`,
+    # `result` and `steps` into the PARENT's channel values. The wrapper node counts as nesting,
+    # which was the open half of decision 15.
+    GitHubEvidence,
 )
 
 SETUP_HINT = "run: cd agent && uv run python -m copilot_agent.checkpoint setup"

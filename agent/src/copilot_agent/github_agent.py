@@ -47,6 +47,8 @@ and turning it will then be a measured change instead of a starting assumption.
 import json
 import logging
 import operator
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Annotated, Any, Literal, TypedDict
 
@@ -60,6 +62,7 @@ from langchain_core.messages import (
     ToolMessage,
 )
 from langchain_core.tools import BaseTool, tool
+from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.graph.state import CompiledStateGraph
@@ -71,9 +74,11 @@ from copilot_agent.github_schema import (
     SchemaCache,
     capped_block,
     describe_type,
+    github_fetch,
     schema_summary,
 )
 from copilot_agent.planner import NO_USAGE, TokenUsage
+from copilot_agent.settings import Settings
 
 logger = logging.getLogger(__name__)
 
@@ -473,4 +478,72 @@ def build_github_agent(
     builder.add_edge("summarise", END)
     # checkpointer=False, not None: None would INHERIT the parent's saver once this graph is
     # nested, and persist every schema outline the loop read. See the module docstring.
+    #
+    # Measured in 3.5 (experiments/subgraph_stream.py, 2026-09-15), because up to then it was a
+    # reading of the documentation: the same run nested under a parent saver wrote 5 checkpoints
+    # with False and 9 with None, and the None run put the subgraph's `messages`, `result` and
+    # `steps` into the parent's channel values. It holds for a wrapper node calling ainvoke as
+    # well as for a directly attached subgraph, which was the half nobody had checked.
     return builder.compile(checkpointer=False)
+
+
+# What the subagent is allowed to emit in one call. It writes GraphQL documents, which are the
+# longest thing any model in this service produces; the planner's 512 would truncate a query
+# with two or three nested connections and the truncation would arrive as a parse error, which
+# reads exactly like a model that cannot write GraphQL. Not a budget: the repair cap and the
+# lookup cap are what bound a turn.
+GITHUB_MAX_OUTPUT_TOKENS = 1500
+
+GITHUB_MAX_RETRIES = 2
+
+
+def openai_github_model(settings: Settings, **client_options: Any) -> ChatOpenAI:
+    """The subagent's chat model: the planner's model and the planner's explicit switches.
+
+    Same model as the planner, the router and the answer (spec decision 8), so phase 6's Bedrock
+    A/B moves one variable. streaming=False for the reason planner.openai_planner_model gives:
+    LangChain streams any call made while a streaming callback handler is attached, and
+    LangGraph's "messages" mode attaches one to every model call inside a graph.
+    """
+    return ChatOpenAI(
+        model=settings.planner_model,
+        temperature=0,
+        max_tokens=GITHUB_MAX_OUTPUT_TOKENS,
+        max_retries=GITHUB_MAX_RETRIES,
+        use_responses_api=True,
+        streaming=False,
+        api_key=settings.openai_api_key,
+        **client_options,
+    )
+
+
+@asynccontextmanager
+async def open_github_agent(settings: Settings) -> AsyncIterator[GitHubAgent | None]:
+    """The subagent for the service's lifespan, or None when there is no token.
+
+    Decision 11, as one branch in one place: without GITHUB_TOKEN this yields None, api.py passes
+    None to the graph, and graph.build_graph then compiles the phase 2 graph with no router node
+    and no GitHub node in it. Not a flag read at request time -- a capability behind a runtime
+    check somebody can get wrong is worse than a capability that is absent.
+
+    Nothing is fetched here. The schema is fetched on the first GitHub turn (decision 6): adding
+    GitHub to startup readiness would make this service's availability depend on GitHub's, for a
+    capability most turns never use.
+
+    One client and one cache for the process, shared by the two tools and the runner, so the
+    schema is introspected once and the lock in SchemaCache has something to protect.
+    """
+    if settings.github_token is None:
+        yield None
+        return
+    token = settings.github_token.get_secret_value()
+    async with httpx.AsyncClient() as client:
+        # path=None deliberately: the on-disk cache is a development convenience (github_schema
+        # says so), and a container has no durable disk and should not run on a schema older
+        # than its image.
+        cache = SchemaCache(fetch=github_fetch(client, token))
+        yield build_github_agent(
+            model=openai_github_model(settings),
+            cache=cache,
+            runner=GitHubQueries(client=client, token=token, schema=cache),
+        )

@@ -40,6 +40,7 @@ from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, St
 
 from copilot_agent import ui_stream
 from copilot_agent.checkpoint import open_checkpointer
+from copilot_agent.github_agent import GitHubAgent, open_github_agent
 from copilot_agent.graph import ChatGraph, openai_chat_graph
 from copilot_agent.history import MAX_CHARS_PER_MESSAGE
 from copilot_agent.query_log import Origin, QueryLog, Turn, Visitor, observe, open_query_log
@@ -53,8 +54,12 @@ from copilot_agent.tracing import Tracing, open_tracing
 OpenSearch = Callable[[Settings], AbstractAsyncContextManager[SearchDocs]]
 # The shape of open_checkpointer(): given settings, an async context manager yielding a saver.
 OpenCheckpointer = Callable[[Settings], AbstractAsyncContextManager[BaseCheckpointSaver]]
-# The shape of openai_chat_graph(): the graph around a search and a saver. Tests pass fakes.
-BuildGraph = Callable[[Settings, SearchDocs, BaseCheckpointSaver], ChatGraph]
+# The shape of openai_chat_graph(): the graph around a search, a saver and (step 3.5) a GitHub
+# subagent or None. Tests pass fakes.
+BuildGraph = Callable[[Settings, SearchDocs, BaseCheckpointSaver, GitHubAgent | None], ChatGraph]
+# The shape of open_github_agent(): given settings, a context manager yielding the subagent, or
+# None when GITHUB_TOKEN is unset. Tests hand it one that opens nothing and costs nothing.
+OpenGitHubAgent = Callable[[Settings], AbstractAsyncContextManager[GitHubAgent | None]]
 # The shape of open_query_log(): given settings, an async context manager yielding the log.
 OpenQueryLog = Callable[[Settings], AbstractAsyncContextManager[QueryLog]]
 # The shape of open_tracing(): given settings, an async context manager yielding the tracing.
@@ -415,6 +420,7 @@ def create_app(
     graph_factory: BuildGraph = openai_chat_graph,
     query_log_factory: OpenQueryLog = open_query_log,
     tracing_factory: OpenTracing = open_tracing,
+    github_factory: OpenGitHubAgent = open_github_agent,
 ) -> FastAPI:
     if settings is None:
         settings = get_settings()
@@ -437,10 +443,14 @@ def create_app(
             search_factory(settings) as search_docs,
             checkpointer_factory(settings) as checkpointer,
             query_log_factory(settings) as query_log,
+            # Last in, so its client closes first, and it opens nothing when GITHUB_TOKEN is
+            # unset. Nothing is fetched here either: the schema is lazy (spec decision 6), so
+            # this line does not put GitHub's availability in front of this service's.
+            github_factory(settings) as github_agent,
         ):
             app.state.tracing = tracing
             app.state.search = search_docs
-            app.state.graph = graph_factory(settings, search_docs, checkpointer)
+            app.state.graph = graph_factory(settings, search_docs, checkpointer, github_agent)
             app.state.query_log = query_log
             yield
 

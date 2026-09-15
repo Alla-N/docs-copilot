@@ -147,6 +147,37 @@ def test_a_planner_that_fell_back_logs_no_planner_tokens() -> None:
     assert (row["planner_input_tokens"], row["planner_output_tokens"]) == (None, None)
 
 
+def test_a_turn_with_no_router_logs_no_route_and_no_router_tokens() -> None:
+    # None is not "docs". A deployment with no GITHUB_TOKEN compiles a graph with no router node
+    # in it, and db/009 keeps the two apart in the column so that 3.6 can measure routing
+    # accuracy over the turns that were actually routed.
+    turn = Turn(question="q", thread_id="t" * 16, origin="web")
+    turn.see(updates("plan", {"plan": PLAN}))
+    canned = {"answer": "hi", "relevant": [], "mode": "skipped", "rerank_calls": 0}
+    assert turn.see(updates("canned", canned)) is True
+    row = turn.row()
+    assert row["route"] is None
+    assert (row["router_input_tokens"], row["router_output_tokens"]) == (None, None)
+
+
+def test_the_router_s_decision_and_tokens_reach_the_row() -> None:
+    # The third model call of a routed turn. Without these columns the harness's measured cost
+    # per request would have held still while the real cost rose (db/009 says why that mattered
+    # enough to be a migration).
+    turn = Turn(question="q", thread_id="t" * 16, origin="web")
+    turn.see(updates("plan", {"plan": PLAN}))
+    turn.see(updates("router", {"route": "both", "router_usage": TokenUsage(300, 4)}))
+    merged = {"relevant": [chunk(0.7)], "mode": "reranked", "rerank_calls": 1}
+    turn.see(updates("merge", merged))
+    generation = GenerationMetrics(
+        usage=TokenUsage(100, 20), ttft_ms=1.0, generation_ms=2.0, finish_reason="stop"
+    )
+    assert turn.see(updates("generate", {"answer": "a", "generation": generation})) is True
+    row = turn.row()
+    assert row["route"] == "both"
+    assert (row["router_input_tokens"], row["router_output_tokens"]) == (300, 4)
+
+
 def test_the_insert_names_every_column_once() -> None:
     assert len(set(COLUMNS)) == len(COLUMNS)
     assert INSERT_SQL.count("%(") == len(COLUMNS)

@@ -27,6 +27,7 @@ import time
 from typing import Any
 
 from copilot_agent.checkpoint import open_checkpointer
+from copilot_agent.github_agent import open_github_agent
 from copilot_agent.graph import openai_chat_graph
 from copilot_agent.retrieval import open_search
 from copilot_agent.settings import get_settings
@@ -48,6 +49,19 @@ def show_update(node: str, update: dict[str, Any], started: float) -> None:
             print(f"           {chunk.score:.3f}  {chunk.title}")
     elif node == "canned":
         print(f"{at} canned reply, mode {update['mode']}:\n\n{update['answer']}")
+    elif node == "router":
+        print(f"{at} router: {update['route']}")
+    elif node == "github":
+        evidence = update["github"]
+        if evidence is None:
+            print(f"{at} github: the subagent returned nothing")
+        else:
+            print(
+                f"{at} github: ok={evidence.ok}  attempts={evidence.attempts} "
+                f"({', '.join(evidence.stages) or 'none'})  lookups={evidence.lookups}  "
+                f"points={evidence.points_spent}  first try valid={evidence.first_try_valid}"
+            )
+            print(f"           {evidence.evidence.splitlines()[0]}")
 
 
 async def run(question: str, thread_id: str) -> None:
@@ -56,8 +70,11 @@ async def run(question: str, thread_id: str) -> None:
         open_tracing(settings) as tracing,
         open_search(settings) as search,
         open_checkpointer(settings) as saver,
+        # With GITHUB_TOKEN in .env.local this is the one command that drives the whole phase 3
+        # path by hand; without it, the same graph as before 3.5 (spec decision 11).
+        open_github_agent(settings) as github_agent,
     ):
-        graph = openai_chat_graph(settings, search, saver)
+        graph = openai_chat_graph(settings, search, saver, github_agent)
         trace_id = tracing.new_trace_id()
         if trace_id:
             print(f"trace {trace_id}")

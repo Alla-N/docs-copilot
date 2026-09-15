@@ -255,7 +255,7 @@ def make_rig(
         yield log
         await log.drain()
 
-    def graph_factory(settings: Settings, search_docs: Any, checkpointer: Any) -> Any:
+    def graph_factory(settings: Settings, search_docs: Any, checkpointer: Any, gh: Any) -> Any:
         return build_graph(
             planner=planner, search=search_docs, model=model, checkpointer=checkpointer
         )
@@ -526,6 +526,12 @@ async def test_an_answered_turn_writes_the_row_the_typescript_route_would() -> N
         "thread_id": THREAD,
         # The rig's settings carry no Langfuse keys, so this turn was not traced (step 2.7).
         "trace_id": None,
+        # And no GITHUB_TOKEN, so the graph this rig builds has no router node in it at all
+        # (step 3.5). None here means nothing routed this turn, which db/009 keeps distinct
+        # from a turn that was routed to the documentation.
+        "route": None,
+        "router_input_tokens": None,
+        "router_output_tokens": None,
     }
     assert all(isinstance(ms, int) and ms >= 0 for ms in timings.values())
     assert timings["ttft_ms"] <= timings["generation_ms"]

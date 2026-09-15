@@ -52,7 +52,7 @@ def make_settings(**overrides: Any) -> Settings:
     return Settings(_env_file=None, **(values | overrides))
 
 
-def no_graph(settings: Settings, search: Any, checkpointer: Any) -> Any:
+def no_graph(settings: Settings, search: Any, checkpointer: Any, github: Any = None) -> Any:
     """The graph factory for these tests: /chat is tested in test_chat_api.py."""
     return None
 

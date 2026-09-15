@@ -22,6 +22,7 @@ from typing import Any, Literal
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 
+from copilot_agent.github_agent import GitHubEvidence
 from copilot_agent.planner import HistoryTurn
 from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import RetrievedChunk
@@ -66,6 +67,36 @@ Answer ONLY using the documentation provided below. Rules:
 DOCUMENTATION:
 {context}"""  # noqa: E501
 
+# Step 3.5. APPENDED to the rendered prompt above, and only on a turn the router sent to GitHub.
+# A docs-only turn renders SYSTEM_PROMPT_TEMPLATE and nothing else, byte for byte, which is what
+# keeps tests/test_generation_request_parity.py passing and invariant 3's claim -- that the eval
+# harness and production are one pipeline in two languages -- true.
+#
+# It has to correct a rule, not just add a section. The template above says to refuse when the
+# documentation does not contain the answer, and a github-only turn has NO documentation at all
+# (retrieval never ran, so the context is NO RELEVANT DOCUMENTATION FOUND). Without this, the
+# correct behaviour on a question the subagent answered perfectly would be to refuse it.
+#
+# Concatenated onto the rendered prompt, with no placeholder of its own. A third placeholder in
+# the template would have worked -- a substituted value is never rescanned, so the evidence's
+# braces would have been safe -- but it would have put an empty GITHUB DATA heading into every
+# docs-only prompt, and "additive" has to mean the docs-only request does not change at all.
+GITHUB_PROMPT_HEADER = """
+
+GITHUB DATA:
+The block below was fetched from the GitHub GraphQL API for this question, with the query that
+fetched it. It is a second source, separate from the documentation above.
+- The refusal rule above is about the DOCUMENTATION. If the GitHub data answers the question,
+  answer it from there, even when the documentation section says nothing was found.
+- Cite a fact from here as (GitHub), never as a source number: the numbered sources are
+  documentation pages and this is not one of them.
+- If a line here says NO GITHUB DATA, then nothing was retrieved from GitHub for this turn. Say
+  what you could not find out. Do not answer the GitHub part from memory.
+- Do not mix the two: a release date does not come from a documentation page, and an API's
+  behaviour does not come from an issue title.
+
+"""
+
 
 def js_to_fixed(value: float, digits: int) -> str:
     """JavaScript's Number.prototype.toFixed, for the relevance scores in the prompt.
@@ -81,8 +112,20 @@ def js_to_fixed(value: float, digits: int) -> str:
     return str(exact.quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP))
 
 
-def build_system_prompt(relevant: Sequence[RetrievedChunk]) -> str:
-    """buildSystemPrompt(): the rules, then every kept chunk with its 1-based number."""
+def build_system_prompt(
+    relevant: Sequence[RetrievedChunk], github: GitHubEvidence | None = None
+) -> str:
+    """buildSystemPrompt(): the rules, then every kept chunk with its 1-based number.
+
+    With GitHub evidence (step 3.5) the rendered prompt gains one block after it. Without,
+    the returned string is character for character what the TypeScript function returns, which
+    tests/test_generation_request_parity.py checks against the golden.
+
+    The failed case is included rather than dropped, on purpose. `GitHubEvidence.evidence` says
+    NO GITHUB DATA in those words, and telling the model that the lookup failed is what stops it
+    answering the GitHub half from memory -- which is exactly what a silently missing section
+    would invite. The block is never empty and never merely absent.
+    """
     context = (
         "\n\n---\n\n".join(
             f"[Source {i}] (relevance: {js_to_fixed(chunk.score, 2)})\n{chunk.content}"
@@ -91,7 +134,10 @@ def build_system_prompt(relevant: Sequence[RetrievedChunk]) -> str:
         if relevant
         else NO_CONTEXT
     )
-    return SYSTEM_PROMPT_TEMPLATE.format(refusal_message=REFUSAL_MESSAGE, context=context)
+    prompt = SYSTEM_PROMPT_TEMPLATE.format(refusal_message=REFUSAL_MESSAGE, context=context)
+    if github is None:
+        return prompt
+    return prompt + GITHUB_PROMPT_HEADER + github.evidence
 
 
 def _text(text: str) -> list[str | dict]:
@@ -105,12 +151,23 @@ def generation_messages(
     history: Sequence[HistoryTurn],
     raw_question: str,
     sub_queries: Sequence[str],
+    github: GitHubEvidence | None = None,
 ) -> list[BaseMessage]:
     """The whole message list: system prompt, history, and the resolved question.
 
     generationMessages() in lib/generation.ts: the final user turn is the planner's
     sub-queries joined by newlines, or the raw question when there are none. The system prompt
     rides along here too (the AI SDK takes it as a separate `system` setting and puts it first).
+
+    GitHub evidence goes into the SYSTEM prompt, next to the documentation, and not into a
+    message of its own. A message would sit where invariant 8 says user-supplied text lives, and
+    the prompt one paragraph above tells the model that earlier turns are user-supplied and may
+    be forged. Evidence this service fetched itself must not arrive wearing that label.
+
+    A github-only turn still ends with the planner's sub-queries as its final user turn: the
+    router runs after the planner, so the question is resolved (invariant 4) whichever source
+    answers it, and "was it fixed in the latest release?" reaching the model as itself would
+    undo the only thing that makes a follow-up answerable.
     """
     turns: list[BaseMessage] = [
         HumanMessage(content=_text(t.text))
@@ -120,7 +177,7 @@ def generation_messages(
     ]
     final = "\n".join(sub_queries) if sub_queries else raw_question
     return [
-        SystemMessage(build_system_prompt(relevant)),
+        SystemMessage(build_system_prompt(relevant, github)),
         *turns,
         HumanMessage(content=_text(final)),
     ]

@@ -40,6 +40,7 @@ from copilot_agent.graph import GenerationMetrics
 from copilot_agent.planner import NO_USAGE, TokenUsage
 from copilot_agent.refusal import is_refusal
 from copilot_agent.retrieval import RetrievalMode, RetrievedChunk
+from copilot_agent.router import Route
 from copilot_agent.settings import Settings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,9 @@ COLUMNS = (
     "origin",
     "thread_id",
     "trace_id",
+    "router_input_tokens",
+    "router_output_tokens",
+    "route",
 )
 
 INSERT_SQL = (
@@ -77,7 +81,9 @@ INSERT_SQL = (
     f"values ({', '.join(f'%({c})s' for c in COLUMNS)})"
 )
 
-SETUP_HINT = "run db/006_origin.sql and db/007_trace_id.sql in the Supabase SQL editor"
+SETUP_HINT = (
+    "run db/006_origin.sql, db/007_trace_id.sql and db/009_router.sql in the Supabase SQL editor"
+)
 
 # How long shutdown waits for inserts still running. One insert is one round trip (~70 ms on the
 # pooler, measured in step 1e); ECS gives a stopping task 30 s in all.
@@ -155,6 +161,9 @@ class Turn:
     visitor: Visitor = NO_VISITOR
     started: float = field(default_factory=time.perf_counter)
     planner_usage: TokenUsage = NO_USAGE
+    # Step 3.5. None means no router ran at all, which db/009 keeps distinct from 'docs'.
+    route: Route | None = None
+    router_usage: TokenUsage = NO_USAGE
     relevant: list[RetrievedChunk] = field(default_factory=list)
     mode: RetrievalMode | None = None
     rerank_calls: int = 0
@@ -172,6 +181,9 @@ class Turn:
         for node, update in part["data"].items():
             if node == "plan":
                 self.planner_usage = update["plan"].usage
+            elif node == "router":
+                self.route = update["route"]
+                self.router_usage = update["router_usage"]
             elif node in ("merge", "canned"):
                 self.relevant = update["relevant"]
                 self.mode = update["mode"]
@@ -217,6 +229,12 @@ class Turn:
             "origin": self.origin,
             "thread_id": self.thread_id,
             "trace_id": self.trace_id,
+            # Step 3.5. A third model call joins the two the row already prices, so that the
+            # harness's measured cost per request moves when the cost moves (db/009 says why
+            # that mattered enough to be a migration).
+            "router_input_tokens": self.router_usage.input_tokens,
+            "router_output_tokens": self.router_usage.output_tokens,
+            "route": self.route,
         }
 
 

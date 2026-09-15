@@ -363,7 +363,7 @@ async def test_the_endpoint_hands_the_graph_run_its_trace(client: FakeClient) ->
         ),
         search_factory=nothing_factory,
         checkpointer_factory=nothing_factory,
-        graph_factory=lambda settings, search, checkpointer: graph,
+        graph_factory=lambda settings, search, checkpointer, github=None: graph,
         query_log_factory=query_log_factory,
         tracing_factory=tracing_factory,
     )

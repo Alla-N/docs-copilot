@@ -22,6 +22,7 @@ from copilot_agent.checkpoint import (
     readiness_problems,
     serializer,
 )
+from copilot_agent.github_agent import GitHubEvidence
 from copilot_agent.graph import ChatState, GenerationMetrics, SubQueryRetrieval
 from copilot_agent.planner import HistoryTurn, Plan, SubQuery, TokenUsage
 from copilot_agent.retrieval import RetrievedChunk
@@ -99,6 +100,24 @@ def full_state() -> dict[str, object]:
         "rerank_calls": 1,
         "answer": "a",
         "generation": GenerationMetrics(TokenUsage(3, 4), 1.5, 2.5, "stop"),
+        # Step 3.5. The subagent's evidence rides in the thread; its messages, attempts and
+        # query data do not, because the subgraph compiles with checkpointer=False.
+        "route": "both",
+        "router_usage": TokenUsage(300, 4),
+        "github": GitHubEvidence(
+            question="when was v7 released",
+            ok=True,
+            evidence="GitHub GraphQL result for: when was v7 released",
+            query="query { repository { name } }",
+            attempts=2,
+            repairs=1,
+            first_try_valid=False,
+            stages=["field-error", "ok"],
+            lookups=2,
+            points_spent=1,
+            node_count=5,
+            usage=TokenUsage(900, 60),
+        ),
     }
 
 

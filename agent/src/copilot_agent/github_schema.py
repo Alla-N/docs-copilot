@@ -157,7 +157,9 @@ class SchemaCache:
         self._path = path
         self._schema: GraphQLSchema | None = None
         # Two turns can arrive together and both find an empty cache. Without the lock both
-        # would fetch tens of megabytes; with it the second waits and then finds the schema.
+        # would fetch the 3.2 MiB introspection document; with it the second waits and then
+        # finds the schema. (3.2 MiB is measured; the first draft of this line said tens of
+        # megabytes, which was invented -- phase 3 finding 8, surviving in one last place.)
         self._lock = asyncio.Lock()
 
     async def get(self) -> GraphQLSchema:
@@ -172,8 +174,8 @@ class SchemaCache:
 
     async def _introspection(self) -> dict:
         if self._path is not None and self._path.exists():
-            # to_thread: reading tens of megabytes off disk blocks the event loop, and the
-            # ASYNC ruff rules exist to catch exactly this.
+            # to_thread: reading 3.2 MiB of JSON off disk and parsing it blocks the event
+            # loop, and the ASYNC ruff rules exist to catch exactly this.
             return await asyncio.to_thread(lambda: json.loads(self._path.read_text()))
         data = await self._fetch()
         if self._path is not None:

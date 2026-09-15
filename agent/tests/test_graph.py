@@ -17,9 +17,23 @@ from langgraph.checkpoint.memory import InMemorySaver
 from pydantic import ConfigDict, Field
 
 from copilot_agent.checkpoint import serializer
-from copilot_agent.graph import SubQueryRetrieval, build_graph, merge_retrievals
+from copilot_agent.generation import GITHUB_PROMPT_HEADER
+from copilot_agent.github_agent import GitHubEvidence
+from copilot_agent.graph import (
+    SubQueryRetrieval,
+    build_graph,
+    merge_retrievals,
+    route_after_router,
+)
 from copilot_agent.history import MAX_STORED_TURNS
-from copilot_agent.planner import GREETING_MESSAGE, HistoryTurn, TokenUsage
+from copilot_agent.planner import (
+    GREETING_MESSAGE,
+    NO_USAGE,
+    HistoryTurn,
+    Plan,
+    SubQuery,
+    TokenUsage,
+)
 from copilot_agent.refusal import REFUSAL_MESSAGE
 from copilot_agent.retrieval import Candidate, RetrievalResult, RetrievedChunk, union_relevant
 
@@ -474,3 +488,254 @@ async def test_what_a_turn_saves_does_not_carry_the_candidates() -> None:
     saved = (await saver.aget_tuple(thread())).checkpoint["channel_values"]
     size = sum(len(serializer().dumps_typed(v)[1]) for v in saved.values())
     assert size < 20_000, f"a turn saved {size} bytes"
+
+
+# ---- the routed graph: router, the three-way fan-out, two kinds of evidence (step 3.5) --------
+#
+# Everything above describes the graph a deployment with no GITHUB_TOKEN compiles, unchanged.
+# This section is the second shape. The subagent here is a stub, not the real subgraph:
+# test_github_agent.py drives that one against a scripted model and a mock transport, and what
+# these cases are about is the boundary between the two graphs.
+
+ROUTER_USAGE = {"input_tokens": 300, "output_tokens": 4, "total_tokens": 304}
+ROUTER_TOKENS = TokenUsage(input_tokens=300, output_tokens=4)
+
+
+def router_replying(*routes: str) -> tuple[Any, list[list[BaseMessage]]]:
+    """A router that returns the given routes, one per turn."""
+    chosen = iter(routes)
+    calls: list[list[BaseMessage]] = []
+
+    async def reply(messages: list[BaseMessage]) -> dict[str, Any]:
+        calls.append(messages)
+        return {
+            "raw": AIMessage(content="", usage_metadata=ROUTER_USAGE),
+            "parsed": {"route": next(chosen)},
+            "parsing_error": None,
+        }
+
+    return RunnableLambda(reply), calls
+
+
+def evidence(question: str = "q", *, ok: bool = True, text: str = "v7 shipped") -> GitHubEvidence:
+    return GitHubEvidence(
+        question=question,
+        ok=ok,
+        evidence=text,
+        query="query { repository { name } }",
+        attempts=1,
+        repairs=0,
+        first_try_valid=ok,
+        stages=["ok" if ok else "field-error"],
+        lookups=2,
+        points_spent=1,
+        node_count=5,
+        usage=TokenUsage(input_tokens=900, output_tokens=60),
+    )
+
+
+class FakeGitHubAgent:
+    """Stands in for the compiled subgraph: records what it was given, returns one result."""
+
+    def __init__(self, result: GitHubEvidence | None) -> None:
+        self._result = result
+        self.calls: list[dict[str, Any]] = []
+
+    async def ainvoke(self, state: dict[str, Any], *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(state)
+        return {"question": state["question"], "result": self._result}
+
+
+def routed_graph(planner: Any, search: Any, chat: Any, route: str, agent: Any, **kwargs: Any):
+    router, _ = router_replying(route)
+    return build_graph(
+        planner=planner, search=search, model=chat, router=router, github_agent=agent, **kwargs
+    )
+
+
+@pytest.mark.parametrize("half", ["router", "agent"])
+async def test_half_a_github_path_is_refused_at_build_time(half: str) -> None:
+    # A router with nowhere to route pays for a decision nobody can act on; a subagent with no
+    # router is a capability nothing can reach. Both are misconfigurations a deployment should
+    # hear about at startup, which is the one moment somebody is looking.
+    planner, _ = planner_replying(search_plan(("q", "h")))
+    router, _ = router_replying("docs")
+    extra = {"router": router} if half == "router" else {"github_agent": FakeGitHubAgent(None)}
+    with pytest.raises(ValueError, match="together"):
+        build_graph(planner=planner, search=FakeSearch({}), model=model(), **extra)
+
+
+async def test_docs_route_retrieves_and_never_calls_the_subagent() -> None:
+    planner, _ = planner_replying(search_plan(("what is streamText", "h")))
+    search = FakeSearch({"what is streamText": result(chunk(1, 0.9))})
+    agent = FakeGitHubAgent(evidence())
+
+    state = await run(
+        routed_graph(planner, search, model(ANSWER), "docs", agent), "what is streamText"
+    )
+
+    assert state["route"] == "docs"
+    assert state["router_usage"] == ROUTER_TOKENS
+    assert agent.calls == []
+    assert state["github"] is None
+    assert [c[0] for c in search.calls] == ["what is streamText"]
+    assert state["mode"] == "reranked"
+
+
+async def test_github_route_calls_the_subagent_and_never_retrieves() -> None:
+    planner, _ = planner_replying(search_plan(("when was v7 released", "h")))
+    search = FakeSearch({})  # any search raises KeyError, which is the assertion
+    agent = FakeGitHubAgent(evidence("when was v7 released"))
+
+    state = await run(
+        routed_graph(planner, search, model(ANSWER), "github", agent), "when was v7 released"
+    )
+
+    assert state["route"] == "github"
+    assert search.calls == []
+    assert agent.calls == [{"question": "when was v7 released"}]
+    assert state["github"].ok is True
+    # Nothing was retrieved, so there is nothing to union and no Cohere call went out. The old
+    # merge would have said "reranked" here, because no result said otherwise — which tells the
+    # UI and the query log that a rerank returned zero chunks, a different event from this one.
+    assert state["mode"] == "skipped"
+    assert state["relevant"] == []
+    assert state["rerank_calls"] == 0
+
+
+async def test_both_route_runs_retrieval_and_the_subagent_and_they_meet_at_merge() -> None:
+    planner, _ = planner_replying(search_plan(("does streamText retry", "h")))
+    search = FakeSearch({"does streamText retry": result(chunk(1, 0.8))})
+    agent = FakeGitHubAgent(evidence("does streamText retry"))
+
+    state = await run(
+        routed_graph(planner, search, model(ANSWER), "both", agent), "does streamText retry"
+    )
+
+    assert state["route"] == "both"
+    assert len(search.calls) == 1
+    assert len(agent.calls) == 1
+    assert state["relevant"] == [chunk(1, 0.8)]
+    assert state["github"].ok is True
+
+
+async def test_the_subagent_is_given_the_question_and_nothing_else() -> None:
+    # Not the retrieved chunks and not the planner's sub-queries. Handed documentation text, the
+    # one thing it could produce is a GitHub-shaped answer that GitHub never said.
+    planner, _ = planner_replying(search_plan(("resolved sub-query", "h")))
+    agent = FakeGitHubAgent(evidence())
+
+    await run(routed_graph(planner, FakeSearch({}), model(ANSWER), "github", agent), "raw question")
+
+    assert agent.calls == [{"question": "raw question"}]
+
+
+async def test_a_subagent_that_returns_no_result_answers_without_github() -> None:
+    # `.get`, not `[...]`: by the time this node runs the answer stream is already a 200, so a
+    # KeyError here reaches the reader as a dead stream rather than as an error.
+    planner, _ = planner_replying(search_plan(("q", "h")))
+
+    state = await run(
+        routed_graph(planner, FakeSearch({}), model(ANSWER), "github", FakeGitHubAgent(None)), "q"
+    )
+
+    assert state["github"] is None
+    assert state["answer"] == ANSWER
+
+
+async def test_github_evidence_reaches_the_system_prompt() -> None:
+    planner, _ = planner_replying(search_plan(("when was v7 released", "h")))
+    chat = model(ANSWER)
+    agent = FakeGitHubAgent(evidence(text="RELEASE v7 published 2025-01-01"))
+
+    await run(routed_graph(planner, FakeSearch({}), chat, "github", agent), "when was v7 released")
+
+    system = chat.seen[0][0].content
+    assert GITHUB_PROMPT_HEADER in system
+    assert system.endswith("RELEASE v7 published 2025-01-01")
+
+
+async def test_a_failed_lookup_is_shown_to_the_model_rather_than_left_out() -> None:
+    # A missing section invites answering the GitHub half from memory. GitHubEvidence.evidence
+    # says NO GITHUB DATA in those words, and that sentence is the whole point of including it.
+    planner, _ = planner_replying(search_plan(("when was v7 released", "h")))
+    chat = model(ANSWER)
+    agent = FakeGitHubAgent(evidence(ok=False, text="NO GITHUB DATA: 3 attempt(s)."))
+
+    await run(routed_graph(planner, FakeSearch({}), chat, "github", agent), "when was v7 released")
+
+    assert "NO GITHUB DATA" in chat.seen[0][0].content
+
+
+async def test_a_docs_turn_in_the_routed_graph_asks_what_the_unrouted_graph_asks() -> None:
+    # What "additive" has to mean: with no GitHub evidence the routed graph's generation request
+    # is the unrouted graph's, character for character. test_generation_request_parity.py pins
+    # that request to the TypeScript one, so anything less breaks invariant 3's claim that the
+    # harness and production are one pipeline in two languages.
+    plan = search_plan(("what is streamText", "h"))
+    found = {"what is streamText": result(chunk(1, 0.9))}
+
+    planner_a, _ = planner_replying(plan)
+    plain = model(ANSWER)
+    await run(build_graph(planner=planner_a, search=FakeSearch(found), model=plain), "q")
+
+    planner_b, _ = planner_replying(plan)
+    chat = model(ANSWER)
+    agent = FakeGitHubAgent(evidence())
+    await run(routed_graph(planner_b, FakeSearch(found), chat, "docs", agent), "q")
+
+    assert chat.seen[0][0].content == plain.seen[0][0].content
+
+
+async def test_the_next_turn_does_not_inherit_the_last_turn_s_github_facts() -> None:
+    # 2.5's bug in a key that needs no reducer to have it: without turn_reset clearing `github`,
+    # turn 2's prompt carries turn 1's release date and the answer grounds on it.
+    planner, _ = planner_script(search_plan(("q", "h")), search_plan(("q", "h")))
+    router, _ = router_replying("github", "docs")
+    chat = TurnModel(messages=iter(["first answer", "second answer"]))
+    agent = FakeGitHubAgent(evidence(text="RELEASE v7 published 2025-01-01"))
+    graph = build_graph(
+        planner=planner,
+        search=FakeSearch({"q": result(chunk(1, 0.9))}),
+        model=chat,
+        router=router,
+        github_agent=agent,
+        checkpointer=InMemorySaver(),
+    )
+
+    await turn(graph, "when was v7 released")
+    # Turn 2 is routed to docs, so the subagent does not run and nothing writes `github`.
+    state = await turn(graph, "what is streamText")
+
+    assert state["route"] == "docs"
+    assert state["github"] is None
+    assert state["router_usage"] == ROUTER_TOKENS
+    assert "RELEASE v7" not in chat.seen[-1][0].content
+
+
+def routing_state(route: str, queries: int = 2) -> dict[str, Any]:
+    return {
+        "question": "q",
+        "route": route,
+        "plan": Plan(
+            intent="search",
+            queries=tuple(SubQuery(query=f"q{i}", hypothetical="h") for i in range(queries)),
+            usage=NO_USAGE,
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("route", "nodes"),
+    [
+        ("docs", ["retrieve", "retrieve"]),
+        ("github", ["github"]),
+        ("both", ["retrieve", "retrieve", "github"]),
+    ],
+)
+def test_the_fan_out_sends_exactly_what_the_route_asked_for(route: str, nodes: list[str]) -> None:
+    assert [send.node for send in route_after_router(routing_state(route))] == nodes
+
+
+def test_a_merge_with_nothing_retrieved_says_skipped() -> None:
+    assert merge_retrievals([]) == {"relevant": [], "mode": "skipped", "rerank_calls": 0}

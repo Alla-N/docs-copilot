@@ -100,13 +100,24 @@ def test_visitor_shapes_match_typescript(name: str) -> None:
 
 def test_the_row_has_the_columns_the_typescript_route_writes() -> None:
     # One table, two writers: lib/query-log.ts for the TypeScript route, query_log.py for the
-    # service. Same columns in the same order, plus the two of db/006 and the one of db/007.
+    # service. Same columns in the same order, then the ones only the service can fill: the two
+    # of db/006, the one of db/007, and the three of db/009. The list grows only when a
+    # migration adds a column the TypeScript route has no way of knowing about -- the router is
+    # a node inside the service, and the route is a decision the byte pipe never sees.
     from copilot_agent.query_log import COLUMNS
 
     source = (LIB / "query-log.ts").read_text()
     insert = source[source.index('.from("query_log").insert({') : source.index("} as never)")]
     ts_columns = re.findall(r"^\s+([a-z_]+):", insert, re.MULTILINE)
-    assert (*ts_columns, "origin", "thread_id", "trace_id") == COLUMNS
+    service_only = (
+        "origin",
+        "thread_id",
+        "trace_id",
+        "router_input_tokens",
+        "router_output_tokens",
+        "route",
+    )
+    assert (*ts_columns, *service_only) == COLUMNS
 
 
 def test_every_column_the_service_writes_is_created_by_a_migration() -> None:
