@@ -140,6 +140,37 @@ measured.
 Uncapped outline bytes, which is what `DEFAULT_BYTE_CAP` is now set from: Repository 5,971 over
 145 fields, PullRequest 4,290, Issue 3,357, the Query root 1,362, and everything else under 800.
 
+## Measured before 3.3 (2026-09-15): what dryRun does
+
+`experiments/dry_run_semantics.py`, three requests against the live API. The published
+description of the mechanism decision 10 is built on is one sentence, and two readings of it
+build different runners, so it was asked rather than read.
+
+| | cost | nodeCount | remaining | used |
+|---|---|---|---|---|
+| `rateLimit` only, before | - | - | 5000 | 0 |
+| `rateLimit(dryRun: true)` + a repository query | 1 | 5 | 5000 | 0 |
+| `rateLimit` only, after | - | - | 5000 | 0 |
+| the same query, for real | 1 | 5 | 4999 | - |
+
+Three results, and all three are better than the reading the spec assumed:
+
+1. **dryRun suppresses evaluation.** `repository` is not null in the dry run response -- it is
+   **absent**. The response data holds `rateLimit` and nothing else. So the pre-flight is
+   necessarily its own request, and the runner makes two round trips per query, exactly as
+   decision 2 priced.
+2. **The dry run is free.** `remaining` did not move, and neither did `used`. So is a plain
+   `rateLimit` query: three requests were made before the second probe and `used` was still 0.
+   The gate therefore costs latency and nothing else, which means **every** generated query can
+   be pre-flighted rather than only the suspicious ones.
+3. **The prediction is exact, not an estimate.** The dry run reported cost 1 and nodeCount 5;
+   the same query run for real reported cost 1 and nodeCount 5 and spent exactly one point.
+   The gate reads the number the real call will charge.
+
+**P3 is confirmed early**: a five-release single-repo query costs 1 point. Which means, as the
+spec already warned, that the 10-point ceiling of decision 10 is probably inert, and the
+`nodeCount` half of the gate is the half doing the work.
+
 ## Findings so far
 
 1. **A marker that names the wrapper.** The first `_field_outline` reported
@@ -163,6 +194,12 @@ Uncapped outline bytes, which is what `DEFAULT_BYTE_CAP` is now set from: Reposi
    meant to find. It now prints uncapped, capped and field count side by side.
 4. **A fine-grained personal access token works against the GraphQL API.** Settled by the live
    test, not by the changelog. The classic `public_repo` token is not needed.
+5. **An asserted aside inside a measurement is still an assertion.** The first version of the
+   dryRun experiment printed `points moved by: 0 (a plain rateLimit query costs 1 itself)`. The
+   parenthetical was invented, and the same run's own numbers disprove it -- `used` was 0 after
+   three requests. A measurement tool is the last place an unmeasured claim should appear,
+   because it arrives wearing the authority of everything around it. Every line of the verdict
+   block is now computed from the responses.
 
 ## Predictions, written before the measurement
 
