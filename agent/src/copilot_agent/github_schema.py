@@ -100,6 +100,15 @@ def introspection_query() -> str:
     return get_introspection_query(descriptions=True)
 
 
+def github_headers(token: str) -> dict[str, str]:
+    """Every request to the API carries these two.
+
+    The User-Agent is not optional: GitHub rejects a request without one, and the rejection does
+    not say that is why. Shared with the query runner so there is one place it can be wrong.
+    """
+    return {"Authorization": f"Bearer {token}", "User-Agent": USER_AGENT}
+
+
 async def fetch_introspection(client: httpx.AsyncClient, token: str) -> dict:
     """POST the introspection query and return its `data`, or raise GitHubSchemaError.
 
@@ -110,10 +119,7 @@ async def fetch_introspection(client: httpx.AsyncClient, token: str) -> dict:
         response = await client.post(
             GITHUB_GRAPHQL_URL,
             json={"query": introspection_query()},
-            headers={
-                "Authorization": f"Bearer {token}",
-                "User-Agent": USER_AGENT,
-            },
+            headers=github_headers(token),
             timeout=INTROSPECTION_TIMEOUT_S,
         )
         response.raise_for_status()

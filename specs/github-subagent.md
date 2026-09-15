@@ -228,6 +228,39 @@ spec already warned, that the 10-point ceiling of decision 10 is probably inert,
 If P3 holds, the points budget of decision 10 is doing nothing and should be said to be doing
 nothing rather than quietly kept as a feature.
 
+## Measured in 3.3 (2026-09-15): what the pre-flight is, and is not
+
+The runner was built on the belief that a request-level error has no `path` and a field-level
+error does, and that the first class is the repairable one. The live suite disproved the second
+half of that immediately, and then a tightened assertion disproved a consolation prize.
+
+1. **A connection missing `first` is a FIELD-level error.** `path: ["repository", "releases"]`,
+   `type: MISSING_PAGINATION_BOUNDARIES`. GitHub checks pagination bounds in its resolvers, not
+   in schema validation, so the error legitimately carries a path -- and P1 says this is the
+   single most common thing a model gets wrong. Deciding repairability from `path` classified it
+   as hopeless, so **the repair loop would never have fired on the failure it exists for**, with
+   37 offline tests agreeing. Repairability is now decided by `type` against a short allow-list
+   (default: no), with provenance recorded per entry.
+2. **Where an error happened and whether it is worth repairing are two questions.** Three
+   discriminators were tried, each a single structural signal: `data is None` (wrong -- null
+   propagates upward), `path` (right about where, wrong about whether), and finally `path` for
+   where and `type` for whether. The mistake each time was looking for one answer to two
+   questions.
+3. **The pre-flight prices without validating.** The dry run costs the pagination-less query
+   happily and only the paid call refuses it. So the pre-flight is a budget gate and nothing
+   more, and **P1's failure mode necessarily costs a paid request**. GitHub computes what a query
+   costs and whether a query is runnable in different places, and dryRun only runs the first.
+4. **A test that accepts two answers is a measurement that cannot measure.** The first version
+   asserted `stage in {"preflight", "field-error"}` and passed without saying which. Tightened to
+   one value, it failed and produced finding 3. This is the same defect as `greatest(reltuples,
+   0)` and the `[connection of IssueConnection]` marker, committed into a test by the person who
+   had just written those two up.
+5. **A second bug was hiding behind the first.** `run()` discarded the pre-flight's field errors
+   entirely, so a failure the free request already knew about was rediscovered by the paid one.
+   The branch that surfaces them is now there, tested offline -- and, given finding 3, **never
+   observed to fire**. That is written in the source as a limitation rather than listed as a
+   feature.
+
 ## Sub-steps
 
 Each ends with a measured result, the Mac gate, a commit and CI, in the project's usual order.
