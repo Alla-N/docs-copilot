@@ -191,6 +191,7 @@ EVIDENCE = GitHubEvidence(
     first_try_valid=False,
     stages=["missing first", "ok"],
     lookups=2,
+    types_read=["Repository", "Release"],
     points_spent=1,
     node_count=3,
     usage=TokenUsage(900, 60),

@@ -270,6 +270,10 @@ export type GitHubBlock = {
     first_try_valid: boolean;
     stages: string[];
     lookups: number;
+    /** Which types it asked to see, in order (3.6c). The count says how much looking happened;
+     *  this says what it looked at, which is what separates "never saw the field" from "saw it
+     *  and passed it over" — two defects the counter cannot tell apart. */
+    types_read: string[];
     points_spent: number;
     node_count: number | null;
     usage: { input_tokens: number | null; output_tokens: number | null };

@@ -536,6 +536,7 @@ def evidence(question: str = "q", *, ok: bool = True, text: str = "v7 shipped") 
         first_try_valid=ok,
         stages=["ok" if ok else "field-error"],
         lookups=2,
+        types_read=["Repository", "Release"],
         points_spent=1,
         node_count=5,
         usage=TokenUsage(input_tokens=900, output_tokens=60),

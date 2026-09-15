@@ -91,7 +91,23 @@ MAX_REPAIRS = 2
 # lookup is free of GitHub points and cheap in tokens. It is here because a model that has asked
 # for six type descriptions and still not written a query is not converging, and the recursion
 # limit is a worse way to find that out than a number with a name.
+#
+# **Reaching it used to end the turn with nothing, and 3.6b measured what that costs.** The step
+# added one sentence to the prompt inviting the model to look a field up when unsure; exploration
+# rose from 2 lookups to 5 and 6, the cap was reached, and `gh-issue-1-author` -- which had been
+# right 4 times out of 4 -- fell to 2 of 4. The failing turns wrote NO query at all: zero
+# attempts, `ok` false, and a result that reads as flakiness rather than as a budget running out.
+# A budget that can be spent entirely on preparation is not a budget, it is a race, and the turn
+# loses it silently. So the cap now bounds LOOKING rather than the turn: see explore() below.
 MAX_LOOKUPS = 6
+
+# Said to the model on the turn after the lookup budget is spent, alongside an offer of the query
+# tool alone. Not a scolding and not an instruction to guess: the two honest moves at that point
+# are a query built from what it has already read, or saying it cannot.
+NO_MORE_LOOKUPS = (
+    "The schema lookup budget for this question is spent. Write the best query you can from "
+    "what you have already read, or say that you cannot answer this question."
+)
 
 # What the answer model is allowed to read from one GitHub result. Well under the 8000 byte
 # schema cap: this competes with five reranked documentation chunks for the same prompt.
@@ -222,6 +238,14 @@ class GitHubEvidence:
     points_spent: int
     node_count: int | None
     usage: TokenUsage
+    # Which types were read, added in 3.6c. A LIST, and not a tuple, and that is not a style
+    # choice: this object rides in the LangGraph checkpoint, and 2.5 already found that msgpack
+    # has no tuple. A tuple goes in and a list comes out, so a frozen dataclass stops equalling
+    # itself across a checkpoint -- which is exactly what tests/test_checkpoint.py caught here,
+    # one commit after the lesson was written down. Required rather than defaulted, like every
+    # other field: this one is a measurement, and an empty default is a measurement that can go
+    # missing quietly.
+    types_read: list[str]
 
 
 class GitHubAgentInput(TypedDict):
@@ -245,6 +269,29 @@ def lookups_so_far(messages: list[AnyMessage]) -> int:
     return sum(
         1 for m in messages if isinstance(m, ToolMessage) and m.name not in (QUERY_TOOL, None)
     )
+
+
+def types_read(messages: list[AnyMessage]) -> list[str]:
+    """Which types the subagent asked to see, in the order it asked, from the calls it made.
+
+    `lookups` says how MUCH looking happened; this says what it looked at, and 3.6b is why the
+    difference earns a field. Both release questions came back with a listing after exactly two
+    lookups, and nothing in the record says whether `Repository` was one of them -- that is,
+    whether the model never saw `release(tagName:)` or saw it and passed it over. Those are two
+    different defects with two different fixes, and the counter cannot tell them apart.
+
+    Taken from the model's calls rather than from the tool replies, because the reply carries
+    the tool's name and the call carries the argument, and the argument is the answer here.
+    `github_schema` takes none, so it stands for itself.
+    """
+    names: list[str] = []
+    for message in messages:
+        for call in getattr(message, "tool_calls", None) or []:
+            if call["name"] == QUERY_TOOL:
+                continue
+            arguments = call.get("args") or {}
+            names.append(str(arguments.get("name") or call["name"]))
+    return names
 
 
 def add_usage(total: TokenUsage | None, reply: AIMessage) -> TokenUsage:
@@ -379,11 +426,33 @@ def build_github_agent(
     bound = model.bind_tools([*lookup_tools, github_query_tool], parallel_tool_calls=False)
 
     async def explore(state: GitHubAgentState) -> dict[str, object]:
+        """One model turn: read a type, write a query, or give up.
+
+        With the lookup budget spent, the model is offered the query tool ALONE rather than
+        being routed straight to summarise. That is 3.6b's finding turned into structure: the
+        old shape let a turn use its whole budget on looking and end with no attempt, so the
+        capable turn and the hopeless one produced the same empty result. Withdrawing the
+        lookup tools makes the last turn a decision between the two honest moves instead of a
+        seventh lookup nobody will read.
+
+        The binding happens here rather than at build time so that the tools offered on a
+        normal turn are the ones built once above; `github_query_tool` is the same object in
+        both bindings, which is what that comment is protecting.
+
+        Termination is unchanged: an exhausted turn either produces a query (run_query, capped
+        by max_repairs) or does not (summarise). It cannot produce another lookup, and the
+        guard in after_explore still catches a model that calls a tool it was not offered.
+        """
         opening: list[AnyMessage] = []
         if not state.get("messages"):
             opening = [SystemMessage(SYSTEM_PROMPT), HumanMessage(state["question"])]
         conversation = [*state.get("messages", []), *opening]
-        reply = await bound.ainvoke(conversation)
+        spent = lookups_so_far(list(state.get("messages", []))) >= max_lookups
+        if spent:
+            last_chance = model.bind_tools([github_query_tool], parallel_tool_calls=False)
+            reply = await last_chance.ainvoke([*conversation, SystemMessage(NO_MORE_LOOKUPS)])
+        else:
+            reply = await bound.ainvoke(conversation)
         return {
             "messages": [*opening, reply],
             "usage": add_usage(state.get("usage"), reply),
@@ -456,6 +525,7 @@ def build_github_agent(
                 first_try_valid=bool(attempts) and attempts[0].ok,
                 stages=[a.stage for a in attempts],
                 lookups=lookups_so_far(messages),
+                types_read=types_read(messages),
                 points_spent=sum(a.spent or 0 for a in attempts),
                 node_count=succeeded.node_count if succeeded is not None else None,
                 usage=state.get("usage") or NO_USAGE,
@@ -472,6 +542,9 @@ def build_github_agent(
         if any(call["name"] == QUERY_TOOL for call in calls):
             return "run_query"
         if lookups_so_far(state["messages"]) >= max_lookups:
+            # A lookup call on a turn where the lookup tools were not offered. Unreachable
+            # through the model's own tool choice since 3.6c, and kept because a provider that
+            # ignores a binding should end the turn rather than quietly get its seventh lookup.
             return "summarise"
         return "lookup"
 

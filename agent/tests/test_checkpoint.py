@@ -114,6 +114,10 @@ def full_state() -> dict[str, object]:
             first_try_valid=False,
             stages=["field-error", "ok"],
             lookups=2,
+            # A LIST on purpose. It went in as a tuple for one commit, and this test failed:
+            # msgpack has no tuple (2.5), so the value came back a list and the frozen dataclass
+            # no longer equalled itself across a checkpoint.
+            types_read=["Repository", "Release"],
             points_spent=1,
             node_count=5,
             usage=TokenUsage(900, 60),

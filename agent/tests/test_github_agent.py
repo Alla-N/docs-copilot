@@ -298,6 +298,9 @@ async def test_a_transport_failure_is_its_own_stage_and_not_repairable(introspec
 
 
 async def test_exploring_forever_is_stopped_by_the_lookup_cap(introspection) -> None:
+    # A model that keeps asking for types even on the turn where the lookup tools were taken
+    # away. That turn is the guard in after_explore, not the normal path: a real model cannot
+    # call a tool it was not offered, and the one below is doing it on purpose.
     looks = (says("github_type", {"name": "Repository"}, call_id=f"c{n}") for n in range(3))
     model = ScriptedModel(*looks)
 
@@ -307,6 +310,31 @@ async def test_exploring_forever_is_stopped_by_the_lookup_cap(introspection) -> 
     assert result.lookups == 2
     assert result.attempts == 0
     assert not result.ok
+
+
+async def test_a_spent_lookup_budget_still_gets_its_query(introspection) -> None:
+    # 3.6b: one added sentence in the prompt pushed exploration from 2 lookups to 6, the cap was
+    # reached, and the turn ended with NO attempt -- zero queries, `ok` false, indistinguishable
+    # from a subagent that had nothing to work with. The cap bounds looking, not the turn, so a
+    # model that has read enough to write a query gets to write it.
+    model = ScriptedModel(
+        says("github_type", {"name": "Repository"}, call_id="c1"),
+        says("github_type", {"name": "Release"}, call_id="c2"),
+        asks_query(WITH_FIRST, call_id="c3"),
+    )
+    recorder = Recorder(priced(), answered())
+
+    state = await agent(introspection, model, recorder, max_lookups=2).ainvoke(
+        {"question": QUESTION}
+    )
+    result = state["result"]
+
+    assert result.lookups == 2
+    assert result.attempts == 1
+    assert result.ok
+    # The last turn was offered the query tool and nothing else: the choice it is left with is
+    # a query or an admission, not a seventh lookup.
+    assert model.tool_names == [QUERY_TOOL]
 
 
 # --- the wiring -------------------------------------------------------------------------

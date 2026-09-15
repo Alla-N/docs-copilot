@@ -623,6 +623,7 @@ type GitHubResult = {
      *  query, and only these two say which happened. */
     lookups: number[];
     stages: string[][];
+    typesRead: string[][];
     verdict: "PASS" | "FAIL" | "VARIED" | "ERROR";
     detail: string;
     sample: string;
@@ -748,6 +749,7 @@ async function runGitHubCases(target: AgentTarget): Promise<GitHubResult[]> {
             repairs: withBlock.map((b) => b.repairs),
             lookups: withBlock.map((b) => b.lookups),
             stages: withBlock.map((b) => b.stages),
+            typesRead: withBlock.map((b) => b.types_read ?? []),
             verdict,
             detail,
             sample: runs[0].text,
@@ -813,7 +815,10 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
             if (r.evidence) console.log(`         evidence ${r.evidence.replace(/\s+/g, " ").slice(0, 400)}`);
             console.log(`         routes   ${r.routes.map((x) => x ?? "null").join(", ")}`);
             if (r.subagentRuns)
-                console.log(`         looked up ${r.lookups.join(", ")} type(s); stages ${r.stages.map((s) => s.join(" > ")).join("  |  ")}`);
+                console.log(
+                    `         looked up ${r.lookups.join(", ")} type(s) [${r.typesRead.map((t) => t.join(" ") || "none").join("  |  ")}]` +
+                    `; stages ${r.stages.map((s) => s.join(" > ")).join("  |  ")}`
+                );
         }
     }
 
@@ -847,6 +852,7 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
             repairs: r.repairs,
             lookups: r.lookups,
             stages: r.stages,
+            typesRead: r.typesRead,
             detail: r.detail,
             query: r.query,
             evidence: r.evidence ? r.evidence.slice(0, 600) : null,
