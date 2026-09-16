@@ -30,6 +30,7 @@ expected to hold to that, not just to keep the tests green.
 | `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
 | `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
 | `evals/planner.ts` · `planner-cases.ts` | Planner-only eval: intent + sub-query assertions, no retrieval; the 23 cases live in `planner-cases.ts` |
+| `evals/github-cases.ts` | Phase 3.6: 12 frozen-answer GitHub questions plus one control, with a routing label each. Own file, own denominators, own cost line, own exit code (5), because the golden suite's numbers are a series. Every literal came from one run of `agent/experiments/freeze_github_answers.py` and names the alias it came from. A question qualified only if its answer cannot change, a generic listing cannot contain it by accident, and it cannot be produced without a query — which is why the licence and the default branch were frozen and then left out |
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
 | `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
@@ -39,9 +40,10 @@ expected to hold to that, not just to keep the tests green.
 | `agent/.../github_agent.py` | Phase 3: the subagent subgraph. `explore` -> `lookup` or `run_query` -> `summarise`, the repair being the tool loop going round again. Compiled `checkpointer=False`, measured: `None` writes the subgraph's messages into the parent's checkpoint. `open_github_agent` yields None without `GITHUB_TOKEN`, and then there is no GitHub path at all |
 | `agent/.../planner.py` | The port of `lib/plan.ts`, call for call. Its prompt is that file's plus **exactly one** paragraph (`REPOSITORY_SCOPE_PARAGRAPH`, step 3.5b, spliced by `with_repository_scope` so the delta is the code's structure and not a claim about it): the vercel/ai repository is in scope, so repository questions reach the router instead of being canned. `tests/test_planner_request_parity.py` pins both halves — the TypeScript prompt byte for byte, and the paragraph as the whole of the difference |
 | `agent/.../router.py` | Phase 3.5: docs or both, never GitHub alone. The planner's call shape with a different prompt; any failure routes to `docs`. The third route existed for one afternoon and its first measurement removed it (the file has the run) |
+| `agent/experiments/freeze_github_answers.py` · `github_error_shapes.py` | Phase 3.6: the twelve frozen answers, read from the repository in one query so the labelled set is provenance rather than memory; and two shapes the baseline needed — the error type behind an over-large `first` (`EXCESSIVE_PAGINATION`), and whether ai@5.0.0 is annotated (it is: `ref.target` is a Tag wrapping the commit, and `object(expression:)` peels it, which is how a peeled result got written down as a direct one) |
 | `agent/experiments/github_schema_size.py` · `dry_run_semantics.py` · `subgraph_stream.py` | The phase 3 measurements: what a cached schema weighs; what `dryRun` actually does (it prices without validating, and is free); and what nesting a subgraph does to the parent's stream and checkpoint. The last one was written BEFORE the 3.5 build, and it overturned two things that were already written down |
 | `agent/experiments/container_memory.sh` | What the container needs: the real image under a hard `--memory` cap with real `/chat` turns, reporting cgroup `anon` and `file` separately. Measured 145 MiB working set; page cache is charged to whichever container faults the image layers in first, so read position 1 |
-| `db/000..009_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) · the router's tokens and `route`, priced into `query_cost` |
+| `db/000..010_*.sql` | schema · content hash · query log · visitor attribution + views · retrieval health view · cost/timing columns + `cost_daily` view · `origin` + `thread_id`, `query_cost`, views on web rows only · `trace_id` · checkpoint retention (pg_cron, 30 days, `maintenance` schema) · the router's tokens and `route`, priced into `query_cost` · the subagent's whole evidence block as `github jsonb` plus its tokens, priced too (db/010): counters cannot say whether a question was answered, so the query and the evidence text are in the row |
 
 ## Invariants — do not break these
 
@@ -254,6 +256,9 @@ npm test                             # Vitest unit tests (Mac, not the bridge VM
 npm run eval                         # full suite: 27 cases × 3 gens (8 for injection); exits non-zero on fail; writes evals/results/<stamp>.json (commit it)
 #   a case that cannot RUN (gateway timeout, dropped connection) is verdict ERROR, not a failure:
 #   the run continues, errored cases leave every denominator, and the run exits 4 as INCOMPLETE
+#   on EVAL_TARGET=python the GitHub labelled set runs too: EVAL_GITHUB=0 skips it, EVAL_GITHUB_RUNS
+#   sets its runs (default 2). It reports on its own denominators and exits 5 when the golden suite
+#   is green and the labelled set is not — two claims, two signals
 EVAL_RUNS=0 npm run eval             # retrieval-only (still pays planner+embed+rerank); fails on a recall miss twice
 npm run eval:planner                 # planner-only: intent, sub-query count, must/must-not strings; cheap
 EVAL_ONLY=id1,id2 npm run eval       # subset — for diagnosis only, never as the pass signal
@@ -285,6 +290,8 @@ cd agent && uv run pytest -m integration tests/test_checkpoint_live.py   # the s
 docker build -t copilot-agent agent  # the agent image; run recipe (3 env vars only, -p 127.0.0.1:8000:8000) in agent/README.md
 cd agent && ./experiments/container_memory.sh          # what the container needs under a hard cap; about 6 cents
 cd agent && uv run python experiments/subgraph_stream.py   # what nesting a subgraph does to the parent stream and checkpoint (free, instant fakes)
+cd agent && uv run python experiments/freeze_github_answers.py   # the labelled set's answers, read from the repository (one query, one point); rerun only to add anchors
+cd agent && uv run python experiments/github_error_shapes.py     # the over-large `first` error type, and the tag asked three ways (two queries, two points)
 cd agent && uv run python -m copilot_agent.chat_cli "is there an open issue about streamText retries"   # the GitHub path by hand; prints router, attempts, lookups, points
 cd agent && uv run python infra/aws_secret.py          # dry run: key names and lengths, no values; --write uploads
 cd agent && ./infra/roles.sh                           # IAM roles, service-linked roles, the scoped secret policy

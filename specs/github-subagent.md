@@ -106,6 +106,9 @@ date to a documentation page. That prompt change is the one place phase 3 touche
 
 ## Done when
 
+**Met in 3.6 (2026-09-15), and measured twice more after it.** The section "Built and measured in
+3.6" below carries the three states and the findings; what follows is what was asked for.
+
 A labelled set of about 12 frozen-answer GitHub questions plus the existing 27-case documentation
 suite, run twice (HyDE is still in the docs path), reporting:
 
@@ -592,6 +595,147 @@ combination of the other four measures, because on this turn the other four are 
 |---|---|---|
 | 23 | **The added paragraph declares scope and nothing else — no intent, no rule.** | Measured twice at about 5 in 10 on `split-drops-noise` when it named an intent, 30/30 when it did not. The prompt declares scope in one place and the rules consume it, so a sentence naming an intent adds a second intent rule in front of rule 4 rather than widening what rule 4 reads. Instructions belong in the rules for the same reason. |
 
+## Built and measured in 3.6 (2026-09-15/16): the labelled set, and what it found
+
+The step the phase existed to reach, and the first one whose result is a number about *answers*
+rather than about the machinery that fetches them. Three measured states, twelve fixed answers,
+and a set that disagreed with every other metric on the first run.
+
+### The set: twelve frozen questions, one control, three selection rules
+
+`evals/github-cases.ts`, its own file next to `planner-cases.ts` — which settles the spec's first
+open question. It is a different kind of set with different criteria and its own denominators,
+and it runs from the same command on the Python target.
+
+Every literal came out of one run of `agent/experiments/freeze_github_answers.py` against the live
+API (one query, one point, timestamped in the file). A question qualified only if:
+
+1. **The answer cannot change.** Publication dates, merge dates, the login that opened an issue,
+   the commit a tag points at. Star counts and "the latest release" are not frozen, and a set
+   built on them fails for the wrong reason within a week.
+2. **A generic listing cannot contain it by accident.** This is 3.5b's finding turned into a
+   selection rule: if `releases(first: 10)` could happen to include the literal, the metric would
+   score the exact failure the set exists to catch as a pass.
+3. **It cannot be produced without a query.** The licence (`NOASSERTION`) and the default branch
+   (`main`) were both frozen by the same run and deliberately left out: a model says those having
+   queried nothing at all.
+
+The freeze run settled two shapes before the set was written. `issue(number: 50)` and
+`pullRequest(number: 100)` both resolved to nothing — **issues and pull requests share one number
+space**, so #50 is a pull request and #100 is an issue, and asking through the wrong field is a
+type error, not a missing record. And `object(expression: "ai@5.0.0")` returned `__typename:
+Commit`, which the dataset recorded as "a lightweight tag" — an inference, and wrong. See
+finding 6.
+
+### Measured: three states, two runs each, 52 observations apiece
+
+| | baseline `b224d04` | 3.6b `05e4405` | 3.6c `a0c083c` |
+|---|---|---|---|
+| **answer accuracy** | **24/52** | **29/52** | **31/52** |
+| first-try query valid | 41/42 | 41/43 | **43/43** |
+| valid after <= 2 repairs | 41/42 | 41/43 | **43/43** |
+| points per question | median 1, max 1 | median 1, max 1 | median 1, max 1 |
+| routing accuracy | 74/74 | 75/75 | 75/75 |
+| canned by the planner | 10 turns | 9 | 9 |
+| golden suite | green x2, $0.2042 / $0.2044 | green x2, $0.2042 / $0.2042 | green x2, $0.2042 / $0.2044 |
+
+The GitHub set costs about $0.0027 a turn, roughly $0.07 for its 26, and is priced on its own line
+so that the golden suite's cost series ($0.1972 local, $0.1972 on AWS, $0.2022 with the router,
+$0.2042 with the planner paragraph) keeps meaning what it meant.
+
+Final per-case state, four observations each: **4/4** on `gh-oldest-release`,
+`gh-issue-1-author`, `gh-issue-2-closed`, `gh-pr-500-author`, `gh-pr-1000-merged`,
+`gh-repo-created` and the control; **3/4** on `gh-issue-1-title`; **0/4** on `gh-ai5-release`,
+`gh-ai4-release`, `gh-tag-commit`, `gh-both-compound` and `gh-pr-500-title`.
+
+### Findings
+
+**1. Every process metric was at ceiling while half the answers were missing.** The baseline:
+first-try validity 41 of 42, points at a median of 1, routing 74 of 74 — and accuracy 24 of 52.
+3.5b saw this on one hand-typed question and called it design-changing; at set scale it is the
+justification for the set existing. **A suite of validity and cost would have reported this
+subagent as working.**
+
+**2. A number reads as an identifier; a tag name does not — and the model had the field in front
+of it.** 3.6b added one sentence telling the subagent to use the field that takes the identifier
+rather than listing the collection. Both pull-request-number cases went 0/4 and 1/4 to **4/4**.
+Both release cases did not move at all, and still wrote `releases(first: 100)` and
+`releases(first: 10, DESC)` — although the sentence names "a tag name" *first*.
+
+3.6c settled why it is not ignorance. The new `types_read` column shows every release turn reading
+`[github_schema Repository]` before writing its query, and `Repository`'s outline — 5,971 bytes
+under an 8,000 byte cap, so nothing is omitted — lists `release(tagName: String!)` plainly. **The
+field was on the screen and the model chose the connection next to it.** That makes the remaining
+failure a selection problem, not a retrieval one, and it changes what the next fix can be: not
+"make it look things up", which it does, but how the outline distinguishes a field that takes a
+key from a field that returns a page.
+
+**3. A budget that can be spent entirely on preparation is not a budget, it is a race — and the
+turn loses it silently.** 3.6b's sentence pushed exploration from 2 lookups to 5 and 6 against a
+`MAX_LOOKUPS` of 6, and `gh-issue-1-author`, right 4 times out of 4 before, fell to 2 of 4. The
+failing turns carry an **empty `stages` list**: no query was attempted at all. Zero attempts, `ok`
+false, evidence saying there was nothing — indistinguishable from a subagent that had nothing to
+work with, and it reads as flakiness.
+
+3.6c made the cap bound *looking* rather than the turn: with the budget spent the model is offered
+the query tool alone and one line saying so. The prompt was deliberately **not** reverted, so the
+attribution is clean — `gh-issue-1-author` returned to **4/4** and first-try validity went to
+43/43 with no empty-stage turns anywhere. The cap was the whole cost of that sentence, and the
+sentence keeps the two cases it fixed.
+
+**4. The columns that explained it were added in the same commit as the change they had to
+explain, and only because a previous step had been un-diagnosable without them.** `lookups` and
+`stages` were already in the evidence block and simply not surfaced. Without them, 3.6b reads as
+"+5, ship it" with one flaky case. **Record the shape of the process, not only its outcome:** a
+counter says how much happened, and the questions worth asking are about what happened.
+
+**5. An allow-list omission cost exactly one question, which is exactly what its own comment
+predicted.** `pullRequests(first: 500)` was refused by GitHub, the type was not in
+`REPAIRABLE_ERROR_TYPES`, and the turn stopped after one attempt with a repair cap of two unspent.
+The comment above that list says an omitted repairable type costs one failed question and an
+included unrepairable one costs a loop, and sets the direction of the guess from that asymmetry.
+The measurement landed precisely on the predicted side. `EXCESSIVE_PAGINATION` was then added with
+its shape measured first (`experiments/github_error_shapes.py`), like the two entries above it.
+
+**6. An inference written down as a measurement, in the file whose whole purpose is provenance.**
+`github-cases.ts` said the ai@5.0.0 tag was lightweight. The baseline disproved it: the subagent
+asked `ref(...) { target { ... on Commit { oid } } }` and got `"target": {}` — an inline fragment
+matching nothing, which is what an annotated tag does. The probe confirmed it: `ref.target` is a
+**Tag** whose own oid is `87cbd3b5`, wrapping the commit `a5e92fe`, and `object(expression:)`
+peels to the commit. Two oids, one of which answers the question. The freeze run had asked the
+peeling form, and a peeled result was read as a direct one.
+
+That empty `{}` deserves its own line: a query that parsed, validated, passed the pre-flight, cost
+its point and returned an object with nothing in it, with every counter reporting success. It is
+this phase's through-line arriving one more time.
+
+**7. msgpack has no tuple — one sub-step after that was written down.** `types_read` went in as a
+tuple, for the good reason that a frozen dataclass with an immutable default needs no
+`field(default_factory=...)`. `GitHubEvidence` rides in the LangGraph checkpoint; a tuple goes in
+and a list comes out, so the frozen dataclass stopped equalling itself across a save.
+`tests/test_checkpoint.py` caught it within the hour. 2.5 recorded that sentence in those words.
+**A lesson written down is not a lesson learned, and the test is what made the difference.**
+
+**8. Routing was never the problem, and the route called `both` finally has evidence.** 74/74,
+75/75, 75/75 across the three states. `both` had been chosen **zero** times across four green
+suite runs before this set existed; on first contact it was chosen 42 times out of 42. The
+capability phase 3 set out to add works. What fails is query authorship, one level down.
+
+**9. What is left is two defects with names.** The tag-name selection problem (four cases, all
+0/4, all reading `Repository` first) and the planner's scope (`gh-pr-500-title` canned in every
+run, nine turns of 52 never reaching the router — and in the baseline the same question routed in
+one run and was canned in the other). Both are documented rather than fixed, and both have the
+evidence attached.
+
+### New decisions
+
+| # | Decision | Why |
+|---|---|---|
+| 24 | **The per-turn GitHub block is stored whole — query and evidence text, not only counters — in a `github jsonb` column (db/010), with the subagent's tokens in their own columns.** | Counters cannot say whether a question was answered (finding 1), and when accuracy fails the only thing separating "fetched the wrong facts" from "had the right ones and did not use them" is reading the evidence next to the answer. Tokens get columns rather than jsonb keys for db/009's reason: a cost computed from `github->>'input_tokens'` goes silently to zero the day the key is renamed. |
+| 25 | **Answer accuracy is a frozen literal, normalised for rendering only.** | Normalisation folds "July 31st, 2025" and "2025-07-31" together and nothing else; it never changes which fact is being checked. The two title cases score on the token that cannot be there without the lookup ("anthropic", "error handling") rather than on the title's word order, because a criterion that punishes a correct paraphrase measures prose style. |
+| 26 | **The labelled set keeps its own denominators, its own cost line and its own exit code (5).** | The golden suite's numbers are a series across six stored runs and must keep meaning what they meant; a second population folded into them breaks the series exactly when it is most worth reading. Exit 5 says the documentation pipeline is green and the labelled set is not — two claims, two signals. |
+| 27 | **The lookup cap bounds looking, not the turn: with the budget spent the model is offered the query tool alone.** | Measured, finding 3. The old shape let a capable turn and a hopeless one produce the same empty result. |
+
 ## Sub-steps
 
 Each ends with a measured result, the Mac gate, a commit and CI, in the project's usual order.
@@ -633,26 +777,39 @@ Each ends with a measured result, the Mac gate, a commit and CI, in the project'
   times. Commits `c3c8e27` (the pin and the first paragraph) and `691c447` (the scope rewrite,
   the fuller `chat_cli` evidence print). The section above is what the measurement cost and why
   two of the three wordings were wrong.
-- **3.6 — the labelled set and the done-when run.** The 12 frozen questions, the routing labels,
-  the harness reading the new per-turn GitHub block, and the five measures, run twice.
+- **3.6 — the labelled set and the done-when run. DONE.** The 12 frozen questions plus a control,
+  the routing labels, db/010 and the harness reading the per-turn GitHub block, and the five
+  measures, run twice. **Met, and then measured twice more.** Baseline `b224d04`: accuracy 24/52
+  with every process metric at ceiling. Commit `b224d04` also closes the backlog item about the
+  harness not recording `route` per case.
+- **3.6b — the connection reflex, and the missing allow-list entry. DONE.** One paragraph in the
+  subagent prompt telling it to use the field that takes the identifier, plus
+  `EXCESSIVE_PAGINATION` in `REPAIRABLE_ERROR_TYPES`, its shape measured first. 24/52 to 29/52:
+  both pull-request-number cases to 4/4, both release cases unmoved, and `gh-issue-1-author`
+  broken from 4/4 to 2/4 by a mechanism the fix was not about. Commit `05e4405`.
+- **3.6c — the lookup cap, and which types get read. DONE.** The cap bounds looking rather than
+  the turn; the prompt deliberately unchanged so the attribution is clean. 29/52 to 31/52,
+  `gh-issue-1-author` back to 4/4 and first-try validity 43/43 with no empty-stage turn anywhere,
+  which makes the cap provably the whole cost of 3.6b's sentence. `types_read` added, and it
+  settled that the release turns read `Repository` before writing a listing. Commit `a0c083c`.
 
 ## Open questions
 
-- **Where the labelled set lives.** The existing harness is TypeScript (`evals/run.ts`,
-  `evals/dataset.ts`) and already has a Python target (`evals/agent-target.ts`,
-  `EVAL_TARGET=python`). Adding the GitHub set there keeps one command for everything, which is
-  worth more than keeping the phase's code in one language. Decision 12 is what makes that
-  possible. To confirm in 3.6.
+- ~~**Where the labelled set lives.**~~ Settled in 3.6: `evals/github-cases.ts`, its own file
+  next to `planner-cases.ts`, run by the same command on the Python target with its own
+  denominators, its own cost line and its own exit code (decision 26). One command for
+  everything, and the phase's code stays in two languages, which was the right trade.
 - ~~**Whether the router should see the sub-queries.**~~ Settled in 3.5: it does not. It sees the
   question and the recent history, folded in exactly as `planner_messages` folds it. History is
   not optional the way the sub-queries are: "and when was that released?" cannot be routed from
   its own text, and a router structurally unable to be right about follow-ups would be measuring
   something other than routing. The sub-queries stay out so that a routing failure is a routing
   failure and not a plan it inherited.
-- **Whether `both` is ever chosen on a documentation suite.** It was chosen zero times across the
-  two green runs of 3.5, which is correct for 27 documentation questions and means the route is
-  unmeasured. 3.6's labelled set is the first thing that will exercise it, and the router prompt
-  it has to get past was written after the only two mis-routes anyone has seen.
+- ~~**Whether `both` is ever chosen on a documentation suite.**~~ Settled in 3.6, and it was
+  never the weak link. Zero times across four green suite runs of 27 documentation questions,
+  which was correct; **42 times out of 42** on first contact with the labelled set, and routing
+  accuracy 74/74, 75/75, 75/75 across the three measured states. The router prompt, written after
+  the only two mis-routes anyone had seen, has not been wrong since.
 - **Secondary rate limits.** Finding 9 of phase 2b says the harness is one client, so
   concurrency limits should not fire. If they do, that is a finding, not a bug to route around.
 
