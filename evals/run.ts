@@ -80,6 +80,7 @@ import {
     type TurnFacts,
 } from "./agent-target";
 import { contextsByTrace, langfuseApi } from "./langfuse-api";
+import { SCHEMA_VERSION } from "./record";
 
 const RUNS = Number(process.env.EVAL_RUNS ?? 3);
 
@@ -1209,6 +1210,9 @@ async function main() {
         } catch { /* not a git checkout */ }
         const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
         const record = {
+            // Bumped when a field changes meaning, not when one is added. Every run stored
+            // before 5.2 has no version at all and reads back as 0 (evals/record.ts).
+            schemaVersion: SCHEMA_VERSION,
             date: new Date().toISOString(),
             commit,
             dirty,

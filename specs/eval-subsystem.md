@@ -33,7 +33,7 @@ Recorded here because a survey that finds nothing usually means nobody looked.
 
 1. **The injection numerator is computed twice** — once for the console line (`resisted`) and once, as a separately written expression, inside the record's `summary.injection`. Two spellings of one metric is exactly what an `evaluators/` directory exists to prevent.
 2. **The console guards an empty latency population and the record does not.** The console prints `no successful retrievals` when every retrieval errored; the record writes `Math.round(Math.max(...sorted))`, which is `-Infinity`, which `JSON.stringify` silently turns into `null`. Only reachable on a run that is already `incomplete`, so it is a latent inconsistency rather than a live bug — **backlog, not this step** (decision 7).
-3. **Three record schemas are already in the results directory.** The four TS runs have no `target`, `dirty`, `incomplete` or `errored`; `errored` arrives on 2026-09-14; `github` and `githubCost` arrive on 2026-09-15. Any diff has to have an opinion about this before it can print one line.
+3. **Three record schemas are already in the results directory.** The five TS runs have no `target`, `dirty`, `incomplete` or `errored`; `dirty` arrives with the Python target on 2026-09-11; `errored` and `incomplete` arrive on 2026-09-14 with the ERROR verdict; `github` and `githubCost` arrive on 2026-09-15 with the labelled set. Six of the 23 runs carry the GitHub set. Counted, not remembered — the first draft of this spec said four TS runs. Any diff has to have an opinion about this before it can print one line.
 4. **`vitest.config.ts` includes `tests/**/*.test.ts` only.** Unit tests for the extracted evaluators have to live in `tests/`, not beside the evaluators (decision 8).
 
 ---
@@ -168,7 +168,7 @@ Written before the build, checked afterwards, wrong ones kept — same as phases
 
 **P1. The restructure moves zero numbers.** A full run at the end of 5.4 diffs empty against `python-3.6c` on every metric except latency and the fourth decimal of cost. This is the verification the phase gets for free, and it is why decision 7 exists.
 
-**P2. At least three metrics in the 23 stored files cannot be compared without normalisation.** Named in advance: `target` (absent in the four TS runs), `errored` (absent before 2026-09-14), `github` and `githubCost` (absent before 2026-09-15). If the reader finds a fourth, the prediction was too conservative and that is worth saying.
+**P2. At least three metrics in the 23 stored files cannot be compared without normalisation.** Named in advance: `target` (absent in the five TS runs), `errored` (absent before 2026-09-14), `github` and `githubCost` (absent before 2026-09-15). If the reader finds a fourth, the prediction was too conservative and that is worth saying.
 
 **P3. Extracting the evaluators finds at least one more duplicated or divergent metric** beyond the two in section 1. Stated as a bet: one file of 1299 lines that grew across six sub-steps does not have exactly two.
 
