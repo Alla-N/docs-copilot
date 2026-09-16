@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
@@ -93,9 +93,28 @@ describe("a field an older run never wrote", () => {
     it("marks the labelled GitHub set absent before 3.6 (2026-09-15)", () => {
         const before = runs.filter((r) => dateOf(r) < "2026-09-15");
         for (const r of before) expect(isKnown(r.githubCases)).toBe(false);
-        const withSet = runs.filter((r) => isKnown(r.githubCases));
-        // Six runs carry it: two baseline, two 3.6b, two 3.6c.
-        expect(withSet.length).toBe(6);
+        // NOT a census, and it was one until 5.5.
+        //
+        // This read `expect(withSet.length).toBe(6)` and it failed on the done-when run: the
+        // one commit of the phase that changed nothing whatever about this reader. Two more
+        // stored runs carried the set, the count went to 8, and the assertion broke because
+        // the project did exactly what it is supposed to do.
+        //
+        // The trap is what the repair looks like. Bump 6 to 8, green again, breaks at 10. An
+        // assertion whose fix is always "edit the number" teaches you to edit the test rather
+        // than read it, and a test nobody reads cannot report anything.
+        //
+        // The contract was never "six runs have it". It is "the reader agrees with the file",
+        // and that holds for every run there will ever be.
+        for (const r of runs) {
+            const raw = JSON.parse(readFileSync(r.file, "utf8"));
+            const inFile = Array.isArray(raw?.summary?.github?.cases);
+            expect(isKnown(r.githubCases), r.file).toBe(inFile);
+        }
+        // A CLOSED set can be counted exactly -- see the five TypeScript runs above, which can
+        // never grow again because that target stopped being written to. This set is open, so
+        // the only honest bound is a floor.
+        expect(runs.filter((r) => isKnown(r.githubCases)).length).toBeGreaterThanOrEqual(6);
     });
 
     it("has recall on every single run, all the way back", () => {

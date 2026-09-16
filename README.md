@@ -306,13 +306,88 @@ worded.
 ## Evals
 
 ```bash
-npm test                     # unit tests: every pure function that has had a bug (~80 cases, seconds)
-npm run eval                 # 27 labelled cases × 3 generations (injection cases × 8)
+npm test                     # unit tests: every pure function that has had a bug (158 cases, seconds)
+npm run eval                 # the golden set: 27 labelled cases × 3 generations (injection cases × 8)
 EVAL_RUNS=0 npm run eval     # retrieval-only: no answer generation (planner + embed + rerank still run — about a cent)
-npm run eval:planner         # planner-only: 23 cases on intent and sub-queries, no retrieval
+npm run eval:planner         # the planner set: 23 cases on intent and sub-queries, no retrieval
 EVAL_JUDGE=1 npm run eval    # + LLM faithfulness check per answered case
 npm run eval:calibrate       # validate that judge against known-labelled answers first
+npm run eval:diff -- --list                                  # the named baselines
+npm run eval:diff -- --baseline python-3.6c --variant <file> # what moved between two stored runs (free)
 ```
+
+### Datasets, evaluators, targets, baselines
+
+The suite is four things, and naming them separately is what makes the fourth possible.
+
+A **dataset** is labelled cases with their own criteria, denominators and exit code. There are
+three: the golden 27, the 13 frozen-answer GitHub questions, and the planner 23. They are not
+folded together, and the exit codes differ on purpose — the golden set exits 1 and the GitHub
+set exits **5**, because "the documentation pipeline is fine and the GitHub set is not" is a
+sentence the exit code can only say if the codes differ.
+
+An **evaluator** is a pure function over cases and results, with the verdict computed in code.
+One file each: recall, coverage, guardrails, injection, false refusals, GitHub answer accuracy,
+GitHub process metrics, and the opt-in faithfulness judge — which is a *model*, so its verdict
+is derived in TypeScript from a quote check rather than taken from the model's prose.
+
+Every number here is a fraction, and the two halves fail differently. The numerator is a rule
+("did this case pass?"); the denominator is a **population** ("which cases were eligible to be
+asked?"). `evaluators/partition.ts` decides the populations once, in one place, with the reason
+for each exclusion written beside it: a parked case is excluded because counting a documented,
+deferred bug reads as a regression nobody caused; an errored case is excluded because the
+pipeline said nothing about it and recording silence as a wrong answer is how a red run stops
+meaning anything; an injection case is on its own axis because "did it refuse an out-of-corpus
+question" and "did it resist an instruction to disobey" are different properties. Before those
+rules had a home they were four filter expressions spelled inline — and two metrics had ended up
+computed **twice**, in two separately written expressions that agreed by arithmetic rather than
+by construction.
+
+A **target** is a pipeline a case can be run against: the TypeScript pipeline in this process,
+or the Python agent service over HTTP. They do not measure the same thing and the suite says so
+— the in-process target retrieves once per case and generates N times, while the service plans
+and retrieves again on every run, so `recall` means *run 1* on both (that is the comparable
+series) and `recall every run` is a question only the service can be asked.
+
+A **baseline** is a *pointer* into `evals/results/`, never a copy — a second copy of a number
+that can drift is a defect waiting to happen. `evals/baselines.json` names seven stored runs,
+and every commit in it was read out of the file it names rather than remembered.
+
+### Diffing two runs
+
+```
+  ▼ recall every run           12/12  →      11/12   -1
+  ! first-try query valid      21/21  →      22/22   denominator 21 → 22
+    suite cost               $0.2044  →    $0.2042   −$0.0002
+not comparable  (1)
+  faithfulness           neither run recorded it — summary.faithful was not recorded by this run
+```
+
+Three rules, each learned from a stored run rather than invented.
+
+**A metric absent from either side is NOT COMPARABLE.** It never prints as equal and never as a
+change. Records written across six months do not have the same shape — five runs predate there
+being a second target at all — so a reader is `Maybe<T>`: a value, or a reason there is not one,
+with no way to spell "absent" as `0`. That is the whole design. A field an older run never wrote
+must not render as a regression, and must not render as agreement either.
+
+**A changed denominator is a changed population, not a changed score.** First-try query validity
+going 21/21 → 22/22 is 22 attempts against 21, not a flat line. How many turns reach the GitHub
+subagent depends on how many the planner cans, and the planner is model output — so that
+denominator is a *random variable*, and the diff flags it rather than reporting "unchanged".
+
+**Latency and cost print a delta and get no verdict.** Retrieval is nondeterministic and token
+counts move; calling a 400 ms difference a regression would be the harness lying. Exit code is
+always 0 — this reports, it is not a gate, and a gate that fires on HyDE variance teaches you to
+ignore it.
+
+**Run the diff against another run of the same commit before trusting it against a different
+one.** It costs nothing and it is the only way to learn a metric's noise floor. Doing that here
+found something the headline hides: across three runs of the same code the GitHub set reported
+an identical 15/26 every time, while **two different cases swapped places on every run**. The
+aggregate is *conserved*, not reproducible — a suite printing only the total would call that
+perfectly stable, and would then report a real fix as having done nothing. Per-case lines are
+printed for exactly this reason, and only for cases whose verdict changed.
 
 The golden set is **27 hand-labelled cases** — every one added because it was *observed*
 passing or failing, not to pad a number (it started at 9): 5 core answerable, 6 out-of-corpus
@@ -323,8 +398,8 @@ sub-queries directly — that off-topic input yields no SDK-shaped query, that "
 history, that noise is dropped — because the main suite only sees the planner's consequences.
 Latest run (twice, on the same commit — one green run is what let `changed-7` through):
 coverage **12/12**, guardrails **6/6**, injection resisted **8/8** (8 attempts each), retrieval
-recall **12/12**, false refusals **0**, retrieval latency **3.3s median / 5.1s worst**, planner
-**24/24** (5 runs each). Every full run writes
+recall **12/12**, false refusals **0**, retrieval latency **3.5s median / 5.1s worst**, planner
+**23/23** (5 runs each). Every full run writes
 `evals/results/<timestamp>.json` — the commit it ran against, the knobs (runs, candidates,
 rerank depth, threshold, judge on/off), the summary and a per-case verdict — and those files
 are committed, so each number in this README can be traced to a stored run rather than to a
