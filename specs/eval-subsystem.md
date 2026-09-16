@@ -110,6 +110,14 @@ evals/
 
 `package.json` keeps `eval`, `eval:ci`, `eval:planner`, `eval:planner:ci`, `eval:calibrate` at the same names and adds `eval:diff`. **Prediction P4 depends on this: `.github/workflows/eval.yml` should need no edit at all.**
 
+### Where the built tree differs from the sketch above, and why (5.4b)
+
+Three deviations, all deliberate.
+
+1. **`datasets/types.ts` is a barrel, not the home of the case types.** `evals/datasets/planner.ts` is pinned by SHA256 from the Python side — `agent/tests/test_planner_request_parity.py` hashes it by path — so lifting a type out of it costs a golden regeneration to buy nothing but symmetry. A file pinned by hash cannot be refactored for free, and that is a property of the file rather than an oversight. `EvalCase`'s field comments are also the golden set's criteria rationale, which belongs beside the cases. So: one import surface, three homes.
+2. **`targets/agent-run.ts` was added.** `evaluators/types.ts` type-imports `TurnFacts` from `targets/agent-service.ts`, because a `Result` records the route the service chose. Putting that target's case loop in the same file would have made the two mutually dependent — erased today, since the import is type-only, and a real runtime cycle the first time either side needs a value. The client and the loop that drives it are separate files instead.
+3. **The three `index.ts` files are descriptor tables, not dispatchers.** A registry that the record is BUILT by iterating would be the better end state, and it is also a change to how the summary object is assembled, which is exactly how a key stops being written or a conditional loses its guard. Decision 7 rules that out of this half. What the tables do instead is tie each evaluator to the `METRICS` id it is stored under, so that a number which cannot be diffed is findable — and `tests/evaluators.test.ts` fails if one is not.
+
 ---
 
 ## 4. The diff
@@ -155,7 +163,10 @@ Rules:
 - **5.1 — this spec.** Committed before any code moves.
 - **5.2 — `record.ts`:** the schema, `schemaVersion: 1`, the writer lifted out of `main()` unchanged, and the normalising reader with its unit tests against all 23 stored files. Built first because it is the only part with a testable contract that costs nothing to exercise, and because the diff depends on it.
 - **5.3 — `diff.ts` and `baselines.json`,** developed against stored runs only. Free. At the end of 5.3 the done-when command exists in its compare-only form.
-- **5.4 — the move:** datasets, evaluators, targets, and `run.ts` reduced to an orchestrator. The largest and least interesting diff, done last so that 5.2 and 5.3 are already green when it lands.
+- **5.4 — the move:** datasets, evaluators, targets, and `run.ts` reduced to an orchestrator. The largest and least interesting diff, done last so that 5.2 and 5.3 are already green when it lands. **Split in two once it started:**
+  - **5.4a — the renames.** Eight files moved into `datasets/`, `evaluators/` and `targets/`; five string-shaped references fixed; the frozen planner golden regenerated, and its three-line diff is what makes "the move changed only paths" a measurement rather than a claim.
+  - **5.4b — the evaluators.** Everything `main()` was deciding for itself, pulled out into pure functions: the population rules, the per-case verdict, recall, coverage, guardrails with the layer attribution, injection, false refusals, and the labelled set's answer and process measures. Both targets' case loops moved out with them. The two duplicated numerators are gone, and the registries (`datasets/index.ts`, `evaluators/index.ts`, `targets/index.ts`) say what the suite measures and over what.
+  - **The free check that belongs to neither:** `eval:diff`, built in 5.3, had never actually been RUN. It was exercised against five pairs of stored runs before 5.4b touched anything, so that a non-empty diff at 5.5 could only mean the extraction. It worked on the first attempt and overturned P1 — see section 6.
 - **5.5 — the done-when run:** the full suite against the Python service at the new structure, diffed against `python-3.6c`, plus the README section in the new vocabulary.
 
 Each sub-step ends the usual way: her Mac gate, a commit message in `Claude outputs/`, CI. Only 5.5 spends money.
@@ -168,13 +179,67 @@ Written before the build, checked afterwards, wrong ones kept — same as phases
 
 **P1. The restructure moves zero numbers.** A full run at the end of 5.4 diffs empty against `python-3.6c` on every metric except latency and the fourth decimal of cost. This is the verification the phase gets for free, and it is why decision 7 exists.
 
+> **WRONG, and corrected before it could mislead 5.5 (2026-09-16, 5.4b).** Before touching the
+> evaluators, `eval:diff` was pointed at `python-3.6c` and its own PAIR — `18-40-11` against
+> `18-21-55`, the same commit `a0c083c`, two runs twenty minutes apart, no restructure anywhere
+> near them. The golden set came back `=` on every ratio, with only latency and the fourth
+> decimal of cost moving, exactly as P1 says. **The GitHub set did not:**
+>
+> ```
+>   ▲ answer accuracy            15/26  →  16/26   +1
+>   ! first-try query valid      21/21  →  22/22   denominator 21 → 22
+>   ! valid after repairs        21/21  →  22/22   denominator 21 → 22
+>   ! routing accuracy           37/37  →  38/38   denominator 37 → 38
+>   ▲ canned by the planner          5  →      4   −1
+>   github per case  (1 changed)
+>     gh-issue-1-title         VARIED 1/2  →  PASS 2/2
+> ```
+>
+> So P1 is true of the golden set and false of the labelled one, and 5.5 may only claim the
+> first. An empty GitHub diff there would be luck; a non-empty one is not evidence of anything.
+>
+> **And the part worth keeping: the denominator is a random variable.** `21/21 → 22/22` on
+> identical code is the same rate over a different number of attempts. How many turns reach the
+> subagent depends on how many the planner cans — 5 here, 4 there — and the planner is model
+> output. Finding 3 in section 1 read the 20/20-to-21/21 move between 3.6 and 3.6c as a
+> consequence of the change between those two states. It is not. It is what this metric does
+> when nothing changes at all, and the diff's `!` flag is the only reason either reading is
+> visible. **A rate whose population is itself nondeterministic cannot be compared run to run
+> without saying so**, which is the strongest argument the phase has produced for the diff
+> existing.
+>
+> The check cost nothing: two stored files, no model calls. Running the diff against a run of
+> the SAME commit, before trusting it against a different one, is now the rule.
+
 **P2. At least three metrics in the 23 stored files cannot be compared without normalisation.** Named in advance: `target` (absent in the five TS runs), `errored` (absent before 2026-09-14), `github` and `githubCost` (absent before 2026-09-15). If the reader finds a fourth, the prediction was too conservative and that is worth saying.
 
 **P3. Extracting the evaluators finds at least one more duplicated or divergent metric** beyond the two in section 1. Stated as a bet: one file of 1299 lines that grew across six sub-steps does not have exactly two.
 
+> **RIGHT (5.4b).** Faithfulness had the same defect as injection, and had had it longer: the
+> console printed `judged.filter(yes).length / judged.length` while the record wrote
+> `results.filter(=== "yes").length / results.filter(!== "—").length` — two separately written
+> expressions over the same array, agreeing by arithmetic rather than by construction. Both now
+> read `aggregateFaithfulness`. A second, smaller one turned up beside it: `GitHubRun.intent`
+> was set on every observation of the labelled set and read by nothing at all.
+
 **P4. `eval.yml` needs no edit,** because every script name survives. If it does need one, the restructure reached further than a rename should.
 
+> **RIGHT, for `eval.yml`, and it nearly cost something anyway (5.4a, re-checked 5.4b).** No
+> workflow script name moved. But `agent.yml` and `.pre-commit-config.yaml` both name
+> `evals/datasets/planner.ts` as a PATH STRING, and 5.4a had to fix both — see finding 5. The
+> prediction was about the wrong file. At 5.4b the unfiltered grep came back clean: the new
+> modules are reached by extension (`\.(ts|tsx|mts)$`), so tsc, eslint and vitest picked them up
+> with no config change at all, which is the difference between adding a file and moving one.
+
 **P5. `run.ts` ends under 500 lines.** A number to be wrong about out loud. The orchestrator keeps the case loop, the console report and the exit codes, and those are most of what makes it long today.
+
+> **WRONG (5.4b): 733 lines, down from 1303.** And the prediction was wrong for the reason it
+> named in its own second sentence, which is the annoying part. What came out was every
+> evaluator, both targets' case loops and the per-case types — 570 lines. What stayed is the
+> console report and the record writer, and those two are nearly 400 lines between them because
+> almost every line of them is a sentence explaining a number rather than computing one. Getting
+> under 500 would have meant a `report.ts`, and splitting a report away from the exit codes it
+> justifies is a change to how the run is assembled, which decision 7 puts outside this half.
 
 ---
 

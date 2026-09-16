@@ -1,11 +1,19 @@
 /**
- * Eval harness.
+ * Eval harness — the orchestrator.
  *
  *   npm run eval                deterministic metrics
- *   EVAL_JUDGE=1 npm run eval   + LLM faithfulness (see judge.ts)
+ *   EVAL_JUDGE=1 npm run eval   + LLM faithfulness (see evaluators/faithfulness.ts)
  *   EVAL_RUNS=0  npm run eval    retrieval-only: no ANSWER generation. It still pays one
  *                                planner call (gpt-4o-mini, structured output), one embed and
  *                                one rerank per sub-query — roughly a cent per run, not zero.
+ *
+ * Since 5.4b this file runs the suite and reports it; it does not decide anything. The layout:
+ *
+ *   datasets/    the labelled cases, and what each set claims (its denominators, its exit code)
+ *   evaluators/  pure functions over cases and results, the verdicts computed in code
+ *   targets/     the two pipelines a case can be run against
+ *   record.ts    what a run leaves on disk, and how an older one is read back
+ *   diff.ts      npm run eval:diff — what moved between two stored runs
  *
  * Per-case criteria, chosen so each measures the property that actually matters:
  *   RETRIEVAL RECALL     did the expected doc survive rerank + threshold?
@@ -16,21 +24,21 @@
  *
  * Two targets. The default runs the pipeline in-process (plannedRetrieve + generateText, the
  * functions the route calls). EVAL_TARGET=python sends every question to the Python agent
- * service over HTTP, as the route forwards it (evals/targets/agent-service.ts, step 2.6): same cases, same
- * criteria, same verdicts, and the differences that come with a service are reported, not hidden
- * (every run retrieves again; history is replayed as real turns; the judge reads the chunk texts
- * back from the trace, since the stream carries pages only; cost is MEASURED from the service's
- * own query_log rows).
+ * service over HTTP, as the route forwards it: same cases, same criteria, same verdicts, and the
+ * differences that come with a service are reported, not hidden (every run retrieves again;
+ * history is replayed as real turns; the judge reads the chunk texts back from the trace, since
+ * the stream carries pages only; cost is MEASURED from the service's own query_log rows).
+ * `targets/index.ts` lists what each one can and cannot measure.
  *
  *   EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval
  *
  * Refusal is detected against REFUSAL_MESSAGE, the same constant the prompt instructs —
  * reword it there and this follows, rather than silently scoring every refusal as an answer.
  *
- * Retrieval runs ONCE per case. It is *nearly* deterministic: embedding, vector search and
- * rerank are, but the planner's HyDE hypothetical is model output, and a different
- * hypothetical can reorder near-tied pages (the push gate retries a recall miss once, and
- * says so — see the RUNS === 0 block). Generation runs N times, because that is
+ * Retrieval runs ONCE per case on the in-process target. It is *nearly* deterministic:
+ * embedding, vector search and rerank are, but the planner's HyDE hypothetical is model output,
+ * and a different hypothetical can reorder near-tied pages (the push gate retries a recall miss
+ * once, and says so — see the RUNS === 0 block). Generation runs N times, because that is
  * where non-determinism lives: temp 0 lowers variance, it does not remove it. A case that
  * passes 2/3 is FLAKY, not passing. Adversarial cases run more times (an attack that works
  * 1-in-8 is a working attack). A parked, known-failing case is marked `expectFail`: it runs
@@ -50,41 +58,53 @@
  *
  * Exit codes: 0 green; 1 a real failure (a failing case, an unfaithful answer, a parked case
  * that now passes, a retrieval regression); 2 bad configuration; 3 the reranker was
- * unavailable, so the run measured a different pipeline; 4 at least one case could not run.
+ * unavailable, so the run measured a different pipeline; 4 at least one case could not run;
+ * 5 the golden set is green and the labelled GitHub set is not.
  */
 import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 
-import { generateText } from "ai";
-
-import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
-import { generationSettings, generationMessages } from "../lib/generation";
-import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
-import { CASES, type EvalCase } from "./datasets/golden";
-import { FROZEN_AT, GITHUB_CASES, containsAnswer, type GitHubCase } from "./datasets/github";
-import { judgeFaithfulness, type Verdict } from "./evaluators/faithfulness";
+import { isRefusal, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
+import { plannedRetrieve } from "../lib/plan";
+import { CASES } from "./datasets/golden";
+import { FROZEN_AT, GITHUB_CASES } from "./datasets/github";
+import {
+    aggregateFaithfulness,
+    erroredResult,
+    evaluateCoverage,
+    evaluateFalseRefusals,
+    evaluateGitHubAccuracy,
+    evaluateGitHubProcess,
+    evaluateGuardrails,
+    evaluateInjection,
+    evaluateRecall,
+    expectedFound,
+    githubVerdict,
+    partition,
+} from "./evaluators";
+import type { GitHubResult, GoldenContext, Result } from "./evaluators/types";
+import { runCaseInProcess } from "./targets/in-process";
+import {
+    judgeAgentRuns,
+    newAgentSession,
+    runCaseOnAgent,
+    runGitHubCases,
+    type AgentSession,
+} from "./targets/agent-run";
 import {
     agentTarget,
-    askAgent,
-    chunkCount,
     costOfThreads,
-    evalThreadId,
     historyFieldStatus,
-    pagesAsChunks,
-    topScore as pagesTopScore,
-    traceIdsOfThreads,
     turnFactsOfThreads,
-    type AgentReply,
     type AgentTarget,
     type RunCost,
     type TurnFacts,
 } from "./targets/agent-service";
-import { contextsByTrace, langfuseApi } from "./targets/langfuse-api";
-import { SCHEMA_VERSION } from "./record";
+import { formatRatio, SCHEMA_VERSION } from "./record";
 
 const RUNS = Number(process.env.EVAL_RUNS ?? 3);
 
-/** "ts" (default): the pipeline in-process. "python": the agent service over HTTP (targets/agent-service.ts). */
+/** "ts" (default): the pipeline in-process. "python": the agent service over HTTP. */
 const TARGET = process.env.EVAL_TARGET ?? "ts";
 if (TARGET !== "ts" && TARGET !== "python") {
     console.error(`EVAL_TARGET must be "ts" or "python", not "${TARGET}".`);
@@ -133,9 +153,6 @@ const JUDGE = process.env.EVAL_JUDGE === "1";
  */
 const GITHUB = process.env.EVAL_GITHUB !== "0";
 const GITHUB_RUNS = Number(process.env.EVAL_GITHUB_RUNS ?? 2);
-/** Case indices for the GitHub set, kept clear of the golden set so thread ids stay unique and
- *  a GitHub turn is recognisable in query_log by its thread id alone. */
-const GITHUB_INDEX_BASE = 1000;
 
 /** Widening the candidate pool costs latency on every production query. Price it. */
 const retrievalMs: number[] = [];
@@ -149,660 +166,42 @@ const retrievalMs: number[] = [];
 const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 250);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * Did the expected page survive rerank + threshold? `null` when the case has no expectation.
- * `expectedSource` may be one slug or several — any match satisfies the case (see dataset.ts
- * for why). One helper, used by the main pass and the push-gate retry, so both judge alike.
- */
-function expectedFound(c: { expectedSource?: string | string[] }, relevant: { source_url: string }[]): boolean | null {
-    if (!c.expectedSource) return null;
-    const wanted = Array.isArray(c.expectedSource) ? c.expectedSource : [c.expectedSource];
-    return relevant.some((r) => wanted.some((slug) => r.source_url.includes(slug)));
-}
-
-type Result = {
-    id: string;
-    intent: PlanIntent;  // what the planner decided; "search" is the only one that retrieves
-    degraded: boolean;   // reranker unavailable → cosine fallback; the run is not comparable
-    retrieved: string;   // expected doc present in the retrieved set?
-    chunks: number;      // how many chunks cleared the threshold and reached the model
-    topScore: string;
-    answered: number;    // how many runs produced an answer rather than a refusal
-    runs: number;
-    sample: string;      // first response, for eyeballing adversarial cases
-    /** The run that broke expectation (answered when it should refuse, or vice versa), if any. */
-    odd?: { i: number; text: string };
-    /** Run 1's thread id on the Python target, so the route the service recorded for this case
-     *  can be read back afterwards (db/009). Absent on the TypeScript target, which has no router. */
-    threadId?: string;
-    /** What the router chose on run 1: "docs", "both", or null for a turn the planner canned
-     *  before the router ever saw it. Step 3.6 records it per case because without it a
-     *  documentation question answered from GitHub is invisible in a stored result. */
-    route?: TurnFacts["route"];
-    faithful: string;    // judge verdict on the first answer, when EVAL_JUDGE=1
-    /** The claims behind a "NO", with the span the judge offered for each. Recorded so a
-     *  stored result can be inspected instead of re-run: without it a reader sees only
-     *  "NO" and has to pay for another judged run to find out whether it was real. */
-    faithfulDetail?: FailedClaim[];
-    /** ERROR: the case could not be RUN (infrastructure), which is not a verdict about the
-     *  pipeline. Kept out of the denominators and it makes the whole run incomplete. */
-    verdict: "PASS" | "FAIL" | "FLAKY" | "—" | "ERROR";
-    detail: string;
-    /** Why the case could not run, when it could not. Set exactly when verdict is ERROR. */
-    errored?: string;
-    /** Python target only: every run retrieves again, so recall has a per-run answer too. */
-    retrievedEvery?: "yes" | "NO" | "varied" | "—";
-    /** Python target only: in how many runs the expected page was retrieved. */
-    foundRuns?: number;
-};
-
-type FailedClaim = { claim: string; quote: string };
-
-/**
- * Report a NO verdict, and record what it rests on.
- *
- * `reasoning` is the model talking. It is NOT the verdict: judge.ts derives `supported` in
- * code from the quote check, claim by claim, after a second look. The two can and do
- * disagree - a run 1 verdict here came with prose calling the answer supported - and
- * reading the prose as the verdict has already produced one wrong conclusion. So the prose
- * is printed labelled as prose, and under it goes the evidence a reader can actually
- * check: the claim that failed, and the span the judge offered for it.
- */
-function reportUnfaithful(id: string, v: Verdict): FailedClaim[] {
-    const failed = v.checked
-        .filter((c) => c.found === false)
-        .map((c) => ({ claim: c.claim, quote: c.quote }));
-    console.log(`  UNFAITHFUL ${id}: ${failed.length} claim(s) with no verbatim support in the chunks`);
-    console.log(`      judge prose, not the verdict: ${v.reasoning}`);
-    for (const f of failed) {
-        console.log(`      unsupported: ${f.claim}`);
-        console.log(`          quote offered: ${f.quote ? f.quote.replace(/\s+/g, " ").slice(0, 220) : "(none)"}`);
-    }
-    return failed;
-}
-
-type Scored = {
-    answered: number;
-    firstAnswer: string;
-    leaked: Set<string>;
-    missed: Set<string>;
-    oddRun: { i: number; text: string } | null;
-};
-
-/**
- * Score a case's answers, one per run. Shared by both targets, so a verdict means the same thing
- * whichever pipeline produced the text.
- */
-function scoreRuns(c: EvalCase, texts: string[]): Scored {
-    let answered = 0;
-    // Forbidden strings are checked on EVERY run, not just the first. An injection that
-    // works one time in three is a working injection.
-    const leaked = new Set<string>();
-    // Required strings likewise: if ANY run omits one, the coverage is unreliable — a
-    // multi-part answer that only sometimes includes an intent is not passing.
-    const missed = new Set<string>();
-    // The run that broke expectation, when one did. `firstAnswer` is run 0, which is often
-    // a perfectly good refusal while run 2 is the one that got counted as "answered" — and
-    // printing only run 0 made a FLAKY verdict impossible to diagnose without guessing.
-    // Capture the first run whose refusal status disagrees with what the case expects.
-    let oddRun: { i: number; text: string } | null = null;
-
-    texts.forEach((text, i) => {
-        const refused = isRefusal(text);
-        if (!refused) answered++;
-        // shouldAnswer false + answered, or shouldAnswer true + refused, is the odd one out.
-        // "either" has no expectation about refusal, so it never produces an odd run.
-        if (!oddRun && c.shouldAnswer !== "either" && refused === c.shouldAnswer) oddRun = { i, text };
-
-        const lower = text.toLowerCase();
-        for (const forbidden of c.mustNotContain ?? []) {
-            if (lower.includes(forbidden.toLowerCase())) leaked.add(forbidden);
-        }
-        // Only require coverage on runs that actually answered — a legitimate refusal
-        // cannot be expected to contain answer content.
-        if (!refused) {
-            for (const required of c.mustContain ?? []) {
-                if (!lower.includes(required.toLowerCase())) missed.add(required);
-            }
-        }
-    });
-    return { answered, firstAnswer: texts[0] ?? "", leaked, missed, oddRun };
-}
-
-/** Verdict and detail line from the scored runs: the same rules for both targets. */
-function verdictOf(c: EvalCase, runs: number, s: Scored, found: boolean | null): Pick<Result, "verdict" | "detail"> {
-    // "either" means answer-vs-refuse is not the criterion for this case; only leaks are.
-    const expected = c.shouldAnswer === "either" ? s.answered : c.shouldAnswer ? runs : 0;
-    let verdict: Result["verdict"] =
-        s.answered === expected ? "PASS" : s.answered === runs - expected ? "FAIL" : "FLAKY";
-
-    // A leak or a missed required string overrides answer-vs-refuse. inj-piggyback is
-    // SUPPOSED to answer, so "answered 3/3" tells you nothing about whether the injection
-    // worked — only the string checks can. Same for coverage: multi-intent-noise answers,
-    // but dropping an intent means mustContain missed.
-    if (s.leaked.size > 0 || s.missed.size > 0) verdict = "FAIL";
-
-    // Retrieval succeeding while generation fails is the interesting failure —
-    // it is exactly the parked bug, and it is invisible without both metrics.
-    const detail =
-        s.leaked.size > 0
-            ? `LEAKED: ${[...s.leaked].join(", ")}`
-            : s.missed.size > 0
-                ? `MISSING: ${[...s.missed].join(", ")}`
-                : verdict === "PASS"
-                ? ""
-                : found === true && c.shouldAnswer
-                    ? "retrieval OK, generation refused"
-                    : found === false
-                        ? "expected doc not retrieved"
-                        : `answered ${s.answered}/${runs}, expected ${expected}`;
-    return { verdict, detail };
-}
-
-/**
- * A case that could not be RUN: the database gateway timed out, a connection dropped, a
- * provider was down. Deliberately NOT scored as a failure. The pipeline said nothing about
- * this case, and recording silence as a wrong answer is how a red run stops meaning anything.
- */
-function erroredResult(c: EvalCase, err: unknown): Result {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-        id: c.id,
-        intent: "search",
-        degraded: false,
-        retrieved: "—",
-        chunks: 0,
-        topScore: "—",
-        answered: 0,
-        runs: 0,
-        sample: "",
-        faithful: "—",
-        verdict: "ERROR",
-        detail: message,
-        errored: message,
-    };
-}
-
-async function runCase(c: EvalCase): Promise<Result> {
-    const t0 = performance.now();
-    const { relevant, mode, intent, subQueries } = await plannedRetrieve(c.query, c.history ?? []);
-    retrievalMs.push(performance.now() - t0);
-
-    // greeting / off-topic are answered by the pipeline without a model call — the route
-    // writes the fixed text straight to the stream. The harness mirrors that exactly, so a
-    // canned reply is scored the same way it is served.
-    const canned =
-        intent === "greeting" ? GREETING_MESSAGE : intent === "off-topic" ? REFUSAL_MESSAGE : null;
-
-    // Plan-and-execute, execute half: generation answers the planner's RESOLVED sub-queries.
-    // The settings and the swap live in lib/generation.ts, shared with the route and the
-    // judge calibration — one code path (invariants #3 and #4), not three kept in sync.
-    const history = (c.history ?? []).map((h) => ({ role: h.role, content: h.text }));
-    const degraded = mode === "cosine-fallback";
-    if (degraded) console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
-
-    const found = expectedFound(c, relevant);
-
-    const chunks = relevant.length;
-    const topScore = chunks ? relevant[0].score.toFixed(3) : "—";
-
-    // EVAL_RUNS=0 → retrieval-only diagnostic. No answer generation (planner + retrieval ran).
-    if (RUNS === 0) {
-        // Inspect the data, don't trust the count: a guardrail is only useful if the
-        // chunks reaching the model look plausible enough to tempt it.
-        console.log(`  ${c.id}`);
-        if (intent !== "search") console.log(`      planner → [${intent}]`);
-        else if (subQueries.length > 1 || (subQueries[0] && subQueries[0] !== c.query))
-            console.log(`      planner → ${JSON.stringify(subQueries)}`);
-        for (const r of relevant) console.log(`      ${r.score.toFixed(3)}  ${r.title}`);
-        if (!relevant.length) console.log(intent === "search" ? "      (nothing cleared the threshold)" : "      (retrieval skipped)");
-        return { id: c.id, intent, degraded, retrieved: found === null ? "—" : found ? "yes" : "NO", chunks, topScore, answered: 0, runs: 0, sample: "", faithful: "—", verdict: "—", detail: "" };
-    }
-
-    const runs = c.injection ? ADVERSARIAL_RUNS : RUNS;
-
-    // Multi-turn cases replay their history before the query. Retrieval above still
-    // used c.query alone, matching production, which embeds only the latest message.
-    // The final user turn is the planner's RESOLVED question, not the raw message.
-    const texts: string[] = [];
-    for (let i = 0; i < runs; i++) {
-        texts.push(
-            canned ??
-                (
-                    await generateText({
-                        ...generationSettings(relevant),
-                        messages: generationMessages(history, c.query, subQueries),
-                    })
-                ).text
-        );
-    }
-    const scored = scoreRuns(c, texts);
-    const { answered, firstAnswer } = scored;
-
-    // Judge only answered cases: a refusal contains no claims to be unfaithful about.
-    // One judgement per case, not per run — generation varies, but not usually in
-    // whether it stayed grounded, and this keeps the cost linear in cases.
-    let faithful = "—";
-    let faithfulDetail: FailedClaim[] | undefined;
-    if (JUDGE && answered > 0 && !isRefusal(firstAnswer)) {
-        const v = await judgeFaithfulness(c.query, relevant, firstAnswer);
-        faithful = v.supported ? "yes" : "NO";
-        if (!v.supported) faithfulDetail = reportUnfaithful(c.id, v);
-    }
-
-    const { verdict, detail } = verdictOf(c, runs, scored, found);
-
-    if (verdict !== "PASS" && !canned && relevant.length) {
-        console.log(`      [context] ${relevant.length} chunks:`);
-        for (const r of relevant)
-            console.log(`        ${r.score.toFixed(3)} ${r.title}: ${r.content.replace(/\s+/g, " ").slice(0, 130)}`);
-    }
-
-    return {
-        id: c.id,
-        intent,
-        degraded,
-        retrieved: found === null ? "—" : found ? "yes" : "NO",
-        chunks,
-        topScore,
-        answered,
-        runs,
-        sample: firstAnswer,
-        ...(scored.oddRun ? { odd: scored.oddRun } : {}),
-        faithful,
-        ...(faithfulDetail ? { faithfulDetail } : {}),
-        verdict,
-        detail,
-    };
-}
-
-// ── The Python target (EVAL_TARGET=python) ─────────────────────────────────────
-
-/**
- * Python target: timings per request for the case's own question (not the replayed turns), kept
- * apart by path. A greeting or off-topic reply streams everything at once right after the planner,
- * so its "first token" is its retrieval time; mixed into one median with answered requests
- * (63 of the 121 requests in a full run are canned) the median described the canned path.
- */
-const agentMs = {
-    answered: { retrieval: [] as number[], firstToken: [] as number[], total: [] as number[] },
-    canned: { total: [] as number[] },
-};
-/** Every thread the run used, and how many completed turns the service should have logged. */
-const agentThreads: string[] = [];
-let agentTurns = 0;
-/**
- * The GitHub set's threads, kept OUT of agentThreads on purpose. costOfThreads over those two
- * arrays is the suite's cost per request, which is a series: $0.1972 local, $0.1972 on AWS,
- * $0.2022 with the router, $0.2042 with the planner paragraph. Folding thirteen subagent turns
- * into it would break the series at the exact moment it is most worth reading, and would price
- * two different populations as one. The GitHub set gets its own line instead.
- */
-const githubThreads: string[] = [];
-let githubTurns = 0;
-/** Identifies this run's threads in query_log: a timestamp plus a little randomness. */
-const RUN_STAMP = new Date().toISOString().replace(/[-:]/g, "").slice(0, 15) + Math.random().toString(16).slice(2, 6);
-// When the run started, minus a minute of clock skew: the window the judge asks Langfuse for.
-const RUN_STARTED = new Date(Date.now() - 60_000);
-
-/**
- * One case against the service. Each run is a fresh thread: the case's earlier user turns are
- * sent first as real turns (the service takes no history, a `history` field is a 422), then the
- * query. Each run plans and retrieves again, so recall is recorded per run.
- */
-async function runCaseOnAgent(target: AgentTarget, c: EvalCase, index: number): Promise<Result> {
-    const runs = c.injection ? ADVERSARIAL_RUNS : RUNS;
-    const replies: AgentReply[] = [];
-    let replayed: AgentReply[] = [];
-    for (let i = 0; i < runs; i++) {
-        const threadId = evalThreadId(RUN_STAMP, index, i);
-        agentThreads.push(threadId);
-        const earlier: AgentReply[] = [];
-        for (const turn of c.history ?? []) {
-            if (turn.role !== "user") continue;
-            const reply = await askAgent(target, threadId, turn.text);
-            if (reply.error) throw new Error(`${c.id}: replaying an earlier turn failed on thread ${threadId}`);
-            agentTurns++;
-            earlier.push(reply);
-        }
-        if (i === 0) replayed = earlier;
-        const reply = await askAgent(target, threadId, c.query);
-        if (!reply.error) agentTurns++;
-        replies.push(reply);
-        // The TS target measures one retrieval per case, canned cases included: run 1 here is the
-        // same population, so the headline latency line compares like with like.
-        if (i === 0 && reply.ms.retrieval !== null) retrievalMs.push(reply.ms.retrieval);
-        if (reply.error) continue;
-        if (reply.intent === "search") {
-            if (reply.ms.retrieval !== null) agentMs.answered.retrieval.push(reply.ms.retrieval);
-            if (reply.ms.firstToken !== null) agentMs.answered.firstToken.push(reply.ms.firstToken);
-            agentMs.answered.total.push(reply.ms.total);
-        } else {
-            agentMs.canned.total.push(reply.ms.total);
-        }
-    }
-
-    const first = replies[0];
-    const degraded = [...replayed, ...replies].some((r) => r.mode === "cosine-fallback");
-    if (degraded) console.log(`  !! ${c.id}: reranker unavailable, cosine fallback`);
-    const foundPerRun = replies.map((r) => expectedFound(c, pagesAsChunks(r.pages)));
-    const found = foundPerRun[0];
-    const foundRuns = foundPerRun.filter((f) => f === true).length;
-    const retrievedEvery =
-        found === null ? "—" : foundRuns === runs ? "yes" : foundRuns === 0 ? "NO" : "varied";
-
-    // Look, don't guess: what the conversation actually was, since it is not the dataset's text.
-    if (replayed.length) {
-        console.log(`  ${c.id}: earlier turns replayed on the service (run 1), its own replies:`);
-        for (const r of replayed) console.log(`      ↳ ${r.text.replace(/\s+/g, " ").slice(0, 110)}`);
-    }
-
-    const scored = scoreRuns(c, replies.map((r) => r.text));
-    let { verdict, detail } = verdictOf(c, runs, scored, found);
-    // A stream that failed produced no answer to score; it is a failure of the run, not a refusal.
-    const errors = replies.filter((r) => r.error).length;
-    if (errors) {
-        verdict = "FAIL";
-        detail = `STREAM ERROR in ${errors}/${runs} runs (the service logged the cause)`;
-    }
-    if (verdict !== "PASS" && first.pages.length) {
-        console.log(`      [pages, run 1] ${chunkCount(first.pages)} chunks:`);
-        for (const p of first.pages) console.log(`        ${p.score.toFixed(3)} ${p.title}  (chunks ${p.chunks.join(", ")})`);
-    }
-
-    const top = pagesTopScore(first.pages);
-    return {
-        id: c.id,
-        threadId: evalThreadId(RUN_STAMP, index, 0),
-        intent: first.intent,
-        degraded,
-        retrieved: found === null ? "—" : found ? "yes" : "NO",
-        retrievedEvery,
-        foundRuns,
-        chunks: chunkCount(first.pages),
-        topScore: top === null ? "—" : top.toFixed(3),
-        answered: scored.answered,
-        runs,
-        sample: scored.firstAnswer,
-        ...(scored.oddRun ? { odd: scored.oddRun } : {}),
-        faithful: "—",
-        verdict,
-        detail,
-    };
-}
-
-/**
- * Faithfulness on the Python target, judged AFTER the run from the traces (step 2.7).
- *
- * On the TypeScript target the chunks are in hand while the case runs, so the judge is called
- * there. Over HTTP the harness never sees a chunk text: the stream carries pages. So run 1 of
- * every case that answered is looked up in two hops - thread id to trace id on the query_log row
- * (db/007_trace_id.sql), trace id to the `context` observation the service wrote - and judged
- * with the chunks the prompt was actually built from.
- *
- * One judgement per case, run 1, exactly as on the other target: generation varies between runs,
- * but not usually in whether it stayed inside its sources, and this keeps the cost linear.
- *
- * A case whose trace never arrives is REPORTED, never judged as an answer with no sources: an
- * observability gap must not become a faithfulness failure.
- */
-async function judgeAgentRuns(results: Result[], active: EvalCase[]): Promise<void> {
-    const byId = new Map(results.map((r) => [r.id, r]));
-    const threads = new Map<string, EvalCase>();
-    active.forEach((c, i) => {
-        const r = byId.get(c.id);
-        // Same gate as the TS path: a refusal has no claims to be unfaithful about, and a
-        // greeting or off-topic reply retrieved nothing, so it has no `context` span either.
-        if (!r || r.intent !== "search" || r.answered === 0 || isRefusal(r.sample)) return;
-        threads.set(evalThreadId(RUN_STAMP, i, 0), c);
-    });
-    if (!threads.size) return;
-
-    const traces = await traceIdsOfThreads([...threads.keys()]);
-    const judged = new Map<string, EvalCase>();
-    for (const [threadId, c] of threads) {
-        const traceId = traces.get(threadId);
-        if (traceId) judged.set(traceId, c);
-    }
-    if (!judged.size) {
-        console.log("\nfaithfulness skipped: the run's rows carry no trace id — were the service's Langfuse keys set?");
-        return;
-    }
-
-    const contexts = await contextsByTrace(langfuseApi(), RUN_STARTED, new Set(judged.keys()));
-    let missing = 0;
-    for (const [traceId, c] of judged) {
-        const chunks = contexts.get(traceId);
-        if (!chunks) {
-            missing++;
-            continue;
-        }
-        const r = byId.get(c.id)!;
-        const v = await judgeFaithfulness(c.query, chunks, r.sample);
-        r.faithful = v.supported ? "yes" : "NO";
-        if (!v.supported) r.faithfulDetail = reportUnfaithful(c.id, v);
-    }
-    if (missing) {
-        console.log(`\nfaithfulness: ${missing}/${judged.size} traces had no context observation in time — not judged, and not counted`);
-    }
-}
-
 const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 const ms = (xs: number[]) => (xs.length ? `${median(xs).toFixed(0)}ms` : "—");
 
 // ---- the GitHub labelled set (step 3.6) ------------------------------------------------------
 
-type GitHubRun = {
-    threadId: string;
-    text: string;
-    intent: PlanIntent;
-    /** For the compound case: was the documentation page there too? null when the case has none. */
-    pageFound: boolean | null;
-    error: string | null;
-};
-
-type GitHubResult = {
-    id: string;
-    label: GitHubCase["route"];
-    runs: number;
-    correct: number;
-    routes: TurnFacts["route"][];
-    routedRight: number;
-    /** Turns the PLANNER canned before the router existed for them. Not a routing mistake: a
-     *  turn that was never routed. 3.5 found three of three repository questions ending here. */
-    canned: number;
-    /** Turns that came back with a subagent block at all. */
-    subagentRuns: number;
-    firstTryValid: number;
-    ok: number;
-    points: number[];
-    attempts: number[];
-    repairs: number[];
-    /** How many type lookups the subagent spent before writing, and which gate each attempt met.
-     *  Recorded from 3.6b so a change in accuracy can be read against a change in BEHAVIOUR: a
-     *  model that writes from memory and one that reads the schema first can produce the same
-     *  query, and only these two say which happened. */
-    lookups: number[];
-    stages: string[][];
-    typesRead: string[][];
-    verdict: "PASS" | "FAIL" | "VARIED" | "ERROR";
-    detail: string;
-    sample: string;
-    query: string | null;
-    evidence: string | null;
-};
-
 /**
- * Did the answer decline, rather than assert something?
+ * The five measures of the 3.6 done-when, printed and returned for the results file.
  *
- * Only the control case is scored with this, and it is the one criterion in the set that is
- * openly approximate. isRefusal alone is not enough here: it is positional (invariant 5) and 3.5
- * watched it read an answered turn as refused when a GitHub answer opened with the refusal
- * sentence. A model that declines in its own words is also correct, so both shapes count, and
- * the control's sample is printed on every run whatever the verdict — the criterion is the thing
- * most likely to be wrong, so it is the thing kept under the eye.
- */
-function declined(text: string): boolean {
-    return (
-        isRefusal(text) ||
-        /\b(cannot|can't|can not|unable to|do(es)? not (provide|have|record)|no (historical|record|data))\b/i.test(text)
-    );
-}
-
-function answeredCorrectly(c: GitHubCase, run: GitHubRun): boolean {
-    if (run.error) return false;
-    if (!c.shouldAnswer) return declined(run.text);
-    if (!containsAnswer(run.text, c.answerContains ?? [])) return false;
-    // The compound case is the only test of the claim that `both` means both, so a right date
-    // with the documentation half missing is not a pass.
-    return run.pageFound !== false;
-}
-
-/**
- * Run the labelled set, then read back what the service recorded for each turn.
- *
- * The facts come from query_log and not from the stream: decision 12, and the reason is that the
- * stream is a product surface. Every measure below except answer accuracy is computed from the
- * block db/010 stores, and answer accuracy is computed from the text, which is the whole point of
- * having it — 3.5b's turn had four perfect counters and no answer in it.
- */
-async function runGitHubCases(target: AgentTarget): Promise<GitHubResult[]> {
-    const cases = ONLY.length ? GITHUB_CASES.filter((c) => ONLY.includes(c.id)) : GITHUB_CASES;
-    if (!cases.length) return [];
-    console.log(
-        `\nGitHub set: ${cases.length} labelled questions x ${GITHUB_RUNS} runs  |  answers frozen ${FROZEN_AT}\n` +
-        `  (a per-case rate at n=${GITHUB_RUNS} is not a rate; a case that differs between its runs is VARIED)\n`
-    );
-
-    const runsByCase = new Map<string, GitHubRun[]>();
-    for (const [i, c] of cases.entries()) {
-        const runs: GitHubRun[] = [];
-        for (let run = 0; run < GITHUB_RUNS; run++) {
-            const threadId = evalThreadId(RUN_STAMP, GITHUB_INDEX_BASE + i, run);
-            githubThreads.push(threadId);
-            let reply: AgentReply;
-            try {
-                reply = await askAgent(target, threadId, c.query);
-            } catch (err) {
-                runs.push({ threadId, text: "", intent: "search", pageFound: null, error: String(err) });
-                continue;
-            }
-            if (!reply.error) githubTurns++;
-            runs.push({
-                threadId,
-                text: reply.text,
-                intent: reply.intent,
-                pageFound: c.expectedSource ? expectedFound(c, pagesAsChunks(reply.pages)) : null,
-                error: reply.error,
-            });
-            await sleep(RERANK_INTERVAL_MS);
-        }
-        runsByCase.set(c.id, runs);
-    }
-
-    // The rows land in the background after each turn, same as the cost and trace rows.
-    const facts = await turnFactsOfThreads(githubThreads);
-
-    const results: GitHubResult[] = [];
-    for (const c of cases) {
-        const runs = runsByCase.get(c.id)!;
-        const blocks = runs.map((r) => facts.get(r.threadId) ?? null);
-        const withBlock = blocks.filter((f) => f?.github).map((f) => f!.github!);
-        const correct = runs.filter((r) => answeredCorrectly(c, r)).length;
-        const routes = blocks.map((f) => f?.route ?? null);
-        const errored = runs.filter((r) => r.error).length;
-
-        let verdict: GitHubResult["verdict"];
-        let detail: string;
-        if (errored === runs.length) {
-            verdict = "ERROR";
-            detail = `could not run: ${runs[0].error}`;
-        } else if (correct === runs.length) {
-            verdict = "PASS";
-            detail = c.shouldAnswer ? "the frozen answer is in every run" : "declined in every run";
-        } else if (correct === 0) {
-            verdict = "FAIL";
-            detail = routes.every((r) => r === null)
-                ? "the planner canned it: never routed, never asked"
-                : withBlock.length === 0
-                  ? "routed, but no GitHub evidence came back"
-                  : withBlock.every((b) => b.ok)
-                    ? "the query ran and the answer is not in it"
-                    : "the subagent could not get a query through";
-        } else {
-            verdict = "VARIED";
-            detail = `${correct}/${runs.length} runs carried the frozen answer`;
-        }
-
-        results.push({
-            id: c.id,
-            label: c.route,
-            runs: runs.length,
-            correct,
-            routes,
-            routedRight: routes.filter((r) => r === c.route).length,
-            canned: routes.filter((r) => r === null).length,
-            subagentRuns: withBlock.length,
-            firstTryValid: withBlock.filter((b) => b.first_try_valid).length,
-            ok: withBlock.filter((b) => b.ok).length,
-            points: withBlock.map((b) => b.points_spent),
-            attempts: withBlock.map((b) => b.attempts),
-            repairs: withBlock.map((b) => b.repairs),
-            lookups: withBlock.map((b) => b.lookups),
-            stages: withBlock.map((b) => b.stages),
-            typesRead: withBlock.map((b) => b.types_read ?? []),
-            verdict,
-            detail,
-            sample: runs[0].text,
-            query: withBlock[0]?.query ?? null,
-            evidence: withBlock[0]?.evidence ?? null,
-        });
-    }
-    return results;
-}
-
-/**
- * The five measures of the done-when, printed and returned for the results file.
- *
- * Routing accuracy is computed over the turns that WERE routed, from both sets: the golden set
- * supplies the `docs` label and the labelled set the `both` label. Turns the planner canned are
- * counted on their own line rather than scored, because db/009 is explicit that a null route is
- * not a route to the documentation — and because 3.5 found the planner throwing away three of
- * three repository questions before the router existed for them, which is a different defect
- * with a different fix.
+ * The numbers come from the two evaluators; this prints them and shapes the record. That split
+ * is the point of 5.4b: `evaluateGitHubAccuracy` reads the TEXT and `evaluateGitHubProcess`
+ * reads the blocks the service stored, and at the 3.6 baseline the second was at ceiling while
+ * the first was 24 of 52. A suite of validity and cost would have reported that subagent as
+ * working — which is the whole argument for a labelled set, and it landed on the first run.
  */
 function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, unknown> {
-    const sum = (ns: number[]) => ns.reduce((a, b) => a + b, 0);
+    // A case that could not RUN is not evidence about the subagent, same rule as the golden set.
     const ran = results.filter((r) => r.verdict !== "ERROR");
-    const observations = sum(ran.map((r) => r.runs));
-    const accuracy = sum(ran.map((r) => r.correct));
-    const subagent = sum(ran.map((r) => r.subagentRuns));
-    const firstTry = sum(ran.map((r) => r.firstTryValid));
-    const ok = sum(ran.map((r) => r.ok));
-    const points = ran.flatMap((r) => r.points);
-    const cannedTurns = sum(ran.map((r) => r.canned));
+    const accuracy = evaluateGitHubAccuracy(ran);
+    const measures = evaluateGitHubProcess(ran, docs);
+    const { routing, points } = measures;
 
-    // Both sets, one number. The golden set's label is `docs` for every case in it.
-    const docsRouted = docs.filter((r) => r.route === "docs" || r.route === "both" || r.route === "github");
-    const docsRight = docsRouted.filter((r) => r.route === "docs").length;
-    const githubRouted = sum(ran.map((r) => r.runs - r.canned));
-    const githubRight = sum(ran.map((r) => r.routedRight));
-
-    console.log(`\nGitHub set — the five measures (${observations} observations over ${ran.length} cases)`);
-    console.log(`  answer accuracy         ${accuracy}/${observations}`);
-    console.log(`  first-try query valid   ${firstTry}/${subagent}   (of the turns whose subagent ran)`);
-    console.log(`  valid after <= 2 repairs ${ok}/${subagent}`);
+    console.log(`\nGitHub set — the five measures (${measures.observations} observations over ${ran.length} cases)`);
+    console.log(`  answer accuracy         ${formatRatio(accuracy)}`);
+    console.log(`  first-try query valid   ${formatRatio(measures.firstTryValid)}   (of the turns whose subagent ran)`);
+    console.log(`  valid after <= 2 repairs ${formatRatio(measures.validAfterRepairs)}`);
     console.log(
-        `  points per question     median ${points.length ? median(points) : "—"}` +
-        `  max ${points.length ? Math.max(...points) : "—"}  total ${sum(points)}`
+        `  points per question     median ${points.median ?? "—"}` +
+        `  max ${points.max ?? "—"}  total ${points.total}`
     );
     console.log(
-        `  routing accuracy        ${githubRight + docsRight}/${githubRouted + docsRouted.length}` +
-        `  (GitHub set ${githubRight}/${githubRouted}, golden set ${docsRight}/${docsRouted.length})`
+        `  routing accuracy        ${formatRatio(routing.overall)}` +
+        `  (GitHub set ${formatRatio(routing.githubSet)}, golden set ${formatRatio(routing.goldenSet)})`
     );
-    if (cannedTurns) {
+    if (routing.cannedByPlanner) {
         console.log(
-            `  canned by the planner   ${cannedTurns} turn(s) never reached the router. Not scored as routing:\n` +
+            `  canned by the planner   ${routing.cannedByPlanner} turn(s) never reached the router. Not scored as routing:\n` +
             `                          a turn that was never routed is not a turn routed to the documentation.`
         );
     }
@@ -826,20 +225,16 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
     return {
         frozenAt: FROZEN_AT,
         runs: GITHUB_RUNS,
-        observations,
-        accuracy: `${accuracy}/${observations}`,
-        firstTryValid: `${firstTry}/${subagent}`,
-        validAfterRepairs: `${ok}/${subagent}`,
-        points: {
-            median: points.length ? median(points) : null,
-            max: points.length ? Math.max(...points) : null,
-            total: sum(points),
-        },
+        observations: measures.observations,
+        accuracy: formatRatio(accuracy),
+        firstTryValid: formatRatio(measures.firstTryValid),
+        validAfterRepairs: formatRatio(measures.validAfterRepairs),
+        points: { median: points.median, max: points.max, total: points.total },
         routing: {
-            overall: `${githubRight + docsRight}/${githubRouted + docsRouted.length}`,
-            githubSet: `${githubRight}/${githubRouted}`,
-            goldenSet: `${docsRight}/${docsRouted.length}`,
-            cannedByPlanner: cannedTurns,
+            overall: formatRatio(routing.overall),
+            githubSet: formatRatio(routing.githubSet),
+            goldenSet: formatRatio(routing.goldenSet),
+            cannedByPlanner: routing.cannedByPlanner,
         },
         cases: results.map((r) => ({
             id: r.id,
@@ -862,6 +257,52 @@ function reportGitHub(results: GitHubResult[], docs: Result[]): Record<string, u
     };
 }
 
+/**
+ * Run the labelled set and score it per case.
+ *
+ * The runner (targets/agent-run.ts) produces observations; the verdict rules live in
+ * evaluators/github-answer.ts. This assembles the two into the per-case record the report and
+ * the results file both read.
+ */
+async function githubResults(session: AgentSession): Promise<GitHubResult[]> {
+    const cases = ONLY.length ? GITHUB_CASES.filter((c) => ONLY.includes(c.id)) : GITHUB_CASES;
+    if (!cases.length) return [];
+    console.log(
+        `\nGitHub set: ${cases.length} labelled questions x ${GITHUB_RUNS} runs  |  answers frozen ${FROZEN_AT}\n` +
+        `  (a per-case rate at n=${GITHUB_RUNS} is not a rate; a case that differs between its runs is VARIED)\n`
+    );
+
+    const observed = await runGitHubCases(session, cases, GITHUB_RUNS, RERANK_INTERVAL_MS);
+    return observed.map((o) => {
+        const withBlock = o.blocks.filter((f) => f?.github).map((f) => f!.github!);
+        const routes = o.blocks.map((f) => f?.route ?? null);
+        const { verdict, detail } = githubVerdict(o.case, o.runs, routes, withBlock, o.correct);
+        return {
+            id: o.case.id,
+            label: o.case.route,
+            runs: o.runs.length,
+            correct: o.correct,
+            routes,
+            routedRight: routes.filter((r) => r === o.case.route).length,
+            canned: routes.filter((r) => r === null).length,
+            subagentRuns: withBlock.length,
+            firstTryValid: withBlock.filter((b) => b.first_try_valid).length,
+            ok: withBlock.filter((b) => b.ok).length,
+            points: withBlock.map((b) => b.points_spent),
+            attempts: withBlock.map((b) => b.attempts),
+            repairs: withBlock.map((b) => b.repairs),
+            lookups: withBlock.map((b) => b.lookups),
+            stages: withBlock.map((b) => b.stages),
+            typesRead: withBlock.map((b) => b.types_read ?? []),
+            verdict,
+            detail,
+            sample: o.runs[0].text,
+            query: withBlock[0]?.query ?? null,
+            evidence: withBlock[0]?.evidence ?? null,
+        };
+    });
+}
+
 async function main() {
     // Duplicate ids fail silently otherwise: byId is a Map, so a second case with the same
     // id overwrites the first in the summary while both still run and both still cost money.
@@ -877,6 +318,7 @@ async function main() {
     );
 
     let target: AgentTarget | null = null;
+    let session: AgentSession | null = null;
     let historyRefused: number | null = null;
     if (TARGET === "python") {
         // The service always answers, so there is no retrieval-only mode to be had over HTTP.
@@ -886,9 +328,10 @@ async function main() {
             process.exit(2);
         }
         target = agentTarget();
-        console.log(`target: the Python agent service at ${target.baseUrl}  (every run = plan + retrieve + answer, origin eval, threads eval-${RUN_STAMP}-*)\n`);
+        session = newAgentSession(target);
+        console.log(`target: the Python agent service at ${target.baseUrl}  (every run = plan + retrieve + answer, origin eval, threads eval-${session.runStamp}-*)\n`);
         // Checked once, before any case: the forged-history attack depends on it.
-        historyRefused = await historyFieldStatus(target, `eval-${RUN_STAMP}-history-check`);
+        historyRefused = await historyFieldStatus(target, `eval-${session.runStamp}-history-check`);
         if (historyRefused !== 422) {
             console.log(`✗ POST /chat accepted a request carrying history (status ${historyRefused}, expected 422). The service reads history only from its thread; stop and look.`);
             process.exit(1);
@@ -905,7 +348,21 @@ async function main() {
         let r: Result;
         try {
             if (FAULT.includes(c.id)) throw new Error("Retrieval failed: Gateway Timeout (EVAL_FAULT)");
-            r = target ? await runCaseOnAgent(target, c, i) : await runCase(c);
+            if (session) {
+                const outcome = await runCaseOnAgent(session, c, i, {
+                    runs: RUNS,
+                    adversarialRuns: ADVERSARIAL_RUNS,
+                    rerankIntervalMs: RERANK_INTERVAL_MS,
+                });
+                // The in-process target measures one retrieval per case, canned cases included: run 1
+                // here is the same population, so the headline latency line compares like with like.
+                if (outcome.retrievalMs !== null) retrievalMs.push(outcome.retrievalMs);
+                r = outcome.result;
+            } else {
+                const outcome = await runCaseInProcess(c, { runs: RUNS, adversarialRuns: ADVERSARIAL_RUNS, judge: JUDGE });
+                retrievalMs.push(outcome.retrievalMs);
+                r = outcome.result;
+            }
         } catch (err) {
             r = erroredResult(c, err);
             console.log(`  ERROR ${c.id.padEnd(22)} could not run: ${r.detail}`);
@@ -940,12 +397,12 @@ async function main() {
         }
     }
 
-    if (target && JUDGE) await judgeAgentRuns(results, active);
+    if (session && JUDGE) await judgeAgentRuns(session, results, active, isRefusal);
 
     // What the router decided for each golden-set case, read back from the rows the service
     // wrote (db/009). Recorded per case because without it a documentation question answered
     // from GitHub is invisible in a stored result -- which is how 3.5's `changed-7` passed.
-    if (target) {
+    if (session) {
         const threads = results.map((r) => r.threadId).filter((t): t is string => Boolean(t));
         const facts = threads.length ? await turnFactsOfThreads(threads) : new Map<string, TurnFacts>();
         for (const r of results) r.route = r.threadId ? (facts.get(r.threadId)?.route ?? null) : null;
@@ -955,7 +412,7 @@ async function main() {
     }
 
     let github: GitHubResult[] = [];
-    if (target && GITHUB) github = await runGitHubCases(target);
+    if (session && GITHUB) github = await githubResults(session);
 
     const byId = new Map(results.map((r) => [r.id, r]));
     // A case that could not run is not evidence about the pipeline, so it is kept out of every
@@ -963,7 +420,6 @@ async function main() {
     // scoring it drags a number down and reads as a regression that did not happen. It cannot
     // hide anything, because a single errored case makes the WHOLE run incomplete below.
     const errored = results.filter((r) => r.verdict === "ERROR");
-    const ran = (c: EvalCase) => byId.get(c.id)!.verdict !== "ERROR";
     // Called after the real-failure exits in both modes: a genuine failure is still exit 1 and
     // still the headline. Exit 4 means nothing failed, but not everything was measured.
     const reportIncomplete = () => {
@@ -991,42 +447,26 @@ async function main() {
         }))
     );
 
-    // Injection cases are counted on their own axis. Several are also guardrails by
-    // shouldAnswer, but "did it refuse an out-of-corpus question" and "did it resist an
-    // instruction to disobey" are different properties and deserve separate numbers.
-    // expectFail (parked, known-failing) cases are excluded from every headline metric and
-    // reported on their own line — otherwise a documented, deferred bug drags coverage
-    // below 5/5 and reads as a regression.
-    const injections = active.filter((c) => c.injection && !c.expectFail && ran(c));
-    const answerable = active.filter((c) => c.shouldAnswer === true && !c.injection && !c.expectFail && ran(c));
-    const guardrails = active.filter((c) => c.shouldAnswer === false && !c.injection && !c.expectFail && ran(c));
-    const parked = active.filter((c) => c.expectFail);
+    // THE POPULATIONS, decided once. Who counts toward which denominator is the half of a
+    // fraction that is easiest to change by accident, and until 5.4b the rules were four filter
+    // expressions inline here, each re-spelling the exclusions for itself. The rules and the
+    // reasons now live in evaluators/partition.ts and evaluators/types.ts.
+    const populations = partition(active, byId);
+    const { answerable, parked } = populations;
+    const ctx: GoldenContext = {
+        active,
+        results,
+        byId,
+        populations,
+        generated: RUNS > 0,
+        perRunRetrieval: session !== null,
+    };
 
-    const coverage = answerable.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
-    const held = guardrails.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
-    const recall = answerable.filter((c) => byId.get(c.id)!.retrieved === "yes").length;
-    // Python target: each run retrieved again. "Every run" counts a case only if the expected page
-    // came back in all of its runs; the ones that varied are named.
-    const recallEvery = answerable.filter((c) => byId.get(c.id)!.retrievedEvery === "yes").length;
-    const varied = answerable.filter((c) => byId.get(c.id)!.retrievedEvery === "varied");
-
-    // FALSE REFUSALS. Recall is PAGE-level — `expectedSource` names a page, so ANY chunk of it
-    // counts as "retrieved". A case can therefore report recall 12/12 and still refuse, because
-    // the chunk that survived carried none of the answer. changed-7 did exactly that on Day 15:
-    // the migration page's intro chunk ("use the command below to add the migration skill") made
-    // the top 5 and none of the substantive ones did, so the model correctly refused a question
-    // the corpus answers. That is the most expensive failure this project can have — the whole
-    // point is grounded answers, not silence — and reporting it only as `FAIL` hid the cause for
-    // a day. It gets its own line. (Day 15.)
-    // Python target: every run retrieved on its own, so the rule reads "the model refused every
-    // time, and the expected page was in front of it in at least one run".
-    const falseRefusals =
-        RUNS > 0
-            ? answerable.filter((c) => {
-                const r = byId.get(c.id)!;
-                return r.answered === 0 && (target ? (r.foundRuns ?? 0) > 0 : r.retrieved === "yes");
-            })
-            : [];
+    const recall = evaluateRecall(ctx);
+    const coverage = evaluateCoverage(ctx);
+    const guard = evaluateGuardrails(ctx);
+    const injection = evaluateInjection(ctx);
+    const falseRefusals = evaluateFalseRefusals(ctx);
 
     const sorted = [...retrievalMs].sort((a, b) => a - b);
     const retrievalMedian = median(sorted);
@@ -1037,61 +477,48 @@ async function main() {
     const latency = sorted.length
         ? `${retrievalMedian.toFixed(0)}ms median, ${Math.max(...sorted).toFixed(0)}ms worst`
         : `no successful retrievals`;
-    if (target) {
-        const { answered: a, canned: k } = agentMs;
+    if (session) {
+        const { answered: a, canned: k } = session.ms;
         console.log(`retrieval latency  ${latency}, n=${sorted.length}  (run 1 of each case, request → data-retrieval: planner + retrieval + thread read + HTTP; the TS baseline's population)`);
         console.log(`answered path      n=${a.total.length}   to sources ${ms(a.retrieval)}, first token ${ms(a.firstToken)}, done ${ms(a.total)}  (medians, every run)`);
         console.log(`canned path        n=${k.total.length}   reply done ${ms(k.total)}  (median; greeting and off-topic, planner only)`);
-        console.log(`retrieval recall   ${recall}/${answerable.length}   run 1 (one retrieval per case, comparable to the TS baseline)`);
-        console.log(`recall every run   ${recallEvery}/${answerable.length}   expected doc retrieved in EVERY run of the case`);
-        if (varied.length)
-            console.log(`recall varied      ${varied.map((c) => `${c.id} (${byId.get(c.id)!.foundRuns}/${byId.get(c.id)!.runs})`).join(", ")} — HyDE moved the page between runs`);
+        console.log(`retrieval recall   ${formatRatio(recall.runOne)}   run 1 (one retrieval per case, comparable to the TS baseline)`);
+        console.log(`recall every run   ${formatRatio(recall.everyRun)}   expected doc retrieved in EVERY run of the case`);
+        if (recall.varied.length)
+            console.log(`recall varied      ${recall.varied.map((v) => `${v.id} (${v.foundRuns}/${v.runs})`).join(", ")} — HyDE moved the page between runs`);
     } else {
         console.log(`retrieval latency  ${latency}  (embed + search + rerank)`);
-        console.log(`retrieval recall   ${recall}/${answerable.length}   expected doc survived rerank + threshold`);
+        console.log(`retrieval recall   ${formatRatio(recall.runOne)}   expected doc survived rerank + threshold`);
     }
     if (RUNS > 0) {
-        console.log(`answer coverage    ${coverage}/${answerable.length}   answerable questions actually answered`);
-        console.log(`guardrails held    ${held}/${guardrails.length}   out-of-corpus questions refused`);
+        console.log(`answer coverage    ${formatRatio(coverage)}   answerable questions actually answered`);
+        console.log(`guardrails held    ${formatRatio(guard.held)}   out-of-corpus questions refused`);
         if (falseRefusals.length)
             console.log(
                 `false refusals     ${falseRefusals.length}   expected page retrieved but the answer refused ` +
                 `(${falseRefusals.map((c) => c.id).join(", ")}) — the chunks that survived did not carry the answer`
             );
-    const resisted = injections.filter((c) => byId.get(c.id)!.verdict === "PASS").length;
-    const multiTurn = injections.filter((c) => c.history).length;
-    console.log(
-        `injection resisted ${resisted}/${injections.length}   adversarial prompts that did not get what they asked for ` +
-        `(${multiTurn} multi-turn, ${injections.length - multiTurn} single-turn, ${ADVERSARIAL_RUNS} attempts each)`
-    );
-    if (target) {
-        const structural = injections.filter((c) => c.historyCarriesTheAttack);
-        for (const c of structural)
-            console.log(
-                `  injection ${c.id}: held by STRUCTURE — its attack is a scripted assistant turn, and this target takes no ` +
-                `client history (a request carrying it got ${historyRefused}). The case ran with its user turns replayed; its verdict is ${byId.get(c.id)!.verdict}.`
-            );
-    }
+        console.log(
+            `injection resisted ${formatRatio(injection.resisted)}   adversarial prompts that did not get what they asked for ` +
+            `(${injection.multiTurn} multi-turn, ${injection.singleTurn} single-turn, ${ADVERSARIAL_RUNS} attempts each)`
+        );
+        if (session) {
+            for (const c of injection.structural)
+                console.log(
+                    `  injection ${c.id}: held by STRUCTURE — its attack is a scripted assistant turn, and this target takes no ` +
+                    `client history (a request carrying it got ${historyRefused}). The case ran with its user turns replayed; its verdict is ${byId.get(c.id)!.verdict}.`
+                );
+        }
     }
 
 
     // The tradeoff this harness exists to protect: loosening the prompt to raise
     // coverage must not lower guardrails. Either number moving alone is a regression.
-    // Three layers can hold a guardrail, and each is blind to a different change:
-    //   PLANNER   — classified off-topic, retrieval skipped. Blind to threshold AND prompt.
-    //   THRESHOLD — retrieved, nothing scored ≥ 0.30. Blind to prompt changes.
-    //   PROMPT    — chunks reached the model and it still refused. The only layer that
-    //               tests the prompt, and (post-HyDE) the one doing most of the work.
-    // Say which, out loud, so a "4/4 held" can't hide a prompt that no longer refuses.
-    for (const g of guardrails) {
-        const r = byId.get(g.id)!;
-        const heldBy =
-            r.intent === "off-topic"
-                ? "held by PLANNER (off-topic, retrieval skipped); blind to threshold and prompt"
-                : r.chunks === 0
-                    ? "held by THRESHOLD; blind to prompt changes"
-                    : `held by PROMPT (top ${r.topScore})`;
-        console.log(`  guardrail ${g.id}: ${r.chunks} chunk(s) reached the model  → ${heldBy}`);
+    // Three layers can hold a guardrail and each is blind to a different change; the
+    // attribution and its caveats live in evaluators/guardrails.ts, so that a "6/6 held"
+    // can never be printed without saying which layer did the holding.
+    for (const h of guard.holds) {
+        console.log(`  guardrail ${h.id}: ${h.chunks} chunk(s) reached the model  → ${h.description}`);
     }
 
     if (RUNS === 0) {
@@ -1132,10 +559,12 @@ async function main() {
         return;
     }
 
+    // ONE numerator, read by the console line below AND by the record further down. Before 5.4b
+    // this was written twice in two separately spelled expressions over the same array — the
+    // same defect the survey found in the injection metric, and the confirmation of P3.
+    const faithfulness = aggregateFaithfulness(results);
     if (JUDGE) {
-        const judged = results.filter((r) => r.faithful !== "—");
-        const grounded = judged.filter((r) => r.faithful === "yes").length;
-        console.log(`faithfulness       ${grounded}/${judged.length}   answers fully supported by their own retrieved chunks (judge calibrated 0/12 FA, 0/23 missed, n=35)`);
+        console.log(`faithfulness       ${formatRatio(faithfulness)}   answers fully supported by their own retrieved chunks (judge calibrated 0/12 FA, 0/23 missed, n=35)`);
     }
 
     // Parked, known-failing cases: reported here, never counted against the suite.
@@ -1162,8 +591,8 @@ async function main() {
 
     // Python target: what the run cost, MEASURED from the rows the service wrote for its threads.
     let cost: RunCost | null = null;
-    if (target) {
-        cost = await costOfThreads(agentThreads, agentTurns);
+    if (session) {
+        cost = await costOfThreads(session.threads, session.turns);
         const per = (p: { rows: number; usd: number }) => (p.rows ? `$${(p.usd / p.rows).toFixed(5)}` : "—");
         console.log(
             `cost               $${cost.usd.toFixed(4)} for ${cost.rows} requests, $${cost.usdPerRequest?.toFixed(5) ?? "—"} per request ` +
@@ -1180,8 +609,8 @@ async function main() {
     // The labelled set is priced on its own line, never folded into the figure above: that one is
     // a series across five stored runs and a different population would break it silently.
     let githubCost: RunCost | null = null;
-    if (target && github.length) {
-        githubCost = await costOfThreads(githubThreads, githubTurns);
+    if (session && github.length) {
+        githubCost = await costOfThreads(session.githubThreads, session.githubTurns);
         console.log(
             `GitHub set cost    $${githubCost.usd.toFixed(4)} for ${githubCost.rows} requests, ` +
             `$${githubCost.usdPerRequest?.toFixed(5) ?? "—"} per request (kept out of the figure above)`
@@ -1224,32 +653,32 @@ async function main() {
             knobs: { runs: RUNS, adversarialRuns: ADVERSARIAL_RUNS, judge: JUDGE, candidates: VECTOR_CANDIDATES, rerankTopN: RERANK_TOP_N, threshold: RERANK_THRESHOLD },
             summary: {
                 cases: active.length,
-                recall: `${recall}/${answerable.length}`,
-                coverage: `${coverage}/${answerable.length}`,
-                guardrails: `${held}/${guardrails.length}`,
-                injection: `${injections.filter((c) => byId.get(c.id)!.verdict === "PASS").length}/${injections.length}`,
-                ...(JUDGE ? { faithful: `${results.filter((r) => r.faithful === "yes").length}/${results.filter((r) => r.faithful !== "—").length}` } : {}),
+                recall: formatRatio(recall.runOne),
+                coverage: formatRatio(coverage),
+                guardrails: formatRatio(guard.held),
+                injection: formatRatio(injection.resisted),
+                ...(JUDGE ? { faithful: formatRatio(faithfulness) } : {}),
                 retrievalMsMedian: Math.round(retrievalMedian),
                 retrievalMsWorst: Math.round(Math.max(...sorted)),
                 parked: parked.map((c) => c.id),
                 errored: errored.map((r) => r.id),
                 failing: failed.map((r) => r.id),
                 falseRefusals: falseRefusals.map((c) => c.id),
-                ...(target
+                ...(session
                     ? {
-                        recallEveryRun: `${recallEvery}/${answerable.length}`,
-                        recallVaried: varied.map((c) => c.id),
+                        recallEveryRun: formatRatio(recall.everyRun),
+                        recallVaried: recall.varied.map((v) => v.id),
                         answeredMs: {
-                            n: agentMs.answered.total.length,
-                            toSources: Math.round(median(agentMs.answered.retrieval)),
-                            firstToken: Math.round(median(agentMs.answered.firstToken)),
-                            done: Math.round(median(agentMs.answered.total)),
+                            n: session.ms.answered.total.length,
+                            toSources: Math.round(median(session.ms.answered.retrieval)),
+                            firstToken: Math.round(median(session.ms.answered.firstToken)),
+                            done: Math.round(median(session.ms.answered.total)),
                         },
-                        cannedMs: { n: agentMs.canned.total.length, done: Math.round(median(agentMs.canned.total)) },
+                        cannedMs: { n: session.ms.canned.total.length, done: Math.round(median(session.ms.canned.total)) },
                         historyFieldStatus: historyRefused,
                         cost,
                         ...(githubReport ? { github: githubReport, githubCost } : {}),
-                        threads: `eval-${RUN_STAMP}-*`,
+                        threads: `eval-${session.runStamp}-*`,
                     }
                     : {}),
             },
@@ -1258,11 +687,11 @@ async function main() {
                 topScore: r.topScore, answered: `${r.answered}/${r.runs}`, faithful: r.faithful, detail: r.detail,
                 ...(r.faithfulDetail ? { faithfulDetail: r.faithfulDetail } : {}),
                 ...(r.errored ? { errored: r.errored } : {}),
-                ...(target ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}`, route: r.route ?? null } : {}),
+                ...(session ? { retrievedEvery: r.retrievedEvery, foundRuns: `${r.foundRuns}/${r.runs}`, route: r.route ?? null } : {}),
             })),
         };
         mkdirSync("evals/results", { recursive: true });
-        const file = `evals/results/${stamp}${target ? "-python" : ""}.json`;
+        const file = `evals/results/${stamp}${session ? "-python" : ""}.json`;
         writeFileSync(file, JSON.stringify(record, null, 2) + "\n");
         console.log(`\nrecorded → ${file}  (commit ${commit}${dirty ? ", WITH UNCOMMITTED CHANGES" : ""})`);
     }
@@ -1279,7 +708,8 @@ async function main() {
     // The golden set is green. The labelled set gets its own exit code rather than 1, because
     // these are two different claims about the system and collapsing them would make "the suite
     // passed" stop meaning what it has meant in every stored run before this one. Exit 5 says:
-    // the documentation pipeline is fine and the GitHub set is not.
+    // the documentation pipeline is fine and the GitHub set is not. (datasets/index.ts carries
+    // that difference as data: each dataset descriptor has its own exitCode.)
     // Exit 4 first, for the same reason the golden set exits 4: a case that could not RUN is not
     // a verdict about the system, and a run that did not measure everything is not a baseline.
     const githubErrored = github.filter((r) => r.verdict === "ERROR");

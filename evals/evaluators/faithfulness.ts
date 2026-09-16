@@ -457,3 +457,53 @@ ${answer}`,
         checked,
     };
 }
+
+// ---- the set-level number -------------------------------------------------------------------
+
+/**
+ * FAITHFULNESS, aggregated: answers fully supported by their own retrieved chunks.
+ *
+ * The denominator is the cases that were JUDGED, not the cases that ran. A refusal has no
+ * claims to be unfaithful about, and a greeting retrieved nothing to be grounded in, so both
+ * are absent from this fraction rather than counted as passes. `faithful === "—"` is exactly
+ * that absence, and reading it as a third value instead of as a zero is the same rule
+ * `evals/record.ts` applies to a metric an older run never wrote down.
+ *
+ * Extracted in 5.4b because this numerator, like the injection one, was written twice in
+ * run.ts: once for the console line and once inside the record's `summary.faithful`, in two
+ * separately spelled expressions over the same array. That was prediction P3 — that a
+ * 1299-line file grown across six sub-steps does not have exactly the two duplicates the
+ * survey found — and it is now a confirmed one.
+ */
+export function aggregateFaithfulness(results: { faithful: string }[]): { num: number; den: number } {
+    const judged = results.filter((r) => r.faithful !== "—");
+    return { num: judged.filter((r) => r.faithful === "yes").length, den: judged.length };
+}
+
+/**
+ * Report a NO verdict, and record what it rests on.
+ *
+ * `reasoning` is the model talking. It is NOT the verdict: the verdict is derived above in code
+ * from the quote check, claim by claim, after a second look. The two can and do disagree - a
+ * run 1 verdict here came with prose calling the answer supported - and reading the prose as
+ * the verdict has already produced one wrong conclusion. So the prose is printed labelled as
+ * prose, and under it goes the evidence a reader can actually check: the claim that failed, and
+ * the span the judge offered for it.
+ *
+ * Lives beside the judge rather than in run.ts because BOTH targets call it - the in-process
+ * one while the case runs, the service one afterwards from the trace - and a judge that
+ * explains itself differently depending on which pipeline asked is a judge you cannot compare
+ * across targets.
+ */
+export function reportUnfaithful(id: string, v: Verdict): { claim: string; quote: string }[] {
+    const failed = v.checked
+        .filter((c) => c.found === false)
+        .map((c) => ({ claim: c.claim, quote: c.quote }));
+    console.log(`  UNFAITHFUL ${id}: ${failed.length} claim(s) with no verbatim support in the chunks`);
+    console.log(`      judge prose, not the verdict: ${v.reasoning}`);
+    for (const f of failed) {
+        console.log(`      unsupported: ${f.claim}`);
+        console.log(`          quote offered: ${f.quote ? f.quote.replace(/\s+/g, " ").slice(0, 220) : "(none)"}`);
+    }
+    return failed;
+}
