@@ -18,6 +18,7 @@
     "exp:chunking": "tsx --env-file=.env.local scripts/experiments/chunking-comparison.ts",
     "eval": "tsx --env-file=.env.local evals/run.ts",
     "eval:ci": "tsx evals/run.ts",
+    "eval:diff": "tsx evals/diff.ts",
     "eval:planner": "tsx --env-file=.env.local evals/planner.ts",
     "eval:planner:ci": "tsx evals/planner.ts",
     "eval:calibrate": "tsx --env-file=.env.local evals/calibrate-judge.ts",

@@ -1,0 +1,55 @@
+{
+  "_comment": [
+    "Named baselines: a POINTER into evals/results/, never a copy of it. A second copy of a",
+    "number that can drift is the failure mode phase 3 hit three times in one day, so the stored",
+    "run stays the only place the figures live and this file only gives them names.",
+    "",
+    "Every commit below was read out of the file it names, not remembered. The first draft of the",
+    "spec pointed python-2.8 at a run from 2026-09-11, which is c536cab — that is step 2.6.",
+    "",
+    "pairedWith names the other run of the same state. The suite is run TWICE whenever HyDE is",
+    "involved, and one run is not a measurement of a flaky case; a diff against a single file is",
+    "a diff against one of a pair, and the reader should be able to find the other one."
+  ],
+  "ts-baseline": {
+    "file": "2026-09-08T14-35-14.json",
+    "commit": "29a14c1",
+    "note": "The TypeScript pipeline on main. The figure the README cites and every Python run is compared against. No target field: it predates there being a second one."
+  },
+  "python-2.8": {
+    "file": "2026-09-12T15-25-29-python.json",
+    "commit": "8146975",
+    "pairedWith": "2026-09-12T15-14-54-python.json",
+    "note": "The Python port at parity, local. The 2.8 done-when run."
+  },
+  "aws-2b": {
+    "file": "2026-09-14T18-25-17-python.json",
+    "commit": "6790366",
+    "pairedWith": "2026-09-14T18-11-57-python.json",
+    "note": "The same service deployed on ECS Express Mode, since torn down. Its pair ran with a dirty tree and says so in the file."
+  },
+  "python-3.5b": {
+    "file": "2026-09-15T13-28-23-python.json",
+    "commit": "691c447",
+    "pairedWith": "2026-09-15T13-17-34-python.json",
+    "note": "The planner scope paragraph. The last state before the labelled GitHub set existed, so a diff forward from here cannot compare the GitHub metrics and will say so."
+  },
+  "python-3.6": {
+    "file": "2026-09-15T15-47-39-python.json",
+    "commit": "b224d04",
+    "pairedWith": "2026-09-15T15-31-20-python.json",
+    "note": "First contact with the labelled set: every process metric at ceiling, answer accuracy 24 of 52 across the pair."
+  },
+  "python-3.6b": {
+    "file": "2026-09-15T17-18-30-python.json",
+    "commit": "05e4405",
+    "pairedWith": "2026-09-15T16-59-08-python.json",
+    "note": "The identifier rule and EXCESSIVE_PAGINATION. 29 of 52 across the pair, and the run where gh-issue-1-author fell over the lookup budget."
+  },
+  "python-3.6c": {
+    "file": "2026-09-15T18-40-11-python.json",
+    "commit": "a0c083c",
+    "pairedWith": "2026-09-15T18-21-55-python.json",
+    "note": "The lookup cap bounding looking rather than the turn. 31 of 52 across the pair, validity 43 of 43. The state phase 5 starts from, and what the restructure must diff empty against."
+  }
+}
