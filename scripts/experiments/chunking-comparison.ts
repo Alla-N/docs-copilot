@@ -11,7 +11,7 @@
  *   corpus     the 37 pages in lib/corpus.ts, fetched live and stripped like ingestion
  *   chunkers   fixed-500 (the old naive baseline), fixed-1500 (same cap as ours, no
  *              structure — the fair control), chunkPage (lib/chunker.ts, what is deployed)
- *   queries    every answerable eval case with an expected page (evals/dataset.ts)
+ *   queries    every answerable eval case with an expected page (evals/datasets/golden.ts)
  *   metric     pure vector search, cosine on text-embedding-3-small, raw question embedded —
  *              no HyDE, no reranker, so the ONLY variable is where the chunk boundaries fall.
  *              recall@5 and recall@40 (does the expected page make the top-N?), MRR over the
@@ -25,7 +25,7 @@ import { openai } from "@ai-sdk/openai";
 
 import { chunkPage, stripBoilerplate } from "../../lib/chunker";
 import { PAGES } from "../../lib/corpus";
-import { CASES, type EvalCase } from "../../evals/dataset";
+import { CASES, type EvalCase } from "../../evals/datasets/golden";
 
 const model = openai.embedding("text-embedding-3-small");
 const EMBED_BATCH = 100;

@@ -5,7 +5,7 @@
  *   - scripts/experiments/planner-requests.ts freezes them, with the exact request the planner
  *     sends for each, into agent/tests/golden/planner-requests.json for the Python port.
  */
-import type { PlanIntent } from "../lib/plan";
+import type { PlanIntent } from "../../lib/plan";
 
 export type PlannerCase = {
     id: string;

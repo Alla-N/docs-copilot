@@ -59,7 +59,7 @@ uv run pytest tests/test_planner_request_parity.py
 uv run python evals/planner_eval.py        # compare two runs with two of: npm run eval:planner
 ```
 
-The golden stores a sha256 of `lib/plan.ts` and `evals/planner-cases.ts`, so editing either
+The golden stores a sha256 of `lib/plan.ts` and `evals/datasets/planner.ts`, so editing either
 fails the parity test until the golden is regenerated.
 
 ## Generation (step 2.2)
@@ -288,7 +288,7 @@ uv run uvicorn --factory copilot_agent.api:create_app          # terminal A, in 
 EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 npm run eval  # terminal B, repo root
 ```
 
-The same 27 cases, criteria and verdicts as the in-process target (`evals/agent-target.ts` sends
+The same 27 cases, criteria and verdicts as the in-process target (`evals/targets/agent-service.ts` sends
 each question to `POST /chat` with `origin: "eval"` and reads the stream). What differs, and is
 printed rather than hidden:
 
@@ -341,7 +341,7 @@ EVAL_TARGET=python AGENT_URL=http://127.0.0.1:8000 EVAL_JUDGE=1 npm run eval   #
 
 Two runs, 2026-09-12, commit `8146975`, same Mac, same 27 cases. `EVAL_JUDGE=1` works on this
 target since 2.7: the judge reads the grounding chunks back out of the trace
-(`evals/langfuse-api.ts`). Tracing is ON in both, so next to the 2.6 pair above this pair also
+(`evals/targets/langfuse-api.ts`). Tracing is ON in both, so next to the 2.6 pair above this pair also
 measures what tracing costs.
 
 | | 2.6 run 1 | 2.6 run 2 | 2.8 run 1 | 2.8 run 2 |

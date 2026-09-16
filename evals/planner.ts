@@ -16,10 +16,10 @@
  *
  * Same verdict rules as evals/run.ts: N runs per case (planner output is model output),
  * PASS only if every run passes, FLAKY if some do, FAIL if none. 23 cases × 5 runs
- * (the cases live in evals/planner-cases.ts).
+ * (the cases live in evals/datasets/planner.ts).
  */
 import { planQuery } from "../lib/plan";
-import { PLANNER_CASES, type PlannerCase } from "./planner-cases";
+import { PLANNER_CASES, type PlannerCase } from "./datasets/planner";
 
 // 5, not 3: a planner call costs a fraction of a cent, and the failure mode this suite guards
 // (the off-topic gate swallowing shorthand) showed up on a 4th sample after 3 had passed.

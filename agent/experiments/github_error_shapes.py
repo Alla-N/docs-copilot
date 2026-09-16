@@ -13,7 +13,7 @@ repairable error by any reading -- the fix is a smaller number, and the model is
 -- and the repair cap of 2 sat unused. The allow-list carries provenance per entry precisely so
 that nothing is added to it from a guess, so this prints the raw error object.
 
-**Question 2: is the ai@5.0.0 tag annotated or lightweight?** evals/github-cases.ts currently
+**Question 2: is the ai@5.0.0 tag annotated or lightweight?** evals/datasets/github.ts currently
 says lightweight, and that was an inference, not a measurement: the freeze run asked
 `object(expression: "ai@5.0.0")` and got `__typename: Commit`, and I read a peeled result as a
 direct one. The baseline then contradicted it -- the subagent asked

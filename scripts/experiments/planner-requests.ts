@@ -4,13 +4,13 @@
  *
  *   npm run exp:planner-requests
  *
- * Step 2.1 of the Windward plan. For every planner-eval case (evals/planner-cases.ts), this runs
+ * Step 2.1 of the Windward plan. For every planner-eval case (evals/datasets/planner.ts), this runs
  * planQuery() with globalThis.fetch replaced by a recorder that answers with a canned Responses
  * API reply, and writes agent/tests/golden/planner-requests.json:
  *   - per case: the question, the history, the eval's expectations, and the request the planner
  *     made (URL + JSON body: model, input messages, temperature, max_output_tokens, text.format
  *     with the JSON schema zod produced);
- *   - meta: commit, dirty flag, sha256 of lib/plan.ts and evals/planner-cases.ts (the Python test
+ *   - meta: commit, dirty flag, sha256 of lib/plan.ts and evals/datasets/planner.ts (the Python test
  *     refuses a golden older than either), the AI SDK versions, and the canned reply.
  * agent/tests/test_planner_request_parity.py sends the SAME canned reply back to the Python
  * planner and asserts it made the same request, byte for byte after JSON parsing. No network on
@@ -32,7 +32,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { PLANNER_CASES } from "../../evals/planner-cases";
+import { PLANNER_CASES } from "../../evals/datasets/planner";
 import { planQuery } from "../../lib/plan";
 
 const OUT = "agent/tests/golden/planner-requests.json";
@@ -120,7 +120,7 @@ async function main() {
             commit: sh("git rev-parse HEAD"),
             dirty: sh("git --no-optional-locks status --porcelain") !== "",
             planTsSha256: sha256("lib/plan.ts"),
-            casesTsSha256: sha256("evals/planner-cases.ts"),
+            casesTsSha256: sha256("evals/datasets/planner.ts"),
             versions: { ai: version("ai"), "@ai-sdk/openai": version("@ai-sdk/openai"), zod: version("zod") },
             cannedReply: CANNED_REPLY,
         },

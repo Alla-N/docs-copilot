@@ -17,11 +17,11 @@
  */
 import { generateText } from "ai";
 
-import { type RetrievedChunk } from "../lib/retrieve";
-import { plannedRetrieve } from "../lib/plan";
-import { generationSettings, generationMessages } from "../lib/generation";
-import { CASES } from "./dataset";
-import { judgeFaithfulness } from "./judge";
+import { type RetrievedChunk } from "../../lib/retrieve";
+import { plannedRetrieve } from "../../lib/plan";
+import { generationSettings, generationMessages } from "../../lib/generation";
+import { CASES } from "../datasets/golden";
+import { judgeFaithfulness } from "../evaluators/faithfulness";
 
 const RERANK_INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 250); // 6500 on a trial Cohere key
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -4,7 +4,7 @@
  * This is a MODEL, not a measurement. It hallucinates, it has opinions, and it is
  * biased toward approving output from its own family. Nothing it says is worth
  * anything until it has been calibrated against answers whose faithfulness is known.
- * See evals/calibrate-judge.ts — run that before trusting any number from here.
+ * See evals/experiments/calibrate-judge.ts — run that before trusting any number from here.
  *
  * Scope note: faithfulness asks whether the answer is grounded in the provided text.
  * It does NOT ask whether the answer is true. If the docs are wrong, a perfectly
@@ -14,7 +14,7 @@ import { generateText, Output } from "ai";
 import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 
-import type { RetrievedChunk } from "../lib/retrieve";
+import type { RetrievedChunk } from "../../lib/retrieve";
 
 /**
  * Structured output, not free text. The model is forced into this shape by the SDK,

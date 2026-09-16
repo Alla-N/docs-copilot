@@ -182,8 +182,8 @@ class Tracing:
         The stream carries PAGES (url, best score, chunk numbers), not texts: enough for recall,
         not enough to ask whether an answer is supported by what it was given. The handler's own
         retrieve spans hold each sub-query's result; this one holds the merged set the prompt was
-        built from, which is what the faithfulness judge reads back (evals/agent-target.ts) and
-        the first thing to look at when an answer is wrong.
+        built from, which is what the faithfulness judge reads back
+        (evals/targets/agent-service.ts) and the first thing to look at when an answer is wrong.
 
         An answered turn with an EMPTY list is worth recording: it means nothing cleared the
         threshold and the model was told so. A canned turn retrieved nothing at all, and the

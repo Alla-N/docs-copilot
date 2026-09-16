@@ -34,7 +34,7 @@
  */
 import { retrieve, VECTOR_CANDIDATES } from "../../lib/retrieve";
 import { planQuery } from "../../lib/plan";
-import { CASES, type EvalCase } from "../../evals/dataset";
+import { CASES, type EvalCase } from "../../evals/datasets/golden";
 
 const INTERVAL_MS = Number(process.env.RERANK_INTERVAL_MS ?? 250);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

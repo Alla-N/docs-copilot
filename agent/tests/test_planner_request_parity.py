@@ -19,7 +19,7 @@ Free and deterministic, so it runs in the pre-commit hook and in CI. It is the e
 planner port's parity. The statistical half is evals/planner_eval.py (real model, 5 runs a case):
 once the requests match, a difference between the two planners' plans is the model, not the port.
 
-The golden records a sha256 of lib/plan.ts and evals/planner-cases.ts. Change either and this
+The golden records a sha256 of lib/plan.ts and evals/datasets/planner.ts. Change either and this
 fails until the golden is regenerated, so the Python side cannot drift from an oracle that moved.
 """
 
@@ -129,8 +129,8 @@ def test_the_golden_matches_the_current_typescript() -> None:
     assert sha256("lib/plan.ts") == GOLDEN["meta"]["planTsSha256"], (
         f"lib/plan.ts changed after the golden file was written; {REGENERATE}"
     )
-    assert sha256("evals/planner-cases.ts") == GOLDEN["meta"]["casesTsSha256"], (
-        f"evals/planner-cases.ts changed after the golden file was written; {REGENERATE}"
+    assert sha256("evals/datasets/planner.ts") == GOLDEN["meta"]["casesTsSha256"], (
+        f"evals/datasets/planner.ts changed after the golden file was written; {REGENERATE}"
     )
 
 

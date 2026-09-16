@@ -348,7 +348,7 @@ behaviour and regressed two cases — see `lib/plan.ts`.) So a
 case may name several correct pages (`expectedSource` accepts any-of), and the CI gate retries a
 recall miss once and prints `recovered on retry` when that happened, rather than hiding it.
 
-**The faithfulness judge** (`evals/judge.ts`, opt-in via `EVAL_JUDGE=1`) checks whether every
+**The faithfulness judge** (`evals/evaluators/faithfulness.ts`, opt-in via `EVAL_JUDGE=1`) checks whether every
 claim in an answer is grounded in the retrieved chunks — but the model only *proposes* an
 evidence quote per claim; code then verifies each quote literally appears in the source, so the
 verdict can't be talked into existence. `npm run eval:calibrate` tests that judge against clean,

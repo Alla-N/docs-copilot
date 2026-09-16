@@ -6,7 +6,7 @@
 Same cases, same checks, same verdicts as `npm run eval:planner`: N runs per case (planner
 output is model output), PASS only if every run passes, FLAKY if some do, FAIL if none. The
 cases come from tests/golden/planner-requests.json, which scripts/experiments/planner-requests.ts
-writes from evals/planner-cases.ts, so the two suites cannot drift apart.
+writes from evals/datasets/planner.ts, so the two suites cannot drift apart.
 
 This is the statistical half of the planner port's parity; test_planner_request_parity.py is
 the exact half. Compare two runs of this with two runs of `npm run eval:planner`: the requests

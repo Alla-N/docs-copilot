@@ -7,7 +7,7 @@ import {
     isScopeClaim,
     mustBeFactual,
     unlistedFactualSentences,
-} from "@/evals/judge";
+} from "@/evals/evaluators/faithfulness";
 
 /**
  * Every case here is a shape that appeared in a real calibration run on Day 15, when the

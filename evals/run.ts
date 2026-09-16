@@ -16,7 +16,7 @@
  *
  * Two targets. The default runs the pipeline in-process (plannedRetrieve + generateText, the
  * functions the route calls). EVAL_TARGET=python sends every question to the Python agent
- * service over HTTP, as the route forwards it (evals/agent-target.ts, step 2.6): same cases, same
+ * service over HTTP, as the route forwards it (evals/targets/agent-service.ts, step 2.6): same cases, same
  * criteria, same verdicts, and the differences that come with a service are reported, not hidden
  * (every run retrieves again; history is replayed as real turns; the judge reads the chunk texts
  * back from the trace, since the stream carries pages only; cost is MEASURED from the service's
@@ -60,9 +60,9 @@ import { generateText } from "ai";
 import { isRefusal, REFUSAL_MESSAGE, RERANK_THRESHOLD, VECTOR_CANDIDATES, RERANK_TOP_N } from "../lib/retrieve";
 import { generationSettings, generationMessages } from "../lib/generation";
 import { plannedRetrieve, GREETING_MESSAGE, type PlanIntent } from "../lib/plan";
-import { CASES, type EvalCase } from "./dataset";
-import { FROZEN_AT, GITHUB_CASES, containsAnswer, type GitHubCase } from "./github-cases";
-import { judgeFaithfulness, type Verdict } from "./judge";
+import { CASES, type EvalCase } from "./datasets/golden";
+import { FROZEN_AT, GITHUB_CASES, containsAnswer, type GitHubCase } from "./datasets/github";
+import { judgeFaithfulness, type Verdict } from "./evaluators/faithfulness";
 import {
     agentTarget,
     askAgent,
@@ -78,13 +78,13 @@ import {
     type AgentTarget,
     type RunCost,
     type TurnFacts,
-} from "./agent-target";
-import { contextsByTrace, langfuseApi } from "./langfuse-api";
+} from "./targets/agent-service";
+import { contextsByTrace, langfuseApi } from "./targets/langfuse-api";
 import { SCHEMA_VERSION } from "./record";
 
 const RUNS = Number(process.env.EVAL_RUNS ?? 3);
 
-/** "ts" (default): the pipeline in-process. "python": the agent service over HTTP (agent-target.ts). */
+/** "ts" (default): the pipeline in-process. "python": the agent service over HTTP (targets/agent-service.ts). */
 const TARGET = process.env.EVAL_TARGET ?? "ts";
 if (TARGET !== "ts" && TARGET !== "python") {
     console.error(`EVAL_TARGET must be "ts" or "python", not "${TARGET}".`);

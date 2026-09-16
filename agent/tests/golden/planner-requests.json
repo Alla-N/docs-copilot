@@ -1,10 +1,10 @@
 {
   "meta": {
-    "generatedAt": "2026-09-11T15:04:02.070Z",
-    "commit": "023c0a31f0c1b5bb6fc4c2703c2d7fc2c35ba848",
+    "generatedAt": "2026-09-16T08:58:02.498Z",
+    "commit": "1e72cdfdb8d6edbce0fde8b9706008181baaa90f",
     "dirty": true,
     "planTsSha256": "192db7b9c3ddd45135daf62423b867c6fba3ce4503cd96fdc35d382c77ee6888",
-    "casesTsSha256": "aa854f5c61ea65ce5992b8c62ded3e971dac6359558eaa401723cf551ced7f9a",
+    "casesTsSha256": "b5a34ebc2c53c4c7307c050c814c9e521154e7d69e092b36a18dff889dfcd733",
     "versions": {
       "ai": "7.0.14",
       "@ai-sdk/openai": "4.0.7",

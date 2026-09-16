@@ -3,7 +3,7 @@
  *
  *   npm run exp:golden
  *
- * Step 1e of the Windward plan. For each recall case of evals/dataset.ts (answerable, not an
+ * Step 1e of the Windward plan. For each recall case of evals/datasets/golden.ts (answerable, not an
  * injection, not parked: the same 12 the harness scores recall on), this runs the planner
  * ONCE, then retrieve() on every sub-query, and writes agent/tests/golden/retrieval-golden.json:
  *   - the planner's sub-queries and the text retrieve() EMBEDDED for each (the HyDE
@@ -31,7 +31,7 @@ import { execSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
-import { CASES } from "../../evals/dataset";
+import { CASES } from "../../evals/datasets/golden";
 import { hashChunk } from "../../lib/content-hash";
 import { planQuery } from "../../lib/plan";
 import {

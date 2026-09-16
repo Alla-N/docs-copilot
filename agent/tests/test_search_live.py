@@ -15,7 +15,7 @@ from copilot_agent.settings import get_settings
 
 pytestmark = [pytest.mark.integration, pytest.mark.anyio]
 
-# From evals/dataset.ts: the stream-text case and its accepted pages.
+# From evals/datasets/golden.ts: the stream-text case and its accepted pages.
 QUERY = "how do I stream text"
 STREAM_TEXT_PAGES = ("generating-text", "stream-text")
 

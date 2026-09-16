@@ -16,7 +16,7 @@
  *     and chunk numbers. Enough for recall, the chunk count and the top score; not enough for the
  *     faithfulness judge, which reads the chunks. Since step 2.7 it gets them from the trace:
  *     each answered turn writes a `context` observation with the merged chunks, the row carries
- *     its `trace_id`, and evals/langfuse-api.ts reads them back after the run.
+ *     its `trace_id`, and evals/targets/langfuse-api.ts reads them back after the run.
  *
  * History: the service takes none from its caller (a `history` field is a 422), so a case's
  * earlier user turns are sent as real turns on a fresh thread, and the service's own replies
@@ -30,7 +30,7 @@
  */
 import { createClient } from "@supabase/supabase-js";
 
-import { requireEnv } from "../lib/env";
+import { requireEnv } from "../../lib/env";
 
 /** One page as data-sources describes it (lib/sources.ts SourcePill). */
 export type AgentPage = { url: string; title: string; score: number; chunks: number[] };

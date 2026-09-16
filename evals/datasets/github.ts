@@ -1,7 +1,7 @@
 /**
  * The GitHub labelled set (step 3.6). Twelve questions with frozen answers, plus one control.
  *
- * Its own file, next to planner-cases.ts, for the same reason that one is not in dataset.ts: it
+ * Its own file, next to planner.ts, for the same reason that one is not in golden.ts: it
  * is a different kind of set, scored on different criteria, with its own denominators. The
  * 27-case golden set measures a retrieval pipeline; this one measures whether a subagent that
  * writes its own GraphQL fetched the fact it was asked for.

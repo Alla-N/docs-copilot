@@ -27,12 +27,16 @@ expected to hold to that, not just to keep the tests green.
 | `lib/visitor.ts` · `lib/landing.ts` | Visitor attribution: server-side sanitised headers → `query_log`; client captures referrer/UTM once per session |
 | `scripts/ingest.ts` | Terminal-only ingestion; dry run by default, `--write` opt-in |
 | `tests/` | Vitest: the pure functions plus the chat route's stream framing (`chat-stream.test.ts`, planner/log/model mocked) and the Python stream contract (`python-stream-contract.test.ts`); `npm test`, first CI step |
-| `evals/dataset.ts` · `run.ts` | 27 hand-labelled cases; the harness that gates CI |
+| `evals/datasets/` | The three labelled sets: `golden.ts` (the 27), `github.ts` (the 13 frozen-answer questions), `planner.ts` (the 23). Each keeps its own criteria, denominators and exit code — they are not folded together |
+| `evals/run.ts` | The harness that gates CI: knobs, both targets, the case loop, the report, five exit codes |
+| `evals/evaluators/` | `faithfulness.ts` — the judge (opt-in), verdict computed in code, not by the model |
+| `evals/targets/` | `agent-service.ts` (the Python service over HTTP, plus the `query_log` and Langfuse readers) and `langfuse-api.ts` |
+| `evals/record.ts` · `diff.ts` · `baselines.json` | Phase 5. The record a run leaves and how an older one is read back: `Maybe<T>` is a value or a reason there is none, and there is no way to spell absent as `0`. `npm run eval:diff` compares two stored runs for free (`--run` to spend); a changed denominator is a changed population, latency and cost get a delta and no verdict, exit code always 0. `baselines.json` names seven stored runs by POINTER, never by copy |
 | `evals/results/` | One JSON per full run (commit, knobs, summary, per-case verdicts) — committed; README numbers point here |
-| `evals/planner.ts` · `planner-cases.ts` | Planner-only eval: intent + sub-query assertions, no retrieval; the 23 cases live in `planner-cases.ts` |
-| `evals/github-cases.ts` | Phase 3.6: 12 frozen-answer GitHub questions plus one control, with a routing label each. Own file, own denominators, own cost line, own exit code (5), because the golden suite's numbers are a series. Every literal came from one run of `agent/experiments/freeze_github_answers.py` and names the alias it came from. A question qualified only if its answer cannot change, a generic listing cannot contain it by accident, and it cannot be produced without a query — which is why the licence and the default branch were frozen and then left out |
+| `evals/planner.ts` | Planner-only eval: intent + sub-query assertions, no retrieval; its 23 cases live in `evals/datasets/planner.ts`, and `agent.yml` path-filters on that path |
+| `evals/datasets/github.ts` | Phase 3.6: 12 frozen-answer GitHub questions plus one control, with a routing label each. Own file, own denominators, own cost line, own exit code (5), because the golden suite's numbers are a series. Every literal came from one run of `agent/experiments/freeze_github_answers.py` and names the alias it came from. A question qualified only if its answer cannot change, a generic listing cannot contain it by accident, and it cannot be produced without a query — which is why the licence and the default branch were frozen and then left out |
 | `scripts/experiments/` | Runnable sources for every README number (threshold sweep, chunking) |
-| `evals/judge.ts` · `calibrate-judge.ts` | Faithfulness judge (opt-in) and its calibration |
+| `evals/experiments/calibrate-judge.ts` | The faithfulness judge's calibration run |
 | `specs/` | Specs written before builds — read the relevant one before touching a subsystem |
 | `agent/infra/` | The AWS deploy (phase 2b): `aws_secret.py` builds one Secrets Manager secret from `.env.local` with the service's own dotenv parser and validates it with the service's own `Settings` before upload; `roles.sh` the two IAM roles, the three service-linked roles and a `GetSecretValue` policy scoped to one ARN; `service.sh` the Express Mode service, with every overridden default and why. Redeploy is those three in order |
 | `agent/.../github_schema.py` | Phase 3: introspection fetched lazily and cached per process (3.2 MiB of JSON, 2.5 MiB RSS, measured), `describe_type` in outline and detail modes, and `capped_block` — the byte cap answers *does all of it fit*, never *does this entry fit plus a footer* |
@@ -64,7 +68,7 @@ expected to hold to that, not just to keep the tests green.
 3. **The eval harness and production share one code path.** Both call `plannedRetrieve`
    from `lib/plan.ts` and `buildSystemPrompt` from `lib/retrieve.ts`. Never re-implement
    retrieval inside `evals/` — a copy drifts, and drifts toward passing. The Python target
-   (`EVAL_TARGET=python`, `evals/agent-target.ts`, step 2.6) goes through the service's own
+   (`EVAL_TARGET=python`, `evals/targets/agent-service.ts`, step 2.6) goes through the service's own
    `POST /chat`, as the route forwards it: never give the service a test-only way in for the
    harness (a case's earlier user turns are replayed as real turns on a fresh thread; a case whose
    attack is a scripted assistant turn is reported as held by STRUCTURE, after the harness checks
@@ -273,7 +277,7 @@ npm run ingest / -- --write          # dry run prints the diff; --write applies 
 npx tsc --noEmit                     # typecheck (CI runs this before eval)
 pre-commit run --all-files           # the local commit gate by hand (ruff, pytest, tsc, eslint, vitest); install once: uv tool install pre-commit && pre-commit install
 cd agent && uv run pytest            # Python agent service tests
-npm run exp:planner-requests         # freeze the TS planner's exact requests into agent/tests/golden/ (free, no network); rerun after editing lib/plan.ts or evals/planner-cases.ts
+npm run exp:planner-requests         # freeze the TS planner's exact requests into agent/tests/golden/ (free, no network); rerun after editing lib/plan.ts or evals/datasets/planner.ts
 cd agent && uv run python evals/planner_eval.py   # the planner eval against the Python planner (23 x 5, a few cents)
 cd agent && uv run python -m copilot_agent.chat_cli "how do I stream text"   # the whole Python pipeline on one question, streamed (about a cent); prints a thread id, pass --thread <id> to ask a follow-up
 cd agent && uv run python experiments/graph_overhead.py   # LangGraph overhead vs plain async code, instant fakes (free)

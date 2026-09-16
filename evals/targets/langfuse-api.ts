@@ -14,7 +14,7 @@
  * Spans leave the service on a batch exporter (5 s) and Langfuse ingests them asynchronously, so
  * this waits for the traces it expects rather than reading once and finding half a run.
  */
-import { requireEnv } from "../lib/env";
+import { requireEnv } from "../../lib/env";
 
 export type LangfuseApi = { baseUrl: string; auth: string };
 
