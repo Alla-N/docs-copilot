@@ -36,6 +36,12 @@ Recorded here because a survey that finds nothing usually means nobody looked.
 3. **Three record schemas are already in the results directory.** The five TS runs have no `target`, `dirty`, `incomplete` or `errored`; `dirty` arrives with the Python target on 2026-09-11; `errored` and `incomplete` arrive on 2026-09-14 with the ERROR verdict; `github` and `githubCost` arrive on 2026-09-15 with the labelled set. Six of the 23 runs carry the GitHub set. Counted, not remembered — the first draft of this spec said four TS runs. Any diff has to have an opinion about this before it can print one line.
 4. **`vitest.config.ts` includes `tests/**/*.test.ts` only.** Unit tests for the extracted evaluators have to live in `tests/`, not beside the evaluators (decision 8).
 
+### Two findings the phase produced that the survey could not have
+
+5. **A stable aggregate can hide an unstable composition (5.5).** Three runs of identical code reported the GitHub set as 15/26 every time. Underneath, two different cases traded PASS and VARIED on every run: baseline to run 1 moved `gh-issue-1-title` and `gh-issue-2-closed`; baseline to run 2 moved `gh-issue-1-title` and `gh-pr-1000-merged`; run 1 to run 2 moved `gh-issue-2-closed` and `gh-pr-1000-merged`. **The total is conserved, not reproducible.** A suite printing only the headline would call that perfectly stable and would then report a real fix as having done nothing, because a different question would have slipped to make room for it. This is finding 1 of phase 3.6 one level up: there, process metrics at ceiling hid missing answers; here, a stable aggregate hides a moving set of them. It is visible only because section 4 specified per-case lines for changed verdicts before any of the diff was written.
+
+6. **A census over an open set is a test that fails when you do your job (5.5).** `tests/record.test.ts` asserted that exactly six stored runs carry the labelled GitHub set. The done-when run added two, and the assertion failed on the one commit of the phase that changed nothing whatever about the reader it tests. The trap is the repair: bump six to eight, green again, breaks at ten — **an assertion whose fix is always to edit the number teaches you to edit the test rather than read it.** It now asserts the contract it always meant, which is that the reader agrees with the file, checked against every stored run. The same file already had both spellings and got them right for the right reasons: the count of stored runs is a floor because runs get added, and the count of TypeScript runs is exact because that target stopped being written to and the set can never grow again. **A census is fine over a closed set and a bug over an open one, and nothing in the assertion says which you are looking at** — only whether the thing being counted can still change.
+
 ---
 
 ## 2. Decisions
@@ -167,7 +173,7 @@ Rules:
   - **5.4a — the renames.** Eight files moved into `datasets/`, `evaluators/` and `targets/`; five string-shaped references fixed; the frozen planner golden regenerated, and its three-line diff is what makes "the move changed only paths" a measurement rather than a claim.
   - **5.4b — the evaluators.** Everything `main()` was deciding for itself, pulled out into pure functions: the population rules, the per-case verdict, recall, coverage, guardrails with the layer attribution, injection, false refusals, and the labelled set's answer and process measures. Both targets' case loops moved out with them. The two duplicated numerators are gone, and the registries (`datasets/index.ts`, `evaluators/index.ts`, `targets/index.ts`) say what the suite measures and over what.
   - **The free check that belongs to neither:** `eval:diff`, built in 5.3, had never actually been RUN. It was exercised against five pairs of stored runs before 5.4b touched anything, so that a non-empty diff at 5.5 could only mean the extraction. It worked on the first attempt and overturned P1 — see section 6.
-- **5.5 — the done-when run:** the full suite against the Python service at the new structure, diffed against `python-3.6c`, plus the README section in the new vocabulary.
+- **5.5 — the done-when run:** DONE, `1bf2a2f`. Two full runs at `b73a554`, three diffs, the README section in the new vocabulary, both result files committed so every figure in it traces to a stored run. Golden set `=` on fifteen of sixteen metrics; the sixteenth is `followup` and the stored record proves it HyDE rather than the extraction (see P1). **Phase 5's renaming half is complete.**
 
 Each sub-step ends the usual way: her Mac gate, a commit message in `Claude outputs/`, CI. Only 5.5 spends money.
 
@@ -210,6 +216,28 @@ Written before the build, checked afterwards, wrong ones kept — same as phases
 >
 > The check cost nothing: two stored files, no model calls. Running the diff against a run of
 > the SAME commit, before trusting it against a different one, is now the rule.
+>
+> **SCORED AT 5.5, and the correction above was itself half wrong (2026-09-16, `1bf2a2f`).**
+> Two full runs at `b73a554`, diffed against `python-3.6c`. The golden set came back `=` on
+> **fifteen of sixteen** metrics — recall run 1, coverage, guardrails, injection, false
+> refusals, every per-case verdict, cost at the fourth decimal. P1's golden-set claim holds.
+>
+> The sixteenth moved: `recall every run` read 11/12 in both runs against 12/12 in the
+> baseline, on the case `followup`. **Not a number the restructure moved, and the stored file
+> proves it rather than suggesting it:** the record says `foundRuns: 2/3` and
+> `retrievedEvery: varied`, which are consistent, and `varied` is the *correct* verdict for 2
+> of 3 — the evaluator did the right thing with the data it was handed. A broken aggregation
+> returns a constant, not a fraction landing in the middle. `recall run 1` reads the same
+> `foundPerRun` array through the same `expectedFound` and is 12/12, so a defect would have to
+> hit the every-run filter while sparing run 1, and that filter is one line. The only remaining
+> route is retrieval itself, which the extraction does not touch. `followup` has varied in
+> **twelve of the twenty stored Python runs, across seven commits**.
+>
+> **And the GitHub set did not move at all.** Identical aggregates in all three files: 15/26,
+> validity 21/21, routing 37/37, five turns canned. The correction above said this set was too
+> noisy to read. The headline was perfectly steady — so that correction was right that the
+> noise exists and wrong about where it lives. See finding 8 below, which is what was actually
+> under it.
 
 **P2. At least three metrics in the 23 stored files cannot be compared without normalisation.** Named in advance: `target` (absent in the five TS runs), `errored` (absent before 2026-09-14), `github` and `githubCost` (absent before 2026-09-15). If the reader finds a fourth, the prediction was too conservative and that is worth saying.
 
